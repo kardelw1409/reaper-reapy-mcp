@@ -296,6 +296,8 @@ class FXController(BaseController):
                                                 if len(comma_parts) >= 3:
                                                     # The plugin name is typically after the second comma
                                                     plugin_name = comma_parts[2].strip()
+                                                    # Clean up the plugin name by removing common postfixes
+                                                    plugin_name = self._clean_plugin_name(plugin_name)
                                                     if plugin_name and plugin_name not in fx_list:
                                                         fx_list.append(plugin_name)
                                                         continue  # Skip other checks for this line
@@ -308,6 +310,8 @@ class FXController(BaseController):
                                                     name_match = re.search(r'"([^"]+)"', part)
                                                     if name_match:
                                                         plugin_name = name_match.group(1)
+                                                        # Clean up the plugin name by removing common postfixes
+                                                        plugin_name = self._clean_plugin_name(plugin_name)
                                                         if plugin_name not in fx_list:
                                                             fx_list.append(plugin_name)
             except Exception as e:
@@ -351,3 +355,59 @@ class FXController(BaseController):
         except Exception as e:
             self.logger.error(f"Failed to toggle FX: {e}")
             return False
+
+    def _clean_plugin_name(self, plugin_name: str) -> str:
+        """
+        Clean plugin name by removing unwanted characters and standardizing format.
+        
+        Args:
+            plugin_name (str): Original plugin name
+            
+        Returns:
+            str: Cleaned plugin name
+        """
+        if not plugin_name:
+            return plugin_name
+            
+        cleaned_name = plugin_name
+        
+        # First, remove unwanted characters like !!!
+        cleaned_name = re.sub(r'!!!+', '', cleaned_name)
+        
+        # Remove other unwanted special characters but keep meaningful ones
+        cleaned_name = re.sub(r'[^\w\s\(\)\-\+\&\.\,\']', '', cleaned_name)
+        
+        # Detect if it's a VST instrument and preserve that information in a clean format
+        is_vsti = False
+        if re.search(r'\b(vsti|instrument)\b', cleaned_name, re.IGNORECASE):
+            is_vsti = True
+        
+        # Remove common postfixes but keep track of VST type
+        postfixes_to_remove = [
+            r'\s*\(vsti\)$',
+            r'\s*\(vst\)$', 
+            r'\s*\(vst3\)$',
+            r'\s*\(au\)$',
+            r'\s*\(dx\)$',
+            r'\s*\(rtas\)$',
+            r'\s*\(aax\)$',
+            r'\s*vsti$',
+            r'\s*vst$',
+            r'\s*vst3$',
+            r'\s*au$',
+            r'\s*dx$',
+            r'\s*rtas$',
+            r'\s*aax$'
+        ]
+        
+        for postfix_pattern in postfixes_to_remove:
+            cleaned_name = re.sub(postfix_pattern, '', cleaned_name, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+        
+        # If it was a VSTi, add a clean suffix to distinguish from regular effects
+        if is_vsti and not re.search(r'\(.*instrument.*\)', cleaned_name, re.IGNORECASE):
+            cleaned_name += " [VSTi]"
+        
+        return cleaned_name
