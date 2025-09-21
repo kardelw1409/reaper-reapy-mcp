@@ -74,6 +74,7 @@ Available MCP tools:
 - `rename_track`: Rename an existing track
 - `set_track_color`: Set track color
 - `get_track_color`: Get track color
+- `get_track_count`: Get number of tracks in project
 
 #### FX Management
 - `add_fx`: Add an FX to a track
@@ -88,10 +89,14 @@ Available MCP tools:
 #### Project Control
 - `set_tempo`: Set project tempo
 - `get_tempo`: Get current tempo
+- `get_time_signature`: Get current time signature
+- `set_project_time_signature`: Set project default time signature
+- `set_time_signature`: Set time signature at position
 - `create_region`: Create a region
 - `delete_region`: Delete a region
 - `create_marker`: Create a marker
 - `delete_marker`: Delete a marker
+- `render_project`: Render project to audio file
 
 #### Master Track
 - `get_master_track`: Get master track information
@@ -142,15 +147,16 @@ Many MCP tools now support dual position formats for enhanced musical workflow:
 #### Measure:Beat Format
 ```json
 {
-  "start_measure": "3:2.5",
-  "new_measure": "5:1"
+  "start_measure": "3:2,500",
+  "new_measure": "5:1,000"
 }
 ```
 
-**Format**: `"measure:beat"` where:
+**Format**: `"measure:beat,fraction"` where:
 - `measure`: 1-based measure number
-- `beat`: 1-based beat number (supports decimals)
-- Example: `"4:2.5"` = measure 4, beat 2.5
+- `beat`: 1-based beat number
+- `fraction`: milliseconds (000-999) representing fraction of a beat
+- Example: `"4:2,500"` = measure 4, beat 2, half beat (500ms)
 
 #### Tools Supporting Both Formats:
 - `create_midi_item` - position via `start_time` OR `start_measure`
