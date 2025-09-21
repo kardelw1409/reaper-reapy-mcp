@@ -129,8 +129,7 @@ class MIDIController(BaseController):
                     self.logger.error("Item has no active take")
                     return False
                 
-                item_start = item.position
-                note_start = item_start + start_time
+                note_start = start_time
                 note_end = note_start + length
                 
                 # Make sure item is selected

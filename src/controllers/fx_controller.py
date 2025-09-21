@@ -10,26 +10,60 @@ from .base_controller import BaseController
 class FXController(BaseController):
     """Controller for FX-related operations in Reaper."""
     
-    def add_fx(self, track_index: int, fx_name: str) -> int:
+    def add_fx(self, track_index: int, fx_name: str) -> bool:
         """
         Add an FX to a track.
         
         Args:
-            track_index (int): Index of the track
+            track_index (int): Index of the track to add FX to
             fx_name (str): Name of the FX to add
             
         Returns:
-            int: Index of the added FX
+            bool: True if successful, False otherwise
         """
         try:
             project = reapy.Project()
+            
+            # Validate track index
+            if track_index < 0 or track_index >= len(project.tracks):
+                self.logger.error(f"Track index {track_index} out of range (project has {len(project.tracks)} tracks)")
+                return False
+                
             track = project.tracks[track_index]
-            fx = track.add_fx(fx_name)
-            return fx.index
+            self.logger.info(f"Adding FX '{fx_name}' to track {track_index}")
+            
+            # Try to add the FX using various name formats
+            success = False
+            
+            # Try the original name first
+            try:
+                fx = track.add_fx(fx_name)
+                if fx:
+                    self.logger.info(f"Successfully added FX using original name: '{fx_name}'")
+                    success = True
+            except Exception as e:
+                self.logger.debug(f"Failed with original name '{fx_name}': {e}")
+            
+            # Try without the [VSTi] or [VST] suffix
+            if not success:
+                base_name = fx_name.split(' [')[0] if ' [' in fx_name else fx_name
+                try:
+                    fx = track.add_fx(base_name)
+                    if fx:
+                        self.logger.info(f"Successfully added FX using base name: '{base_name}'")
+                        success = True
+                except Exception as e:
+                    self.logger.debug(f"Failed with base name '{base_name}': {e}")
+            
+            if not success:
+                self.logger.error(f"Failed to add FX '{fx_name}' to track {track_index} with all attempted names")
+                return False
+                
+            return True
 
         except Exception as e:
-            self.logger.error(f"Failed to add FX: {e}")
-            return -1
+            self.logger.error(f"Failed to add FX to track {track_index}: {e}")
+            return False
 
     def remove_fx(self, track_index: int, fx_index: int) -> bool:
         """

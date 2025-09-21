@@ -2,7 +2,7 @@ from mcp import types
 from mcp.server.fastmcp import FastMCP, Context
 from typing import Optional, Dict, Any, List, Union
 import reapy
-from utils.position_utils import position_to_time, time_to_measure
+from utils.position_utils import position_to_time, time_to_measure, get_time_map_info, measure_length_to_time
 
 def setup_mcp_tools(mcp: FastMCP, controller) -> None:
     """Setup MCP tools for Reaper control."""
@@ -159,12 +159,49 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to toggle FX: {str(e)}"}
 
     @mcp.tool("create_region")
-    def create_region(ctx: Context, start_time: float, end_time: float, name: str) -> Dict[str, Any]:
-        """Create a region in the project."""
+    def create_region(ctx: Context, name: str,
+                     start_time: Optional[float] = None, end_time: Optional[float] = None,
+                     start_measure: Optional[str] = None, end_measure: Optional[str] = None) -> Dict[str, Any]:
+        """Create a region in the project.
+        
+        Args:
+            name: Name of the region
+            start_time: Start position in seconds (optional if start_measure is provided)
+            end_time: End position in seconds (optional if end_measure is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            end_measure: End position as "measure:beat,fraction" (optional if end_time is provided)
+        """
         try:
-            region_index = controller.create_region(start_time, end_time, name)
+            # Determine start position
+            if start_time is not None:
+                time_start = float(start_time)
+                measure_start = time_to_measure(time_start)
+            elif start_measure is not None:
+                time_start = position_to_time(start_measure)
+                measure_start = start_measure
+            else:
+                return {"status": "error", "message": "Either start_time or start_measure must be provided"}
+                
+            # Determine end position
+            if end_time is not None:
+                time_end = float(end_time)
+                measure_end = time_to_measure(time_end)
+            elif end_measure is not None:
+                time_end = position_to_time(end_measure)
+                measure_end = end_measure
+            else:
+                return {"status": "error", "message": "Either end_time or end_measure must be provided"}
+                
+            region_index = controller.create_region(time_start, time_end, name)
             if region_index >= 0:
-                return {"status": "success", "message": f"Created region {region_index}: {name}"}
+                return {
+                    "status": "success", 
+                    "message": f"Created region {region_index}: {name}",
+                    "range": {
+                        "start": {"time": time_start, "measure": measure_start},
+                        "end": {"time": time_end, "measure": measure_end}
+                    }
+                }
             return {"status": "error", "message": "Failed to create region"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to create region: {str(e)}"}
@@ -263,15 +300,20 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
     # ----- MIDI Operations -----
     
     @mcp.tool("create_midi_item")
-    def create_midi_item(ctx: Context, track_index: int, start_time: Optional[float] = None, 
-                        start_measure: Optional[str] = None, length: float = 4.0) -> Dict[str, Any]:
+    def create_midi_item(ctx: Context, track_index: int, 
+                        start_time: Optional[float] = None, 
+                        start_measure: Optional[str] = None,
+                        length_time: Optional[float] = None,
+                        length_measure: Optional[str] = None) -> Dict[str, Any]:
         """Create an empty MIDI item on a track.
         
         Args:
             track_index: Index of the track
             start_time: Start position in seconds (optional if start_measure is provided)
-            start_measure: Start position as "measure:beat" (optional if start_time is provided)
-            length: Length in seconds
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+                         where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
+            length_time: Length in seconds (optional if length_measure is provided)
+            length_measure: Length as "measure:beat,fraction" where fraction is milliseconds
         """
         try:
             # Determine the time position
@@ -284,20 +326,123 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             else:
                 return {"status": "error", "message": "Either start_time or start_measure must be provided"}
                 
+            # Determine length
+            if length_time is not None:
+                length = float(length_time)
+                end_time = time_pos + length
+                length_pos = time_to_measure(end_time)
+            elif length_measure is not None:
+                length = measure_length_to_time(length_measure, time_pos)
+                end_time = time_pos + length
+                length_pos = time_to_measure(end_time)
+            else:
+                return {"status": "error", "message": "Either length_time or length_measure must be provided"}
+
             item_id = controller.create_midi_item(track_index, time_pos, length)
             if (isinstance(item_id, int) and item_id >= 0) or (isinstance(item_id, str) and item_id):
-                return {"status": "success", "message": f"Created MIDI item at position {measure_pos} (time: {time_pos:.3f}s)", "item_id": item_id}
+                return {
+                    "status": "success",
+                    "message": f"Created MIDI item at position {measure_pos} with length {length_pos}",
+                    "item_id": item_id,
+                    "position": {"time": time_pos, "measure": measure_pos},
+                    "end": {"time": end_time, "measure": length_pos}
+                }
             return {"status": "error", "message": "Failed to create MIDI item"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to create MIDI item: {str(e)}"}
     
     @mcp.tool("add_midi_note")
     def add_midi_note(ctx: Context, track_index: int, item_id: int, pitch: int, 
-                     start_time: float, length: float, velocity: int = 96) -> Dict[str, Any]:
-        """Add a MIDI note to a MIDI item."""
+                     start_time: Optional[float] = None, 
+                     length_time: Optional[float] = None,
+                     start_measure: Optional[str] = None,
+                     length_measure: Optional[str] = None,
+                     velocity: int = 96) -> Dict[str, Any]:
+        """Add a MIDI note to a MIDI item.
+        
+        Args:
+            track_index: Index of the track
+            item_id: ID of the item
+            pitch: MIDI note pitch (0-127)
+            start_time: Start position in seconds (optional if start_measure is provided)
+            length_time: Note length in seconds (optional if length_measure is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            length_measure: Length as "measure:beat,fraction" (optional if length_time is provided)
+            velocity: Note velocity (0-127, default: 96)
+        """
         try:
-            if controller.add_midi_note(track_index, item_id, pitch, start_time, length, velocity):
-                return {"status": "success", "message": f"Added MIDI note (pitch: {pitch}, velocity: {velocity}) to item {item_id}"}
+            # Get MIDI item properties for debugging
+            item_props = controller.get_item_properties(track_index, item_id)
+            if not item_props:
+                return {"status": "error", "message": "Failed to get MIDI item properties"}
+                
+            item_start = item_props.get("position", 0)
+            item_length = item_props.get("length", 0)
+            
+            # Determine the start position
+            if start_time is not None:
+                time_pos = float(start_time)
+                measure_pos = time_to_measure(time_pos)
+            elif start_measure is not None:
+                time_pos = position_to_time(start_measure)
+                measure_pos = start_measure
+            else:
+                return {"status": "error", "message": "Either start_time or start_measure must be provided"}
+
+            # Determine the length
+            if length_time is not None:
+                length = max(float(length_time), 0.1)  # Minimum length 0.1s
+                end_time = time_pos + length
+                end_measure = time_to_measure(end_time)
+            elif length_measure is not None:
+                length = measure_length_to_time(length_measure, time_pos)
+                end_time = time_pos + length
+                end_measure = time_to_measure(end_time)
+            else:
+                return {"status": "error", "message": "Either length_time or length_measure must be provided"}
+
+            relative_item_pos = (time_pos - item_start)
+            # Enhanced debug info with detailed timing calculations
+            debug_info = {
+                "item": {
+                    "start_time": item_start,
+                    "start_measure": time_to_measure(item_start),
+                    "length": item_length,
+                    "end_time": item_start + item_length,
+                    "end_measure": time_to_measure(item_start + item_length)
+                },
+                "note": {
+                    "absolute": {
+                        "time_pos": time_pos,
+                        "measure_pos": measure_pos,
+                        "end_time": end_time,
+                        "end_measure": end_measure
+                    },
+                    "relative": {
+                        "start": relative_item_pos,
+                        "length": length,
+                        "end": relative_item_pos + length
+                    }
+                },
+                "calculations": {
+                    "time_diff": time_pos - item_start,
+                    "is_in_bounds": 0 <= relative_item_pos <= item_length,
+                    "start_offset": relative_item_pos,
+                    "end_offset": relative_item_pos + length
+                }
+            }
+
+            if controller.add_midi_note(track_index, item_id, pitch, relative_item_pos, length, velocity):
+                return {
+                    "status": "success", 
+                    "message": f"Added MIDI note (pitch: {pitch}, velocity: {velocity}) to item {item_id}",
+                    "note": {
+                        "start": {"time": time_pos, "measure": measure_pos},
+                        "length": length,
+                        "end": {"time": end_time, "measure": end_measure}
+                    },
+                    "debug": debug_info
+                }
             return {"status": "error", "message": "Failed to add MIDI note"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to add MIDI note: {str(e)}"}
@@ -353,7 +498,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             track_index: Index of the track
             file_path: Path to the audio file
             start_time: Start position in seconds (optional if start_measure is provided)
-            start_measure: Start position as "measure:beat" (optional if start_time is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
         """
         try:
             # Determine the time position
@@ -393,7 +538,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             track_index: Index of the track
             item_id: ID of the item to duplicate
             new_time: New position in seconds (optional)
-            new_measure: New position as "measure:beat" (optional)
+            new_measure: New position as "measure:beat,fraction" (optional)
         """
         try:
             # Determine the time position if any position is provided
@@ -449,14 +594,16 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
     
     @mcp.tool("set_item_position")
     def set_item_position(ctx: Context, track_index: int, item_id: int, 
-                         position_time: Optional[float] = None, position_measure: Optional[str] = None) -> Dict[str, Any]:
+                         position_time: Optional[float] = None, 
+                         position_measure: Optional[str] = None) -> Dict[str, Any]:
         """Set the position of a media item.
         
         Args:
             track_index: Index of the track
             item_id: ID of the item
             position_time: New position in seconds (optional if position_measure is provided)
-            position_measure: New position as "measure:beat" (optional if position_time is provided)
+            position_measure: New position as "measure:beat,fraction" (optional if position_time is provided)
+                           where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
         """
         try:
             # Determine the time position
@@ -476,11 +623,41 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to set item position: {str(e)}"}
     
     @mcp.tool("set_item_length")
-    def set_item_length(ctx: Context, track_index: int, item_id: int, length: float) -> Dict[str, Any]:
-        """Set the length of a media item."""
+    def set_item_length(ctx: Context, track_index: int, item_id: int,
+                       length_time: Optional[float] = None,
+                       length_measure: Optional[str] = None) -> Dict[str, Any]:
+        """Set the length of a media item.
+        
+        Args:
+            track_index: Index of the track
+            item_id: ID of the item
+            length_time: Length in seconds (optional if length_measure is provided)
+            length_measure: Length as "measure:beat,fraction" (optional if length_time is provided)
+        """
         try:
+            # Get current item position to calculate length in measures
+            props = controller.get_item_properties(track_index, item_id)
+            if not props:
+                return {"status": "error", "message": "Failed to get item properties"}
+                
+            current_pos = props.get("position", 0)
+            
+            # Determine length
+            if length_time is not None:
+                length = float(length_time)
+                length_pos = time_to_measure(current_pos + length)
+            elif length_measure is not None:
+                end_pos = position_to_time(length_measure)
+                length = end_pos - current_pos
+                length_pos = length_measure
+            else:
+                return {"status": "error", "message": "Either length_time or length_measure must be provided"}
+
             if controller.set_item_length(track_index, item_id, length):
-                return {"status": "success", "message": f"Set item {item_id} length to {length} seconds"}
+                return {
+                    "status": "success",
+                    "message": f"Set item {item_id} length to {length_pos} (time: {length:.3f}s)"
+                }
             return {"status": "error", "message": "Failed to set item length"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to set item length: {str(e)}"}
@@ -505,8 +682,8 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             track_index: Index of the track
             start_time: Start position in seconds (optional if start_measure is provided)
             end_time: End position in seconds (optional if end_measure is provided)
-            start_measure: Start position as "measure:beat" (optional if start_time is provided)
-            end_measure: End position as "measure:beat" (optional if end_time is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            end_measure: End position as "measure:beat,fraction" (optional if end_time is provided)
         """
         try:
             # Determine start position
@@ -566,3 +743,154 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "No selected items found"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to get selected items: {str(e)}"}
+    
+    @mcp.tool("get_time_signature")
+    def get_time_signature(ctx: Context) -> Dict[str, Any]:
+        """Get the current time signature of the project."""
+        try:
+            time_map = get_time_map_info()
+            return {
+                "status": "success",
+                "time_signature": {
+                    "numerator": time_map['time_sig_num'],
+                    "denominator": time_map['time_sig_den'],
+                    "bpm": time_map['bpm']
+                }
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get time signature: {str(e)}"}
+
+    @mcp.tool("set_project_time_signature")
+    def set_project_time_signature(ctx: Context, numerator: int, denominator: int) -> Dict[str, Any]:
+        """Set the default project time signature.
+        
+        Args:
+            numerator: Time signature numerator (e.g., 4 in 4/4)
+            denominator: Time signature denominator (e.g., 4 in 4/4)
+        """
+        try:
+            if controller.set_project_time_signature(numerator, denominator):
+                return {
+                    "status": "success", 
+                    "message": f"Set project time signature to {numerator}/{denominator}",
+                    "time_signature": {
+                        "numerator": numerator,
+                        "denominator": denominator
+                    }
+                }
+            return {"status": "error", "message": "Failed to set project time signature"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to set project time signature: {str(e)}"}
+
+    @mcp.tool("get_project_time_signature")
+    def get_project_time_signature(ctx: Context) -> Dict[str, Any]:
+        """Get the default project time signature."""
+        try:
+            time_sig = controller.get_project_time_signature()
+            return {
+                "status": "success",
+                "time_signature": time_sig
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get project time signature: {str(e)}"}
+
+    @mcp.tool("set_time_signature")
+    def set_time_signature(ctx: Context, numerator: int, denominator: int, 
+                          position: Optional[str] = None, 
+                          time: Optional[float] = None) -> Dict[str, Any]:
+        """Set time signature at specified position.
+        
+        Args:
+            numerator: Time signature numerator (e.g., 4 in 4/4)
+            denominator: Time signature denominator (e.g., 4 in 4/4)
+            position: Position as "measure:beat,fraction" (optional if time is provided)
+                     where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
+            time: Position in seconds (optional if position is provided)
+        """
+        try:
+            # Determine position
+            if position is not None:
+                pos = position_to_time(position)
+                measure_pos = position
+            elif time is not None:
+                pos = float(time)
+                measure_pos = time_to_measure(pos)
+            else:
+                pos = 0.0
+                measure_pos = "1:1.000"
+                
+            if controller.set_time_signature(numerator, denominator, pos):
+                return {
+                    "status": "success", 
+                    "message": f"Set time signature to {numerator}/{denominator} at position {measure_pos}",
+                    "position": {"time": pos, "measure": measure_pos}
+                }
+            return {"status": "error", "message": "Failed to set time signature"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to set time signature: {str(e)}"}
+
+    @mcp.tool("render_project")
+    def render_project(ctx: Context, 
+                      output_file: str,
+                      start_time: Optional[float] = None,
+                      end_time: Optional[float] = None,
+                      start_measure: Optional[str] = None,
+                      end_measure: Optional[str] = None,
+                      samplerate: int = 44100,
+                      channels: int = 2,
+                      **kwargs) -> Dict[str, Any]:
+        """Render project to audio file.
+        
+        Args:
+            output_file: Path to output audio file
+            start_time: Start position in seconds (optional if start_measure is provided)
+            end_time: End position in seconds (optional if end_measure is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            end_measure: End position as "measure:beat,fraction" (optional if end_time is provided)
+            samplerate: Sample rate in Hz (default: 44100)
+            channels: Number of channels (default: 2)
+            **kwargs: Additional render settings
+        """
+        try:
+            # Convert measure positions to time if provided
+            render_start = None
+            render_end = None
+            
+            if start_time is not None:
+                render_start = float(start_time)
+                start_pos = time_to_measure(render_start)
+            elif start_measure is not None:
+                render_start = position_to_time(start_measure)
+                start_pos = start_measure
+                
+            if end_time is not None:
+                render_end = float(end_time)
+                end_pos = time_to_measure(render_end)
+            elif end_measure is not None:
+                render_end = position_to_time(end_measure)
+                end_pos = end_measure
+            
+            # Perform render
+            if controller.render_project(output_file, render_start, render_end, 
+                                      samplerate, channels, **kwargs):
+                response = {
+                    "status": "success",
+                    "message": f"Project rendered to {output_file}",
+                    "file": output_file,
+                    "settings": {
+                        "samplerate": samplerate,
+                        "channels": channels
+                    }
+                }
+                
+                # Add time range info if provided
+                if render_start is not None or render_end is not None:
+                    response["range"] = {
+                        "start": {"time": render_start, "measure": start_pos} if render_start is not None else None,
+                        "end": {"time": render_end, "measure": end_pos} if render_end is not None else None
+                    }
+                    
+                return response
+            return {"status": "error", "message": "Failed to render project"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to render project: {str(e)}"}
