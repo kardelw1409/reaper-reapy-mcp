@@ -312,8 +312,8 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             start_time: Start position in seconds (optional if start_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
                          where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
-            length_time: Length in seconds (optional if length_measure is provided)
-            length_measure: Length as "measure:beat,fraction" where fraction is milliseconds
+            length_time: Duration in seconds from start position (from start_time or start_measure)(optional if length_measure is provided)
+            length_measure: Duration as "measure:beat,fraction" from start position (e.g., "2:1,000" = 2 measures from start_time or start_measure)(optional if length_time is provided)
         """
         try:
             # Determine the time position
@@ -354,8 +354,8 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
     @mcp.tool("add_midi_note")
     def add_midi_note(ctx: Context, track_index: int, item_id: int, pitch: int, 
                      start_time: Optional[float] = None, 
-                     length_time: Optional[float] = None,
                      start_measure: Optional[str] = None,
+                     length_time: Optional[float] = None,
                      length_measure: Optional[str] = None,
                      velocity: int = 96) -> Dict[str, Any]:
         """Add a MIDI note to a MIDI item.
@@ -365,9 +365,9 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             item_id: ID of the item
             pitch: MIDI note pitch (0-127)
             start_time: Start position in seconds (optional if start_measure is provided)
-            length_time: Note length in seconds (optional if length_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
-            length_measure: Length as "measure:beat,fraction" (optional if length_time is provided)
+            length_time: Duration in seconds from note start (from start_time or start_measure)(optional if length_measure is provided)
+            length_measure: Duration as "measure:beat,fraction" from note start (e.g., "0:2,000" = 2 beats from start_time or start_measure)(optional if length_time is provided)
             velocity: Note velocity (0-127, default: 96)
         """
         try:
@@ -631,8 +631,8 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         Args:
             track_index: Index of the track
             item_id: ID of the item
-            length_time: Length in seconds (optional if length_measure is provided)
-            length_measure: Length as "measure:beat,fraction" (optional if length_time is provided)
+            length_time: Length in seconds from start of item (optional if length_measure is provided)
+            length_measure: Length as "measure:beat,fraction" from start of item(optional if length_time is provided)
         """
         try:
             # Get current item position to calculate length in measures
@@ -728,7 +728,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             - track_index: Index of the track containing the item
             - item_index: Index of the item in its track
             - position: Start time in seconds
-            - length: Length in seconds
+            - length: Length in seconds from the start of item
             - is_midi: Whether the item is a MIDI item
             - name: Item name if available
         """
