@@ -297,6 +297,34 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to get track count: {str(e)}"}
             
+    @mcp.tool("get_track_list")
+    def get_track_list(ctx: Context) -> Dict[str, Any]:
+        """Get a list of all tracks in the project.
+
+        Returns:
+            Dict containing status and a list of tracks, each with:
+            - index: Track index
+            - name: Track name
+            - color: Track color (if available)
+        """
+        try:
+            tracks = []
+            project = reapy.Project()
+            for i, track in enumerate(project.tracks):
+                track_info = {
+                    "index": i,
+                    "name": track.name,
+                    "color": getattr(track, "color", None)
+                }
+                tracks.append(track_info)
+            return {
+                "status": "success",
+                "tracks": tracks,
+                "count": len(tracks)
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get track list: {str(e)}"}
+            
     # ----- MIDI Operations -----
     
     @mcp.tool("create_midi_item")

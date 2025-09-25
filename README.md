@@ -75,6 +75,7 @@ Available MCP tools:
 - `set_track_color`: Set track color
 - `get_track_color`: Get track color
 - `get_track_count`: Get number of tracks in project
+- `get_track_list`: Get list of all tracks with their properties
 
 #### FX Management
 - `add_fx`: Add an FX to a track
