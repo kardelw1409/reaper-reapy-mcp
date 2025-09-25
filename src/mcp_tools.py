@@ -333,15 +333,15 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                         start_measure: Optional[str] = None,
                         length_time: Optional[float] = None,
                         length_measure: Optional[str] = None) -> Dict[str, Any]:
-        """Create an empty MIDI item on a track.
+        """Create an empty MIDI item on a track. Reaper format 2.1.00 should be converted to 2:1,000.
         
         Args:
             track_index: Index of the track
             start_time: Start position in seconds (optional if start_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
                          where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
-            length_time: Duration in seconds from start position (from start_time or start_measure)(optional if length_measure is provided)
-            length_measure: Duration as "measure:beat,fraction" from start position (e.g., "2:1,000" = 2 measures from start_time or start_measure)(optional if length_time is provided)
+            length_time: Duration in seconds from start position (from start_time or start_measure)(optional if length_measure is provided).
+            length_measure: Duration as "measure:beat,fraction" from start position (e.g., "2:1,000" = 2 measures from start_time or start_measure)(optional if length_time is provided). Also remember 2:0,0 is not end of 2 measure and 3:1,0 should be.
         """
         try:
             # Determine the time position
@@ -386,7 +386,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                      length_time: Optional[float] = None,
                      length_measure: Optional[str] = None,
                      velocity: int = 96) -> Dict[str, Any]:
-        """Add a MIDI note to a MIDI item.
+        """Add a MIDI note to a MIDI item. Reaper format 2.1.00 should be converted to 2:1,000.
         
         Args:
             track_index: Index of the track
@@ -395,7 +395,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             start_time: Start position in seconds (optional if start_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
             length_time: Duration in seconds from note start (from start_time or start_measure)(optional if length_measure is provided)
-            length_measure: Duration as "measure:beat,fraction" from note start (e.g., "0:2,000" = 2 beats from start_time or start_measure)(optional if length_time is provided)
+            length_measure: Duration as "measure:beat,fraction" from note start (e.g., "0:2,000" = 2 beats from start_time or start_measure)(optional if length_time is provided). Also remember 2:0,0 is not end of 2 measure and 3:1,0 should be.
             velocity: Note velocity (0-127, default: 96)
         """
         try:
