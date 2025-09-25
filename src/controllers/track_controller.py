@@ -19,10 +19,19 @@ class TrackController(BaseController):
         """
         try:
             project = reapy.Project()
-            track = project.add_track()
-            if name:
-                track.name = name
-            return track.index
+            # Get current track count to determine where the new track will be added
+            current_track_count = len(project.tracks)
+            self.logger.info(f"Current track count: {current_track_count}")
+            
+            # Add track at the end (after all existing tracks)
+            track = project.add_track(index=current_track_count, name=name or "")
+            
+            # Get the final track count and the actual index
+            final_track_count = len(project.tracks)
+            actual_index = final_track_count - 1  # Last track index
+            
+            self.logger.info(f"Added track. Final track count: {final_track_count}, returning index: {actual_index}")
+            return actual_index
 
         except Exception as e:
             self.logger.error(f"Failed to create track: {e}")

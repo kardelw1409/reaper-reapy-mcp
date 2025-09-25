@@ -10,26 +10,60 @@ from .base_controller import BaseController
 class FXController(BaseController):
     """Controller for FX-related operations in Reaper."""
     
-    def add_fx(self, track_index: int, fx_name: str) -> int:
+    def add_fx(self, track_index: int, fx_name: str) -> bool:
         """
         Add an FX to a track.
         
         Args:
-            track_index (int): Index of the track
+            track_index (int): Index of the track to add FX to
             fx_name (str): Name of the FX to add
             
         Returns:
-            int: Index of the added FX
+            bool: True if successful, False otherwise
         """
         try:
             project = reapy.Project()
+            
+            # Validate track index
+            if track_index < 0 or track_index >= len(project.tracks):
+                self.logger.error(f"Track index {track_index} out of range (project has {len(project.tracks)} tracks)")
+                return False
+                
             track = project.tracks[track_index]
-            fx = track.add_fx(fx_name)
-            return fx.index
+            self.logger.info(f"Adding FX '{fx_name}' to track {track_index}")
+            
+            # Try to add the FX using various name formats
+            success = False
+            
+            # Try the original name first
+            try:
+                fx = track.add_fx(fx_name)
+                if fx:
+                    self.logger.info(f"Successfully added FX using original name: '{fx_name}'")
+                    success = True
+            except Exception as e:
+                self.logger.debug(f"Failed with original name '{fx_name}': {e}")
+            
+            # Try without the [VSTi] or [VST] suffix
+            if not success:
+                base_name = fx_name.split(' [')[0] if ' [' in fx_name else fx_name
+                try:
+                    fx = track.add_fx(base_name)
+                    if fx:
+                        self.logger.info(f"Successfully added FX using base name: '{base_name}'")
+                        success = True
+                except Exception as e:
+                    self.logger.debug(f"Failed with base name '{base_name}': {e}")
+            
+            if not success:
+                self.logger.error(f"Failed to add FX '{fx_name}' to track {track_index} with all attempted names")
+                return False
+                
+            return True
 
         except Exception as e:
-            self.logger.error(f"Failed to add FX: {e}")
-            return -1
+            self.logger.error(f"Failed to add FX to track {track_index}: {e}")
+            return False
 
     def remove_fx(self, track_index: int, fx_index: int) -> bool:
         """
@@ -296,6 +330,8 @@ class FXController(BaseController):
                                                 if len(comma_parts) >= 3:
                                                     # The plugin name is typically after the second comma
                                                     plugin_name = comma_parts[2].strip()
+                                                    # Clean up the plugin name by removing common postfixes
+                                                    plugin_name = self._clean_plugin_name(plugin_name)
                                                     if plugin_name and plugin_name not in fx_list:
                                                         fx_list.append(plugin_name)
                                                         continue  # Skip other checks for this line
@@ -308,6 +344,8 @@ class FXController(BaseController):
                                                     name_match = re.search(r'"([^"]+)"', part)
                                                     if name_match:
                                                         plugin_name = name_match.group(1)
+                                                        # Clean up the plugin name by removing common postfixes
+                                                        plugin_name = self._clean_plugin_name(plugin_name)
                                                         if plugin_name not in fx_list:
                                                             fx_list.append(plugin_name)
             except Exception as e:
@@ -351,3 +389,59 @@ class FXController(BaseController):
         except Exception as e:
             self.logger.error(f"Failed to toggle FX: {e}")
             return False
+
+    def _clean_plugin_name(self, plugin_name: str) -> str:
+        """
+        Clean plugin name by removing unwanted characters and standardizing format.
+        
+        Args:
+            plugin_name (str): Original plugin name
+            
+        Returns:
+            str: Cleaned plugin name
+        """
+        if not plugin_name:
+            return plugin_name
+            
+        cleaned_name = plugin_name
+        
+        # First, remove unwanted characters like !!!
+        cleaned_name = re.sub(r'!!!+', '', cleaned_name)
+        
+        # Remove other unwanted special characters but keep meaningful ones
+        cleaned_name = re.sub(r'[^\w\s\(\)\-\+\&\.\,\']', '', cleaned_name)
+        
+        # Detect if it's a VST instrument and preserve that information in a clean format
+        is_vsti = False
+        if re.search(r'\b(vsti|instrument)\b', cleaned_name, re.IGNORECASE):
+            is_vsti = True
+        
+        # Remove common postfixes but keep track of VST type
+        postfixes_to_remove = [
+            r'\s*\(vsti\)$',
+            r'\s*\(vst\)$', 
+            r'\s*\(vst3\)$',
+            r'\s*\(au\)$',
+            r'\s*\(dx\)$',
+            r'\s*\(rtas\)$',
+            r'\s*\(aax\)$',
+            r'\s*vsti$',
+            r'\s*vst$',
+            r'\s*vst3$',
+            r'\s*au$',
+            r'\s*dx$',
+            r'\s*rtas$',
+            r'\s*aax$'
+        ]
+        
+        for postfix_pattern in postfixes_to_remove:
+            cleaned_name = re.sub(postfix_pattern, '', cleaned_name, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+        
+        # If it was a VSTi, add a clean suffix to distinguish from regular effects
+        if is_vsti and not re.search(r'\(.*instrument.*\)', cleaned_name, re.IGNORECASE):
+            cleaned_name += " [VSTi]"
+        
+        return cleaned_name

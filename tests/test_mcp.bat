@@ -1,3 +1,3 @@
 @echo off
 echo Starting MCP inspector...
-npx @modelcontextprotocol/inspector python src\\run_mcp_server.py
+npx @modelcontextprotocol/inspector uv --directory "../" run -m src.run_mcp_server
