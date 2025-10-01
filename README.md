@@ -110,6 +110,7 @@ Available MCP tools:
 - `create_midi_item`: Create an empty MIDI item on a track
   - Supports both time (seconds) and measure:beat positioning
 - `add_midi_note`: Add a MIDI note to a MIDI item
+- `add_midi_notes`: Add multiple MIDI notes at once
 - `get_midi_notes`: Get all MIDI notes from a MIDI item
 - `clear_midi_item`: Clear all MIDI notes from a MIDI item
 

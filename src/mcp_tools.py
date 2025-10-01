@@ -344,6 +344,13 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             length_measure: Duration as "measure:beat,fraction" from start position (e.g., "2:1,000" = 2 measures from start_time or start_measure)(optional if length_time is provided). Also remember 2:0,0 is not end of 2 measure and 3:1,0 should be.
         """
         try:
+            # Normalize length_measure if it ends with :0,0
+            if length_measure and ':0,0' in length_measure:
+                # Split into measure and rest
+                measure_part = int(length_measure.split(':')[0])
+                # Convert M:0,0 to M+1:1,0
+                length_measure = f"{measure_part+1}:1,0"
+                
             # Determine the time position
             if start_time is not None:
                 time_pos = float(start_time)
@@ -399,6 +406,13 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             velocity: Note velocity (0-127, default: 96)
         """
         try:
+            # Normalize length_measure if it ends with :0,0
+            if length_measure and ':0,0' in length_measure:
+                # Split into measure and rest
+                measure_part = int(length_measure.split(':')[0])
+                # Convert M:0,0 to M+1:1,0
+                length_measure = f"{measure_part+1}:1,0"
+            
             # Get MIDI item properties for debugging
             item_props = controller.get_item_properties(track_index, item_id)
             if not item_props:
@@ -663,6 +677,13 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             length_measure: Length as "measure:beat,fraction" from start of item(optional if length_time is provided)
         """
         try:
+            # Normalize length_measure if it ends with :0,0
+            if length_measure and ':0,0' in length_measure:
+                # Split into measure and rest
+                measure_part = int(length_measure.split(':')[0])
+                # Convert M:0,0 to M+1:1,0
+                length_measure = f"{measure_part+1}:1,0"
+                
             # Get current item position to calculate length in measures
             props = controller.get_item_properties(track_index, item_id)
             if not props:
@@ -922,3 +943,81 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "Failed to render project"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to render project: {str(e)}"}
+
+    @mcp.tool("add_midi_notes")
+    def add_midi_notes(ctx: Context, track_index: int, item_id: int, notes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Add multiple MIDI notes to a MIDI item in one operation.
+        
+        Args:
+            track_index: Index of the track
+            item_id: ID of the item
+            notes: List of note definitions, each containing:
+                - pitch: MIDI note pitch (0-127)
+                - start_time: Start position in seconds (optional if start_measure provided)
+                - start_measure: Start position as "measure:beat,fraction" (optional if start_time provided)
+                - length_time: Duration in seconds (optional if length_measure provided)
+                - length_measure: Duration as "measure:beat,fraction" (e.g., "0:2,000" = 2 beats)
+                - velocity: Note velocity (0-127, optional, default: 96)
+        
+        Example:
+            notes = [
+                {
+                    "pitch": 60,
+                    "start_measure": "1:1,000",
+                    "length_measure": "0:2,000",
+                    "velocity": 100
+                },
+                {
+                    "pitch": 64,
+                    "start_time": 2.5,
+                    "length_time": 0.5
+                }
+            ]
+        """
+        try:
+            results = []
+            errors = []
+            
+            for i, note in enumerate(notes):
+                try:
+                    # Call existing add_midi_note tool with parameters from note dict
+                    result = add_midi_note(ctx, 
+                        track_index=track_index,
+                        item_id=item_id,
+                        pitch=note["pitch"],
+                        start_time=note.get("start_time"),
+                        start_measure=note.get("start_measure"),
+                        length_time=note.get("length_time"),
+                        length_measure=note.get("length_measure"),
+                        velocity=note.get("velocity", 96)
+                    )
+                    
+                    if result["status"] == "success":
+                        results.append({
+                            "index": i,
+                            "note": note,
+                            "details": result["note"]
+                        })
+                    else:
+                        errors.append({
+                            "index": i,
+                            "note": note,
+                            "error": result["message"]
+                        })
+                        
+                except Exception as e:
+                    errors.append({
+                        "index": i,
+                        "note": note,
+                        "error": str(e)
+                    })
+            
+            return {
+                "status": "success" if not errors else "partial" if results else "error",
+                "message": f"Added {len(results)} notes, {len(errors)} failed",
+                "successful_notes": results,
+                "failed_notes": errors
+            }
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to add MIDI notes: {str(e)}"}
