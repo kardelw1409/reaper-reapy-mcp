@@ -1,3 +1,3 @@
 @echo off
 echo Starting MCP inspector...
-npx @modelcontextprotocol/inspector uv --directory "../" run -m src.run_mcp_server
+npx @modelcontextprotocol/inspector uv --directory "../" run -m reaper_reapy_mcp
