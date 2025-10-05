@@ -48,17 +48,17 @@ This is a short Star Wars theme clip that's commonly used for testing audio appl
 
 You can run the server using uv directly:
 ```bash
-uv --directory <project_path> run -m src.run_mcp_server
+uv --directory <project_path> run -m reaper_reapy_mcp
 ```
 
 For example, on Windows:
 ```bash
-uv --directory C:\path\to\guitar_pro_mcp2 run -m src.run_mcp_server
+uv --directory C:\path\to\reaper_reapy_mcp run -m reaper_reapy_mcp
 ```
 
 Or using the Python module directly after installation:
 ```bash
-python -m src.run_mcp_server
+python -m reaper_reapy_mcp
 ```
 
 ### Use the MCP inspector to test the tools:
@@ -179,7 +179,7 @@ Many MCP tools now support dual position formats for enhanced musical workflow:
                 "<path to folder>",
                 "run",
                 "-m",
-                "src.run_mcp_server"
+                "reaper_reapy_mcp"
             ]
         }
     }
@@ -194,7 +194,22 @@ Many MCP tools now support dual position formats for enhanced musical workflow:
             "type": "stdio",
             "command": "python",
             "args": [
-                "<path to folder>\\src\\run_mcp_server.py"
+                "-m"
+                "reaper_reapy_mcp"
+            ]
+        }
+    }
+}
+```
+or
+```json
+{
+    "mcpServers": {
+        "reaper-reapy-mcp": {
+            "type": "stdio",
+            "command": "python",
+            "args": [
+                "<path to folder>\\src\\reaper_reapy_mcp.py"
             ]
         }
     }
