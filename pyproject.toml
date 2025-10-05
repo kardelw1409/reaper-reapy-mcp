@@ -3,14 +3,14 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "reaper_api_usage"
+name = "reaper-reapy-mcp"
 version = "0.1.0"
 description = "REAPER DAW integration using MCP"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "wegitor", email = "your.email@example.com"},
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -31,9 +31,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/reaper_api_usage"
-Repository = "https://github.com/yourusername/reaper_api_usage.git"
-Issues = "https://github.com/yourusername/reaper_api_usage/issues"
+Homepage = "https://github.com/wegitor/reaper-reapy-mcp"
+Repository = "https://github.com/wegitor/reaper-reapy-mcp.git"
+Issues = "https://github.com/wegitor/reaper-reapy-mcp/issues"
 
 [tool.setuptools]
 packages = ["src"] 
