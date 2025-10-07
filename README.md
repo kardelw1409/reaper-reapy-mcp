@@ -29,7 +29,14 @@ A Python application for controlling REAPER Digital Audio Workstation (DAW) usin
 1. Install REAPER if you haven't already
 2. Enable reapy server via REAPER scripting
     add reaper_side_enable_server.py to reaper actions and run it inside reaper studio
-3. Install current package:
+3. Install the package:
+   ```bash
+   # From PyPI
+   pip install reaper-reapy-mcp
+
+   # From GitHub repository
+   pip install git+https://github.com/wegitor/reaper-reapy-mcp.git
+   ```
 4. Enable python in REAPER
 
 
@@ -194,7 +201,7 @@ Many MCP tools now support dual position formats for enhanced musical workflow:
             "type": "stdio",
             "command": "python",
             "args": [
-                "-m"
+                "-m",
                 "reaper_reapy_mcp"
             ]
         }
