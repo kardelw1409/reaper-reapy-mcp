@@ -32,7 +32,7 @@ A Python application for controlling REAPER Digital Audio Workstation (DAW) usin
 3. Install the package:
    ```bash
    # From PyPI
-   pip install reaper-reapy-mcp
+   pip install reaper_reapy_mcp
 
    # From GitHub repository
    pip install git+https://github.com/wegitor/reaper-reapy-mcp.git
