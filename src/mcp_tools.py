@@ -395,6 +395,9 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                      velocity: int = 96) -> Dict[str, Any]:
         """Add a MIDI note to a MIDI item. Reaper format 2.1.00 should be converted to 2:1,000.
         
+        Important: Please check MIDI item length in which you want to add the note. 
+        If the note extends beyond the item bounds, create another one or resize existing before note adding.
+        
         Args:
             track_index: Index of the track
             item_id: ID of the item
@@ -973,6 +976,10 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                     "length_time": 0.5
                 }
             ]
+
+        Important: Please check MIDI item length in which you want to add the note. 
+        If the note extends beyond the item bounds, create another one or resize existing before note adding.
+        
         """
         try:
             results = []
