@@ -2,7 +2,10 @@
 
 A Python application for controlling REAPER Digital Audio Workstation (DAW) using the MCP(Model context protocol).
 
-![REAPER MCP Demo](docs/media/reaper-reapy-mcp-demo-for-gif-002.gif)
+![REAPER MCP MIDI generation Demo](docs/media/midi-generation.gif)
+
+
+![REAPER MCP project features Demo](docs/media/reaper-reapy-mcp-demo-for-gif-002.gif)
 
 ## Features
 
