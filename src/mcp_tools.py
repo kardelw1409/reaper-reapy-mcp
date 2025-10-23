@@ -17,9 +17,42 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Connection test failed: {str(e)}"}
 
+    @mcp.tool("get_region_list")
+    def get_region_list(ctx: Context) -> Dict[str, Any]:
+        """Get a list of all regions in the project.
+
+        Returns:
+            Dict containing status and a list of regions, each with:
+            - index: region index
+            - start: region start position
+            - end: region end position
+        """
+        try:
+            regions = []
+            project = reapy.Project()
+
+            for i, region in enumerate(project.regions):
+                region_info = {
+                    "index": i,
+                    "start": region.start,
+                    "end": region.end
+                }
+                regions.append(region_info)
+            return {
+                "status": "success",
+                "regions": regions,
+                "count": len(regions)
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get region list: {str(e)}"}
+
+
     @mcp.tool("create_track")
     def create_track(ctx: Context, name: Optional[str] = None) -> Dict[str, Any]:
-        """Create a new track in Reaper."""
+        """Note: Track indices in REAPER API are 0-based (first track = 0, second = 1, etc.)
+              However, REAPER's visual interface displays tracks starting from 1.
+              So track 0 in API = Track 1 in REAPER UI.
+        """
         try:
             track_index = controller.create_track(name)
             return {"status": "success", "message": f"Created track {track_index}"}
@@ -28,7 +61,14 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
 
     @mcp.tool("rename_track")
     def rename_track(ctx: Context, track_index: int, new_name: str) -> Dict[str, Any]:
-        """Rename an existing track."""
+        """Rename an existing track.
+        
+        Args:
+            track_index: 0-based track index (0 = first track, 1 = second, etc.)
+                        Note: REAPER UI shows tracks starting from 1, but API uses 0-based indexing.
+                        API track 0 = UI Track 1, API track 1 = UI Track 2, etc.
+            new_name: New name for the track
+        """
         try:
             if controller.rename_track(track_index, new_name):
                 return {"status": "success", "message": f"Renamed track {track_index} to {new_name}"}
@@ -57,7 +97,12 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
 
     @mcp.tool("set_track_color")
     def set_track_color(ctx: Context, track_index: int, color: str) -> Dict[str, Any]:
-        """Set the color of a track."""
+        """Set the color of a track.
+        
+        Args:
+            track_index: 0-based track index (0 = first track, 1 = second track, etc.)
+            color: Color value
+        """
         try:
             if controller.set_track_color(track_index, color):
                 return {"status": "success", "message": f"Set color of track {track_index} to {color}"}
@@ -67,7 +112,11 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
 
     @mcp.tool("get_track_color")
     def get_track_color(ctx: Context, track_index: int) -> Dict[str, Any]:
-        """Get the color of a track."""
+        """Get the color of a track.
+        
+        Args:
+            track_index: 0-based track index (0 = first track, 1 = second track, etc.)
+        """
         try:
             color = controller.get_track_color(track_index)
             return {"status": "success", "message": f"Color of track {track_index}: {color}"}
@@ -130,9 +179,16 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         """Get a list of all FX on a track."""
         try:
             fx_list = controller.get_fx_list(track_index)
-            if fx_list:
-                return {"status": "success", "message": f"Retrieved {len(fx_list)} FX on track {track_index}", "fx_list": fx_list}
-            return {"status": "error", "message": f"Failed to get FX list for track {track_index}"}
+            # If controller returns None -> treat as failure.
+            if fx_list is None:
+                return {"status": "error", "message": f"Failed to get FX list for track {track_index}"}
+            # Empty list is a successful response with count 0.
+            return {
+                "status": "success",
+                "message": f"Retrieved {len(fx_list)} FX on track {track_index}",
+                "fx_list": fx_list,
+                "count": len(fx_list)
+            }
         except Exception as e:
             return {"status": "error", "message": f"Failed to get FX list: {str(e)}"}
             
@@ -333,10 +389,19 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                         start_measure: Optional[str] = None,
                         length_time: Optional[float] = None,
                         length_measure: Optional[str] = None) -> Dict[str, Any]:
-        """Create an empty MIDI item on a track. Reaper format 2.1.00 should be converted to 2:1,000.
+        """Create an empty MIDI item on a track. 
+        
+        Important: It is recommended to avoid overlapping MIDI items. Ensure to double-check before creating a new one.
+
+        Returns both track_pos_idx and direct_item_id for flexible item referencing:
+        - track_pos_idx: 0-based position index within the track (0, 1, 2, etc.)
+        - direct_item_id: REAPER's internal item ID (string pointer)
+        
+        Both can be used interchangeably in subsequent operations like add_midi_note.
         
         Args:
-            track_index: Index of the track
+            track_index: 0-based track index (0 = first track, 1 = second, etc.)
+                        Note: REAPER UI shows "Track 1, Track 2" but API uses 0, 1, etc.
             start_time: Start position in seconds (optional if start_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
                          where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
@@ -344,13 +409,18 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             length_measure: Duration as "measure:beat,fraction" from start position (e.g., "2:1,000" = 2 measures from start_time or start_measure)(optional if length_time is provided). Also remember 2:0,0 is not end of 2 measure and 3:1,0 should be.
         """
         try:
-            # Normalize length_measure if it ends with :0,0
-            if length_measure and ':0,0' in length_measure:
-                # Split into measure and rest
-                measure_part = int(length_measure.split(':')[0])
-                # Convert M:0,0 to M+1:1,0
-                length_measure = f"{measure_part+1}:1,0"
-                
+            # Normalize length_measure: reject explicit zero-length "0:0,0", convert "M:0,0" -> "M+1:1,0"
+            if length_measure:
+                lm = length_measure.strip()
+                if lm in ("0:0,0", "0:0.0"):
+                    return {"status": "error", "message": "Invalid length_measure: zero length specified (0:0,0)"}
+                if ":0,0" in lm or ":0.0" in lm:
+                    try:
+                        measure_part = int(lm.split(':')[0])
+                        length_measure = f"{measure_part+1}:1,0"
+                    except Exception:
+                        return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
+                        
             # Determine the time position
             if start_time is not None:
                 time_pos = float(start_time)
@@ -363,22 +433,34 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                 
             # Determine length
             if length_time is not None:
-                length = float(length_time)
+                try:
+                    length_val = float(length_time)
+                except Exception:
+                    return {"status": "error", "message": "Invalid length_time value"}
+                if length_val <= 0:
+                    return {"status": "error", "message": "Note length must be greater than zero"}
+                length = length_val
                 end_time = time_pos + length
                 length_pos = time_to_measure(end_time)
             elif length_measure is not None:
-                length = measure_length_to_time(length_measure, time_pos)
+                try:
+                    length = measure_length_to_time(length_measure, time_pos)
+                except Exception as e:
+                    return {"status": "error", "message": f"Invalid length_measure: {e}"}
+                if length <= 0:
+                    return {"status": "error", "message": "Note length must be greater than zero"}
                 end_time = time_pos + length
                 length_pos = time_to_measure(end_time)
             else:
                 return {"status": "error", "message": "Either length_time or length_measure must be provided"}
 
-            item_id = controller.create_midi_item(track_index, time_pos, length)
-            if (isinstance(item_id, int) and item_id >= 0) or (isinstance(item_id, str) and item_id):
+            result = controller.create_midi_item(track_index, time_pos, length)
+            if result['track_pos_idx'] >= 0 or result['direct_item_id']:
                 return {
                     "status": "success",
                     "message": f"Created MIDI item at position {measure_pos} with length {length_pos}",
-                    "item_id": item_id,
+                    "track_pos_idx": result['track_pos_idx'],
+                    "direct_item_id": result['direct_item_id'],
                     "position": {"time": time_pos, "measure": measure_pos},
                     "end": {"time": end_time, "measure": length_pos}
                 }
@@ -387,60 +469,117 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to create MIDI item: {str(e)}"}
     
     @mcp.tool("add_midi_note")
-    def add_midi_note(ctx: Context, track_index: int, item_id: int, pitch: int, 
+    def add_midi_note(ctx: Context, track_index: int, item: Union[int, str], pitch: int, 
                      start_time: Optional[float] = None, 
                      start_measure: Optional[str] = None,
                      length_time: Optional[float] = None,
                      length_measure: Optional[str] = None,
-                     velocity: int = 96) -> Dict[str, Any]:
+                     velocity: int = 96,
+                     relative_start: bool = False) -> Dict[str, Any]:
         """Add a MIDI note to a MIDI item. Reaper format 2.1.00 should be converted to 2:1,000.
         
         Important: Please check MIDI item length in which you want to add the note. 
         If the note extends beyond the item bounds, create another one or resize existing before note adding.
+        Double-check the item's starting position before adding it. Notes positioned before the item's position won't be added.
+
+        Item Identification - TWO ways to specify which item:
+        
+        1. Using track_pos_idx (integer):
+           - Pass the simple index number from create_midi_item response
+           - Example: item=track_pos_idx=0 for first item, item=track_pos_idx=1 for second item
+           - Fast and easy but may change if items are reordered
+           
+        2. Using direct_item_id (string):
+           - Pass the exact string ID from create_midi_item or get_items_in_time_range
+           - Example: item=direct_item_id="MediaItem*0x000001234567890A"
+           - Stable and reliable, won't change even if items move
+        
+        The system automatically detects which type you're using.
+        
+        Note about positioning:
+        - start_time and start_measure specify ABSOLUTE position in the project timeline
+        - The note will be placed at this absolute position, regardless of item location
+        - Example: start_measure="5:1,000" means measure 5 in the project, not 5 measures into the item
         
         Args:
-            track_index: Index of the track
-            item_id: ID of the item
+            track_index: 0-based track index (0 = first track, 1 = second, etc.)
+                        Important: REAPER UI displays "Track 1" but API uses index 0.
+            item: EITHER an integer track_pos_idx (0, 1, 2...) OR a string direct_item_id
             pitch: MIDI note pitch (0-127)
-            start_time: Start position in seconds (optional if start_measure is provided)
-            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            start_time: ABSOLUTE start position in seconds in the project timeline (optional if start_measure is provided)
+            start_measure: ABSOLUTE start position as "measure:beat,fraction" in the project timeline (optional if start_time is provided)
             length_time: Duration in seconds from note start (from start_time or start_measure)(optional if length_measure is provided)
             length_measure: Duration as "measure:beat,fraction" from note start (e.g., "0:2,000" = 2 beats from start_time or start_measure)(optional if length_time is provided). Also remember 2:0,0 is not end of 2 measure and 3:1,0 should be.
             velocity: Note velocity (0-127, default: 96)
+            relative_start: If True, start_time/start_measure are interpreted as offsets
+                            from the item's start (i.e. relative to item.start). If False
+                            (default), they are treated as absolute project positions.
         """
         try:
-            # Normalize length_measure if it ends with :0,0
-            if length_measure and ':0,0' in length_measure:
-                # Split into measure and rest
-                measure_part = int(length_measure.split(':')[0])
-                # Convert M:0,0 to M+1:1,0
-                length_measure = f"{measure_part+1}:1,0"
+            # Normalize length_measure: convert M:0,0 -> M+1:1,0, but reject explicit "0:0,0"
+            if length_measure:
+                lm = length_measure.strip()
+                if lm in ("0:0,0", "0:0.0"):
+                    return {"status": "error", "message": "Invalid length_measure: zero length specified (0:0,0)"}
+                if ":0,0" in lm or ":0.0" in lm:
+                    try:
+                        measure_part = int(lm.split(':')[0])
+                        length_measure = f"{measure_part+1}:1,0"
+                    except Exception:
+                        return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
             
-            # Get MIDI item properties for debugging
-            item_props = controller.get_item_properties(track_index, item_id)
+            # Get MIDI item properties for debugging / existence check
+            item_props = controller.get_item_properties(track_index, item)
             if not item_props:
-                return {"status": "error", "message": "Failed to get MIDI item properties"}
+                return {"status": "error", "message": "MIDI item does not exist"}
                 
             item_start = item_props.get("position", 0)
             item_length = item_props.get("length", 0)
             
-            # Determine the start position
+            # Determine the start position (absolute vs relative to item start)
             if start_time is not None:
-                time_pos = float(start_time)
+                if relative_start:
+                    # treat start_time as offset from item_start
+                    time_pos = item_start + float(start_time)
+                else:
+                    time_pos = float(start_time)
                 measure_pos = time_to_measure(time_pos)
             elif start_measure is not None:
-                time_pos = position_to_time(start_measure)
-                measure_pos = start_measure
+                if relative_start:
+                    # treat start_measure as a length/offset from item_start
+                    offset = measure_length_to_time(start_measure, item_start)
+                    time_pos = item_start + offset
+                else:
+                    time_pos = position_to_time(start_measure)
+                measure_pos = time_to_measure(time_pos)
             else:
                 return {"status": "error", "message": "Either start_time or start_measure must be provided"}
 
+            # NEW: if using absolute mode, reject notes that start before the item
+            if not relative_start and time_pos < item_start:
+                return {
+                    "status": "error",
+                    "message": "Requested note start is before the MIDI item start; note will not be added."
+                }
+
             # Determine the length
             if length_time is not None:
-                length = max(float(length_time), 0.1)  # Minimum length 0.1s
+                try:
+                    length_val = float(length_time)
+                except Exception:
+                    return {"status": "error", "message": "Invalid length_time value"}
+                if length_val <= 0:
+                    return {"status": "error", "message": "Note length must be greater than zero"}
+                length = length_val
                 end_time = time_pos + length
                 end_measure = time_to_measure(end_time)
             elif length_measure is not None:
-                length = measure_length_to_time(length_measure, time_pos)
+                try:
+                    length = measure_length_to_time(length_measure, time_pos)
+                except Exception as e:
+                    return {"status": "error", "message": f"Invalid length_measure: {e}"}
+                if length <= 0:
+                    return {"status": "error", "message": "Note length must be greater than zero"}
                 end_time = time_pos + length
                 end_measure = time_to_measure(end_time)
             else:
@@ -467,6 +606,9 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                         "start": relative_item_pos,
                         "length": length,
                         "end": relative_item_pos + length
+                    },
+                    "flags": {
+                        "relative_start_mode": relative_start
                     }
                 },
                 "calculations": {
@@ -477,20 +619,130 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                 }
             }
 
-            if controller.add_midi_note(track_index, item_id, pitch, relative_item_pos, length, velocity):
+            if controller.add_midi_note(track_index, item, pitch, relative_item_pos, length, velocity):
                 return {
                     "status": "success", 
-                    "message": f"Added MIDI note (pitch: {pitch}, velocity: {velocity}) to item {item_id}",
+                    "message": f"Added MIDI note (pitch: {pitch}, velocity: {velocity}) to item {item}",
                     "note": {
                         "start": {"time": time_pos, "measure": measure_pos},
                         "length": length,
-                        "end": {"time": end_time, "measure": end_measure}
+                        "end": {"time": end_time, "measure": end_measure},
+                        "relative_start_mode": relative_start
                     },
                     "debug": debug_info
                 }
             return {"status": "error", "message": "Failed to add MIDI note"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to add MIDI note: {str(e)}"}
+    
+    @mcp.tool("add_midi_notes")
+    def add_midi_notes(ctx: Context, track_index: int, item: Union[int, str], notes: List[Dict[str, Any]],
+                       relative_start: bool = False) -> Dict[str, Any]:
+        """Add multiple MIDI notes to a MIDI item in one operation.
+        
+        Important: Please check MIDI item length in which you want to add notes. 
+        If any note extends beyond the item bounds, create another one or resize existing before note adding.
+        
+        Item Identification - TWO ways to specify which item:
+        
+        1. Using track_pos_idx (integer):
+           - Simple position number: 0 = first item, 1 = second item, etc.
+           - Get this from create_midi_item response field "track_pos_idx"
+           - Quick but may become invalid if items are deleted/reordered
+           
+        2. Using direct_item_id (string):
+           - REAPER's internal pointer like "MediaItem*0x000001234567890A"
+           - Get this from create_midi_item response field "direct_item_id"
+           - Or from get_items_in_time_range response
+           - Guaranteed to always point to the same item
+        
+        Recommendation: Use track_pos_idx for quick scripts, direct_item_id for reliability.
+        
+        Args:
+            track_index: Index of the track
+            track_pos_idx: EITHER integer track_pos_idx OR string direct_item_id
+            notes: List of note definitions, each containing:
+                - pitch: MIDI note pitch (0-127)
+                - start_time: Start position in seconds (optional if start_measure provided)
+                - start_measure: Start position as "measure:beat,fraction" (optional if start_time provided)
+                - length_time: Duration in seconds (optional if length_measure provided)
+                - length_measure: Duration as "measure:beat,fraction" (e.g., "0:2,000" = 2 beats)
+                - velocity: Note velocity (0-127, optional, default: 96)
+                - relative_start: Default mode for all notes. Per-note override supported via note['relative_start'] (bool).
+        
+        Example:
+            notes = [
+                {
+                    "pitch": 60,
+                    "start_measure": "1:1,000",
+                    "length_measure": "0:2,000",
+                    "velocity": 100
+                },
+                {
+                    "pitch": 64,
+                    "start_time": 2.5,
+                    "length_time": 0.5
+                }
+            ]
+        """
+        try:
+            # Check if item exists before adding notes
+            item_props = controller.get_item_properties(track_index, item)
+            if not item_props:
+                return {
+                    "status": "error",
+                    "message": "MIDI item does not exist",
+                    "successful_notes": [],
+                    "failed_notes": [{"error": "MIDI item does not exist"}]
+                }
+            
+            results = []
+            errors = []
+            
+            for i, note in enumerate(notes):
+                try:
+                    note_relative = note.get("relative_start", relative_start)
+                    result = add_midi_note(ctx, 
+                        track_index=track_index,
+                        item=item,  # Can be either track_pos_idx or direct_item_id
+                        pitch=note["pitch"],
+                        start_time=note.get("start_time"),
+                        start_measure=note.get("start_measure"),
+                        length_time=note.get("length_time"),
+                        length_measure=note.get("length_measure"),
+                        velocity=note.get("velocity", 96),
+                        relative_start=note_relative
+                    )
+                    
+                    if result["status"] == "success":
+                        results.append({
+                            "index": i,
+                            "note": note,
+                            "details": result["note"]
+                        })
+                    else:
+                        errors.append({
+                            "index": i,
+                            "note": note,
+                            "error": result.get("message", "unknown error")
+                        })
+                        
+                except Exception as e:
+                    errors.append({
+                        "index": i,
+                        "note": note,
+                        "error": str(e)
+                    })
+            
+            return {
+                "status": "success" if not errors else "partial" if results else "error",
+                "message": f"Added {len(results)} notes, {len(errors)} failed",
+                "successful_notes": results,
+                "failed_notes": errors
+            }
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to add MIDI notes: {str(e)}"}
     
     @mcp.tool("clear_midi_item")
     def clear_midi_item(ctx: Context, track_index: int, item_id: int) -> Dict[str, Any]:
@@ -503,11 +755,24 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to clear MIDI item: {str(e)}"}
             
     @mcp.tool("get_midi_notes")
-    def get_midi_notes(ctx: Context, track_index: int, item_id: int) -> Dict[str, Any]:
-        """Get all MIDI notes from a MIDI item."""
+    def get_midi_notes(ctx: Context, track_index: int, item_id: Union[int, str], include_invisible: bool = False) -> Dict[str, Any]:
+        """Get all MIDI notes from a MIDI item.
+        
+        By default, returns only visible notes (within item bounds). 
+        Invisible notes exist in the MIDI data but won't sound during playback.
+        
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
+        Args:
+            track_index: Index of the track
+            item_id: EITHER integer track_pos_idx OR string direct_item_id
+            include_invisible: If True, include notes outside item bounds (won't sound). Default: False
+        """
         try:
-            notes = controller.get_midi_notes(track_index, item_id)
-            return {"status": "success", "notes": notes}
+            notes = controller.get_midi_notes(track_index, item_id, include_invisible)
+            return {"status": "success", "notes": notes, "count": len(notes)}
         except Exception as e:
             return {"status": "error", "message": f"Failed to get MIDI notes: {str(e)}"}
 
@@ -575,13 +840,17 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to insert audio item: {str(e)}"}
     
     @mcp.tool("duplicate_item")
-    def duplicate_item(ctx: Context, track_index: int, item_id: int, 
+    def duplicate_item(ctx: Context, track_index: int, item_id: Union[int, str], 
                       new_time: Optional[float] = None, new_measure: Optional[str] = None) -> Dict[str, Any]:
         """Duplicate an existing item on a track.
         
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
         Args:
             track_index: Index of the track
-            item_id: ID of the item to duplicate
+            item_id: EITHER integer track_pos_idx OR string direct_item_id
             new_time: New position in seconds (optional)
             new_measure: New position as "measure:beat,fraction" (optional)
         """
@@ -627,25 +896,38 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to duplicate item: {str(e)}"}
     
     @mcp.tool("get_item_properties")
-    def get_item_properties(ctx: Context, track_index: int, item_id: int) -> Dict[str, Any]:
-        """Get properties of a media item."""
+    def get_item_properties(ctx: Context, track_index: int, item: Union[int, str]) -> Dict[str, Any]:
+        """Get properties of a media item.
+        
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
+        Args:
+            track_index: Index of the track
+            item_id: EITHER integer track_pos_idx OR string direct_item_id
+        """
         try:
-            properties = controller.get_item_properties(track_index, item_id)
+            properties = controller.get_item_properties(track_index, item)
             if properties:
                 return {"status": "success", "properties": properties}
-            return {"status": "error", "message": f"Failed to get properties for item {item_id}"}
+            return {"status": "error", "message": f"Failed to get properties for item {item}"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to get item properties: {str(e)}"}
     
     @mcp.tool("set_item_position")
-    def set_item_position(ctx: Context, track_index: int, item_id: int, 
+    def set_item_position(ctx: Context, track_index: int, item_id: Union[int, str], 
                          position_time: Optional[float] = None, 
                          position_measure: Optional[str] = None) -> Dict[str, Any]:
         """Set the position of a media item.
         
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
         Args:
             track_index: Index of the track
-            item_id: ID of the item
+            item_id: EITHER integer track_pos_idx OR string direct_item_id
             position_time: New position in seconds (optional if position_measure is provided)
             position_measure: New position as "measure:beat,fraction" (optional if position_time is provided)
                            where fraction is milliseconds (e.g., "1:1,500" = measure 1, beat 1, half beat)
@@ -668,25 +950,34 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to set item position: {str(e)}"}
     
     @mcp.tool("set_item_length")
-    def set_item_length(ctx: Context, track_index: int, item_id: int,
+    def set_item_length(ctx: Context, track_index: int, item_id: Union[int, str],
                        length_time: Optional[float] = None,
                        length_measure: Optional[str] = None) -> Dict[str, Any]:
         """Set the length of a media item.
         
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
         Args:
             track_index: Index of the track
-            item_id: ID of the item
+            item_id: EITHER integer track_pos_idx OR string direct_item_id
             length_time: Length in seconds from start of item (optional if length_measure is provided)
             length_measure: Length as "measure:beat,fraction" from start of item(optional if length_time is provided)
         """
         try:
-            # Normalize length_measure if it ends with :0,0
-            if length_measure and ':0,0' in length_measure:
-                # Split into measure and rest
-                measure_part = int(length_measure.split(':')[0])
-                # Convert M:0,0 to M+1:1,0
-                length_measure = f"{measure_part+1}:1,0"
-                
+            # Normalize length_measure: reject explicit zero-length "0:0,0", convert "M:0,0" -> "M+1:1,0"
+            if length_measure:
+                lm = length_measure.strip()
+                if lm in ("0:0,0", "0:0.0"):
+                    return {"status": "error", "message": "Invalid length_measure: zero length specified (0:0,0)"}
+                if ":0,0" in lm or ":0.0" in lm:
+                    try:
+                        measure_part = int(lm.split(':')[0])
+                        length_measure = f"{measure_part+1}:1,0"
+                    except Exception:
+                        return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
+            
             # Get current item position to calculate length in measures
             props = controller.get_item_properties(track_index, item_id)
             if not props:
@@ -715,11 +1006,20 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to set item length: {str(e)}"}
     
     @mcp.tool("delete_item")
-    def delete_item(ctx: Context, track_index: int, item_id: int) -> Dict[str, Any]:
-        """Delete a media item from a track."""
+    def delete_item(ctx: Context, track_index: int, item: Union[int, str]) -> Dict[str, Any]:
+        """Delete a media item from a track.
+        
+        Item Identification - Accepts BOTH types:
+        - track_pos_idx (integer): Simple index like 0, 1, 2
+        - direct_item_id (string): Internal ID like "MediaItem*0x..."
+        
+        Args:
+            track_index: Index of the track
+            item: EITHER integer track_pos_idx OR string direct_item_id
+        """
         try:
-            if controller.delete_item(track_index, item_id):
-                return {"status": "success", "message": f"Deleted item {item_id} from track {track_index}"}
+            if controller.delete_item(track_index, item):
+                return {"status": "success", "message": f"Deleted item {item} from track {track_index}"}
             return {"status": "error", "message": "Failed to delete item"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to delete item: {str(e)}"}
@@ -730,12 +1030,33 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                                start_measure: Optional[str] = None, end_measure: Optional[str] = None) -> Dict[str, Any]:
         """Get all items on a track within a time range.
         
+        Returns items with BOTH identification methods for each item:
+        
+        1. track_pos_idx (integer):
+           - Simple sequential index: 0, 1, 2, 3...
+           - Easy to use in loops and quick operations
+           - Changes if items before it are deleted
+           
+        2. direct_item_id (string):
+           - REAPER's permanent internal ID like "MediaItem*0x..."
+           - Unique stable reference that never changes
+           - Use this for reliable long-term item tracking
+        
+        You can use either one in subsequent operations like add_midi_note.
+        
         Args:
-            track_index: Index of the track
+            track_index: 0-based track index (0 = first track, 1 = second, etc.)
             start_time: Start position in seconds (optional if start_measure is provided)
             end_time: End position in seconds (optional if end_measure is provided)
             start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
             end_measure: End position as "measure:beat,fraction" (optional if end_time is provided)
+            
+        Returns:
+            Each item includes:
+            - track_pos_idx: Integer position index (0, 1, 2...)
+            - direct_item_id: String internal ID ("MediaItem*...")
+            - position: Item start time in seconds
+            - length: Item duration in seconds
         """
         try:
             # Determine start position
@@ -758,11 +1079,24 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             else:
                 return {"status": "error", "message": "Either end_time or end_measure must be provided"}
                 
-            item_ids = controller.get_items_in_time_range(track_index, time_start, time_end)
+            # Get items with their properties
+            project = reapy.Project()
+            track = project.tracks[track_index]
+            items_info = []
+            
+            for index, item in enumerate(track.items):
+                if time_start <= item.position < time_end or time_start < (item.position + item.length) <= time_end:
+                    items_info.append({
+                        "track_pos_idx": index,
+                        "direct_item_id": str(item.id),
+                        "position": item.position,
+                        "length": item.length
+                    })
+            
             return {
                 "status": "success", 
-                "message": f"Found {len(item_ids)} items between {measure_start} and {measure_end}",
-                "item_ids": item_ids,
+                "message": f"Found {len(items_info)} items between {measure_start} and {measure_end}",
+                "items": items_info,
                 "range": {
                     "start": {"time": time_start, "measure": measure_start},
                     "end": {"time": time_end, "measure": measure_end}
@@ -947,84 +1281,3 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to render project: {str(e)}"}
 
-    @mcp.tool("add_midi_notes")
-    def add_midi_notes(ctx: Context, track_index: int, item_id: int, notes: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Add multiple MIDI notes to a MIDI item in one operation.
-        
-        Args:
-            track_index: Index of the track
-            item_id: ID of the item
-            notes: List of note definitions, each containing:
-                - pitch: MIDI note pitch (0-127)
-                - start_time: Start position in seconds (optional if start_measure provided)
-                - start_measure: Start position as "measure:beat,fraction" (optional if start_time provided)
-                - length_time: Duration in seconds (optional if length_measure provided)
-                - length_measure: Duration as "measure:beat,fraction" (e.g., "0:2,000" = 2 beats)
-                - velocity: Note velocity (0-127, optional, default: 96)
-        
-        Example:
-            notes = [
-                {
-                    "pitch": 60,
-                    "start_measure": "1:1,000",
-                    "length_measure": "0:2,000",
-                    "velocity": 100
-                },
-                {
-                    "pitch": 64,
-                    "start_time": 2.5,
-                    "length_time": 0.5
-                }
-            ]
-
-        Important: Please check MIDI item length in which you want to add the note. 
-        If the note extends beyond the item bounds, create another one or resize existing before note adding.
-        
-        """
-        try:
-            results = []
-            errors = []
-            
-            for i, note in enumerate(notes):
-                try:
-                    # Call existing add_midi_note tool with parameters from note dict
-                    result = add_midi_note(ctx, 
-                        track_index=track_index,
-                        item_id=item_id,
-                        pitch=note["pitch"],
-                        start_time=note.get("start_time"),
-                        start_measure=note.get("start_measure"),
-                        length_time=note.get("length_time"),
-                        length_measure=note.get("length_measure"),
-                        velocity=note.get("velocity", 96)
-                    )
-                    
-                    if result["status"] == "success":
-                        results.append({
-                            "index": i,
-                            "note": note,
-                            "details": result["note"]
-                        })
-                    else:
-                        errors.append({
-                            "index": i,
-                            "note": note,
-                            "error": result["message"]
-                        })
-                        
-                except Exception as e:
-                    errors.append({
-                        "index": i,
-                        "note": note,
-                        "error": str(e)
-                    })
-            
-            return {
-                "status": "success" if not errors else "partial" if results else "error",
-                "message": f"Added {len(results)} notes, {len(errors)} failed",
-                "successful_notes": results,
-                "failed_notes": errors
-            }
-            
-        except Exception as e:
-            return {"status": "error", "message": f"Failed to add MIDI notes: {str(e)}"}
