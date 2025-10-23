@@ -1,6 +1,7 @@
 import reapy
 import logging
 from typing import Union, Dict, Any, Optional
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -112,23 +113,42 @@ def delete_item(item: reapy.Item) -> bool:
         bool: True if successful, False otherwise
     """
     try:
+        # Store the item ID and track for verification
+        item_id = str(item.id)
+        track = item.track
+        
         # Use reapy's native API to delete the item
         item.delete()
         
-        # Verify the item was deleted
-        try:
-            # Try to find the item again - it should be gone
-            for i in item.track.items:
-                if str(i.id) == str(item.id):
-                    logger.error("Item still exists after deletion")
-                    return False
-        except Exception as e:
-            # If we get an error trying to access the item, it probably means it was deleted
-            pass
+        # Wait a bit for the deletion to complete
+        time.sleep(0.05)  # 50ms wait
         
-        logger.info(f"Deleted item with ID: {item.id}")
-        return True
+        # Verify the item was deleted by checking all items in the track
+        max_retries = 3
+        for retry in range(max_retries):
+            found = False
+            try:
+                for track_item in track.items:
+                    if str(track_item.id) == item_id:
+                        found = True
+                        break
+                
+                if not found:
+                    logger.info(f"Successfully deleted item with ID: {item_id}")
+                    return True
+                
+                # Item still exists, wait a bit more
+                if retry < max_retries - 1:
+                    time.sleep(0.05)
+                    
+            except Exception as e:
+                # If we can't iterate items, assume deletion succeeded
+                logger.debug(f"Could not verify deletion (likely succeeded): {e}")
+                return True
+        
+        logger.error(f"Item {item_id} still exists after deletion attempts")
+        return False
         
     except Exception as e:
         logger.error(f"Failed to delete item: {e}")
-        return False 
+        return False
