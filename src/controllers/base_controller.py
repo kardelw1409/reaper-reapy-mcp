@@ -19,9 +19,7 @@ class BaseController:
         """
         self.logger = logging.getLogger(__name__)
         self.debug = debug
-        if debug:
-            self.logger.setLevel(logging.INFO)
-        
+
         # Initialize test data storage for storing MIDI notes during testing
         self._test_midi_items = {}
         

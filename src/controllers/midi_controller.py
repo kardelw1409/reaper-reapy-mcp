@@ -20,7 +20,7 @@ class MIDIController(BaseController):
         """
         return select_item(item)
     
-    def create_midi_item(self, track_index: int, start_time: float, length: float = 4.0) -> Union[int, str]:
+    def create_midi_item(self, track_index: int, start_time: float, length: float = 4.0) -> Dict[str, Union[int, str]]:
         """
         Create an empty MIDI item on a track.
         
@@ -30,8 +30,10 @@ class MIDIController(BaseController):
             length (float): Length of the MIDI item in seconds
             
         Returns:
-            int or str: Index or ID of the created MIDI item for direct use in add_midi_note
-            Returns -1 if creation fails
+            dict: {'track_pos_idx': int, 'direct_item_id': str} 
+                  track_pos_idx: Track-relative position index (0-based)
+                  direct_item_id: REAPER's internal item ID
+                  Returns {'track_pos_idx': -1, 'direct_item_id': None} if creation fails
         """
         try:
             # Convert and validate parameters
@@ -41,12 +43,12 @@ class MIDIController(BaseController):
                 length = float(length)
             except (ValueError, TypeError) as e:
                 self.logger.error(f"Invalid parameter type: {e}")
-                return -1
+                return {'track_pos_idx': -1, 'direct_item_id': None}
             
             # Validate track index using base controller method
             track = self._get_track(track_index)
             if track is None:
-                return -1
+                return {'track_pos_idx': -1, 'direct_item_id': None}
                 
             self.logger.debug(f"Creating MIDI item on track {track_index} at position {start_time} with length {length}")
             
@@ -54,40 +56,31 @@ class MIDIController(BaseController):
             item = track.add_midi_item(start_time, start_time + length)
             if item is None:
                 self.logger.error("Failed to create MIDI item - track.add_midi_item returned None")
-                return -1
+                return {'track_pos_idx': -1, 'direct_item_id': None}
                 
             take = item.active_take
             if take is None:
                 take = item.add_take()
                 if take is None:
                     self.logger.error("Failed to add take to MIDI item")
-                    return -1
+                    return {'track_pos_idx': -1, 'direct_item_id': None}
                 self.logger.debug("Added new take to item")
             
             self.logger.debug("Take configured for MIDI")
             
-            project = reapy.Project()
-            project.select_all_items(False)
-            try:
-                self._select_item(item)
-                self.logger.debug("Selected the newly created item")
-            except Exception as e:
-                self.logger.warning(f"Failed to select item, but continuing: {e}")
-            
             # Find the index of this item in the track's items collection
-            # This is more reliable for later operations than using the ID
             for i, track_item in enumerate(track.items):
                 if track_item.id == item.id:
-                    self.logger.info(f"Created MIDI item at index {i} with actual ID: {item.id}")
-                    return i
+                    self.logger.info(f"Created MIDI item at index {i} with ID: {item.id}")
+                    return {'track_pos_idx': i, 'direct_item_id': str(item.id)}
             
-            # Fallback to returning the raw ID if we couldn't find the index
-            self.logger.info(f"Created MIDI item with ID: {item.id}, returning as string")
-            return item.id
+            # Fallback - couldn't find index
+            self.logger.warning(f"Created MIDI item with ID: {item.id}, but couldn't find index")
+            return {'track_pos_idx': -1, 'direct_item_id': str(item.id)}
 
         except Exception as e:
             self.logger.error(f"Failed to create MIDI item: {e}")
-            return -1
+            return {'track_pos_idx': -1, 'direct_item_id': None}
     
     def add_midi_note(self, track_index: int, item_id: Union[int, str], pitch: int, 
                      start_time: float, length: float, velocity: int = 96, channel: int = 0) -> bool:
@@ -215,21 +208,24 @@ class MIDIController(BaseController):
             self.logger.error(f"Failed to clear MIDI item: {e}")
             return False
     
-    def get_midi_notes(self, track_index, item_id):
+    def get_midi_notes(self, track_index, item_id, include_invisible: bool = False):
         """
         Get all MIDI notes from a MIDI item.
         
         Args:
             track_index (int): Index of the track containing the MIDI item
             item_id (int or str): ID of the MIDI item
+            include_invisible (bool): If True, include notes outside item bounds (these notes won't sound).
+                                     Default False - returns only visible notes within item boundaries.
             
         Returns:
             list: A list of dictionaries containing MIDI note data with keys:
                 - pitch (int): MIDI note number
-                - start_time (float): Start time in seconds
-                - end_time (float): End time in seconds
+                - start_time (float): Start time in seconds (relative to item start)
+                - end_time (float): End time in seconds (relative to item start)
                 - velocity (int): Note velocity (0-127)
                 - channel (int): MIDI channel
+                - is_visible (bool): Whether note is within item bounds (only included if include_invisible=True)
         """
         self.logger.debug(f"Getting MIDI notes from track {track_index}, item {item_id}")
         
@@ -249,29 +245,38 @@ class MIDIController(BaseController):
                 return []
                 
             item_start = item.position
-            
-            # Get MIDI notes using REAPER API
-            from reapy import reascript_api as RPR
-            
-            # Make sure item is selected for MIDI operations
-            project.select_all_items(False)
-            try:
-                self._select_item(item)
-            except Exception as e:
-                self.logger.warning(f"Failed to select item, but continuing: {e}")
+            item_length = item.length
             
             # Get all MIDI notes
             notes = []
             for note in take.notes:
-                notes.append({
+                relative_start = note.start - item_start
+                relative_end = note.end - item_start
+                
+                # Check if note is visible (within item bounds)
+                is_visible = (0 <= relative_start < item_length) and (0 < relative_end <= item_length)
+                
+                # Skip invisible notes unless requested
+                if not is_visible and not include_invisible:
+                    continue
+                
+                note_data = {
                     'pitch': note.pitch,
-                    'start_time': note.start - item_start,  # Subtract item start to get time relative to item
-                    'end_time': note.end - item_start,      # Subtract item start to get time relative to item
+                    'start_time': relative_start,
+                    'end_time': relative_end,
                     'velocity': note.velocity,
                     'channel': note.channel
-                })
+                }
+                
+                # Add visibility flag only when including invisible notes
+                if include_invisible:
+                    note_data['is_visible'] = is_visible
+                    if not is_visible:
+                        note_data['_note'] = 'Note outside item bounds - will not sound during playback'
+                
+                notes.append(note_data)
             
-            self.logger.info(f"Found {len(notes)} MIDI notes in item")
+            self.logger.info(f"Found {len(notes)} MIDI notes in item (include_invisible={include_invisible})")
             return notes
             
         except Exception as e:

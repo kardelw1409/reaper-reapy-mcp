@@ -16,18 +16,18 @@ from mcp_tools import setup_mcp_tools
 def main():
     # Setup logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     logger = logging.getLogger(__name__)
     
-    print("Starting MCP server for Reaper...")
+    logger.info("Starting MCP server for Reaper...")
     
     try:
         # Create Reaper controller
-        print("Initializing ReaperController...")
+        logger.info("Initializing ReaperController...")
         controller = ReaperController(debug=True)
-        print("ReaperController initialized successfully.")
+        logger.info("ReaperController initialized successfully.")
         
         # Create MCP server
         mcp = FastMCP("Reaper Control")
