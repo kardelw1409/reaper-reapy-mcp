@@ -417,7 +417,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                 if ":0,0" in lm or ":0.0" in lm:
                     try:
                         measure_part = int(lm.split(':')[0])
-                        length_measure = f"{measure_part+1}:1,0"
+                        length_measure = f"{measure_part}:1,0"
                     except Exception:
                         return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
                         
@@ -524,7 +524,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                 if ":0,0" in lm or ":0.0" in lm:
                     try:
                         measure_part = int(lm.split(':')[0])
-                        length_measure = f"{measure_part+1}:1,0"
+                        length_measure = f"{measure_part}:1,0"
                     except Exception:
                         return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
             
@@ -974,7 +974,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                 if ":0,0" in lm or ":0.0" in lm:
                     try:
                         measure_part = int(lm.split(':')[0])
-                        length_measure = f"{measure_part+1}:1,0"
+                        length_measure = f"{measure_part}:1,0"
                     except Exception:
                         return {"status": "error", "message": f"Invalid length_measure format: {length_measure}"}
             
