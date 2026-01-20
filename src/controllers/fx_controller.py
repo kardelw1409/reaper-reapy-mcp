@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from .base_controller import BaseController
 
@@ -275,6 +275,86 @@ class FXController(BaseController):
             self.logger.error(f"Failed to get FX list: {e}")
             return []
 
+    def create_fx_param_automation_item(
+        self,
+        track_index: int,
+        fx_index: int,
+        param_name: str,
+        start_time: float,
+        length_time: float,
+        pool_id: int = -1,
+        points: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[int]:
+        """
+        Create an automation item for an FX parameter envelope.
+
+        Args:
+            track_index (int): Track index
+            fx_index (int): FX index
+            param_name (str): FX parameter name
+            start_time (float): Automation item start time in seconds
+            length_time (float): Automation item length in seconds
+            pool_id (int): Pool ID for automation item (-1 = new)
+            points (list, optional): List of point dicts with absolute times and values
+
+        Returns:
+            Optional[int]: Automation item index if successful, otherwise None
+        """
+        try:
+            track = self._get_track(track_index)
+            if track is None:
+                self.logger.error(f"Track index {track_index} out of range")
+                return None
+
+            if fx_index < 0 or fx_index >= len(track.fxs):
+                self.logger.error(f"FX index {fx_index} out of range for track {track_index}")
+                return None
+
+            fx = track.fxs[fx_index]
+            param_index = self._find_fx_param_index(fx, param_name)
+            if param_index is None:
+                self.logger.error(f"FX parameter '{param_name}' not found")
+                return None
+
+            envelope = reapy.reascript_api.GetFXEnvelope(track.id, fx_index, param_index, True)
+            if not envelope:
+                self.logger.error("Failed to get or create FX parameter envelope")
+                return None
+
+            item_idx = reapy.reascript_api.InsertAutomationItem(
+                envelope,
+                int(pool_id),
+                float(start_time),
+                float(length_time),
+            )
+            if item_idx < 0:
+                self.logger.error("Failed to insert automation item")
+                return None
+
+            if points:
+                for point in points:
+                    time_pos = float(point["time"])
+                    value = float(point["value"])
+                    shape = int(point.get("shape", 0))
+                    tension = float(point.get("tension", 0.0))
+                    selected = bool(point.get("selected", False))
+                    reapy.reascript_api.InsertEnvelopePointEx(
+                        envelope,
+                        int(item_idx),
+                        time_pos,
+                        value,
+                        shape,
+                        tension,
+                        selected,
+                        True,
+                    )
+                reapy.reascript_api.Envelope_SortPointsEx(envelope, int(item_idx))
+
+            return int(item_idx)
+        except Exception as e:
+            self.logger.error(f"Failed to create automation item: {e}")
+            return None
+
     def get_available_fx_list(self) -> List[str]:
         """
         Get a list of all available FX plugins in Reaper by reading Reaper's INI files
@@ -445,3 +525,9 @@ class FXController(BaseController):
             cleaned_name += " [VSTi]"
         
         return cleaned_name
+
+    def _find_fx_param_index(self, fx, param_name: str) -> Optional[int]:
+        for param_index in range(fx.n_params):
+            if fx.params[param_index].name.lower() == param_name.lower():
+                return param_index
+        return None

@@ -1,4 +1,5 @@
 import reapy
+from reapy import reascript_api as RPR
 import logging
 from typing import Optional
 
@@ -105,3 +106,149 @@ class TrackController(BaseController):
         except Exception as e:
             self.logger.error(f"Failed to get track color: {e}")
             return "#000000"
+
+    def move_track(self, track_index: int, new_index: int) -> bool:
+        """
+        Move a track to a new index (0-based).
+
+        Args:
+            track_index: Current track index
+            new_index: Desired track index after move
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            project = reapy.Project()
+            track_count = len(project.tracks)
+
+            if track_index < 0 or track_index >= track_count:
+                self.logger.error(f"Track index {track_index} out of range (project has {track_count} tracks)")
+                return False
+            if new_index < 0 or new_index >= track_count:
+                self.logger.error(f"New index {new_index} out of range (project has {track_count} tracks)")
+                return False
+            if track_index == new_index:
+                return True
+
+            # Save current track selection
+            selected_ids = []
+            selected_count = RPR.CountSelectedTracks(project.id)
+            for i in range(selected_count):
+                track = RPR.GetSelectedTrack(project.id, i)
+                if track:
+                    selected_ids.append(track)
+
+            # Clear selection
+            for track in project.tracks:
+                RPR.SetTrackSelected(track.id, False)
+
+            # Select only the track to move
+            track_to_move = project.tracks[track_index]
+            RPR.SetTrackSelected(track_to_move.id, True)
+
+            # Compute insertion index for ReorderSelectedTracks
+            if new_index >= track_count - 1:
+                before_index = -1
+            elif new_index > track_index:
+                before_index = new_index + 1
+                if before_index >= track_count:
+                    before_index = -1
+            else:
+                before_index = new_index
+
+            RPR.ReorderSelectedTracks(int(before_index), 0)
+
+            # Restore previous selection
+            for track in project.tracks:
+                RPR.SetTrackSelected(track.id, False)
+            for track_id in selected_ids:
+                try:
+                    RPR.SetTrackSelected(track_id, True)
+                except Exception:
+                    pass
+
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to move track: {e}")
+            return False
+
+    def create_track_send(self, source_index: int, destination_index: int, volume: float = 1.0) -> Optional[int]:
+        """
+        Create a send from one track to another and set its volume.
+
+        Args:
+            source_index: Source track index
+            destination_index: Destination track index
+            volume: Send volume (linear, 1.0 = 0 dB)
+
+        Returns:
+            Optional[int]: Send index if successful, otherwise None
+        """
+        try:
+            project = reapy.Project()
+            track_count = len(project.tracks)
+
+            if source_index < 0 or source_index >= track_count:
+                self.logger.error(f"Source track index {source_index} out of range (project has {track_count} tracks)")
+                return None
+            if destination_index < 0 or destination_index >= track_count:
+                self.logger.error(f"Destination track index {destination_index} out of range (project has {track_count} tracks)")
+                return None
+
+            source = project.tracks[source_index]
+            dest = project.tracks[destination_index]
+
+            send_idx = RPR.CreateTrackSend(source.id, dest.id)
+            if send_idx < 0:
+                self.logger.error("Failed to create track send")
+                return None
+
+            RPR.SetTrackSendInfo_Value(source.id, 0, send_idx, "D_VOL", float(volume))
+            return int(send_idx)
+        except Exception as e:
+            self.logger.error(f"Failed to create track send: {e}")
+            return None
+
+    def set_track_folder(self, parent_index: int, first_child_index: int, last_child_index: int, compact: Optional[int] = None) -> bool:
+        """
+        Set a folder (subgroup) in REAPER by defining parent and child track range.
+
+        Args:
+            parent_index: Track index of the folder parent
+            first_child_index: First child track index
+            last_child_index: Last child track index (will be folder end)
+            compact: Optional folder compact mode (0=normal, 1=small, 2=tiny)
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            project = reapy.Project()
+            track_count = len(project.tracks)
+
+            for idx in (parent_index, first_child_index, last_child_index):
+                if idx < 0 or idx >= track_count:
+                    self.logger.error(f"Track index {idx} out of range (project has {track_count} tracks)")
+                    return False
+
+            if not (parent_index < first_child_index <= last_child_index):
+                self.logger.error("Invalid folder range: parent must be above children and range must be valid")
+                return False
+
+            parent = project.tracks[parent_index]
+            reapy.reascript_api.SetMediaTrackInfo_Value(parent.id, "I_FOLDERDEPTH", 1)
+
+            if compact is not None:
+                reapy.reascript_api.SetMediaTrackInfo_Value(parent.id, "I_FOLDERCOMPACT", int(compact))
+
+            # Set child depths: middle children 0, last child -1 to close the folder
+            for idx in range(first_child_index, last_child_index + 1):
+                child = project.tracks[idx]
+                depth = -1 if idx == last_child_index else 0
+                reapy.reascript_api.SetMediaTrackInfo_Value(child.id, "I_FOLDERDEPTH", depth)
+
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to set track folder: {e}")
+            return False
