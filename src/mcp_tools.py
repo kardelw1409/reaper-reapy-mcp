@@ -76,6 +76,47 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to rename track: {str(e)}"}
 
+    @mcp.tool("move_track")
+    def move_track(ctx: Context, track_index: int, new_index: int) -> Dict[str, Any]:
+        """Move a track to a new index.
+
+        Args:
+            track_index: Current track index (0-based)
+            new_index: Desired track index after move (0-based)
+        """
+        try:
+            if controller.move_track(track_index, new_index):
+                return {"status": "success", "message": f"Moved track {track_index} to index {new_index}"}
+            return {"status": "error", "message": "Failed to move track"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to move track: {str(e)}"}
+
+    @mcp.tool("create_track_send")
+    def create_track_send(
+        ctx: Context,
+        source_track_index: int,
+        destination_track_index: int,
+        volume: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Create a track send and set its volume.
+
+        Args:
+            source_track_index: Source track index
+            destination_track_index: Destination track index
+            volume: Send volume (linear, 1.0 = 0 dB)
+        """
+        try:
+            send_idx = controller.create_track_send(source_track_index, destination_track_index, volume)
+            if send_idx is not None:
+                return {
+                    "status": "success",
+                    "message": f"Created send {send_idx} from track {source_track_index} to {destination_track_index} at volume {volume}",
+                    "send_index": send_idx,
+                }
+            return {"status": "error", "message": "Failed to create track send"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to create track send: {str(e)}"}
+
     @mcp.tool("set_tempo")
     def set_tempo(ctx: Context, bpm: float) -> Dict[str, Any]:
         """Set the project tempo."""
@@ -213,6 +254,102 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "Failed to toggle FX"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to toggle FX: {str(e)}"}
+
+    @mcp.tool("add_fx_param_automation_item")
+    def add_fx_param_automation_item(
+        ctx: Context,
+        track_index: int,
+        fx_index: int,
+        param_name: str,
+        start_time: Optional[float] = None,
+        start_measure: Optional[str] = None,
+        length_time: Optional[float] = None,
+        length_measure: Optional[str] = None,
+        pool_id: int = -1,
+        points: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Create an automation item for an FX parameter envelope.
+
+        Args:
+            track_index: Track index
+            fx_index: FX index
+            param_name: FX parameter name (case-insensitive)
+            start_time: Start position in seconds (optional if start_measure is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+            length_time: Length in seconds (optional if length_measure is provided)
+            length_measure: Length as "measures:beat,fraction" (optional if length_time is provided)
+            pool_id: Automation item pool ID (-1 creates a new pool)
+            points: Optional list of points. Each point supports:
+                - time OR measure (absolute), OR time_offset OR measure_offset (relative to start)
+                - value (normalized 0..1)
+                - shape (int), tension (float), selected (bool)
+        """
+        try:
+            if start_time is not None:
+                time_start = float(start_time)
+                measure_start = time_to_measure(time_start)
+            elif start_measure is not None:
+                time_start = position_to_time(start_measure)
+                measure_start = start_measure
+            else:
+                return {"status": "error", "message": "Either start_time or start_measure must be provided"}
+
+            if length_time is not None:
+                length = float(length_time)
+            elif length_measure is not None:
+                length = measure_length_to_time(length_measure, time_start)
+            else:
+                return {"status": "error", "message": "Either length_time or length_measure must be provided"}
+
+            if length <= 0:
+                return {"status": "error", "message": "Length must be greater than 0"}
+
+            resolved_points = []
+            if points:
+                for point in points:
+                    if "value" not in point:
+                        return {"status": "error", "message": "Each point must include a value"}
+                    if "time" in point:
+                        time_pos = float(point["time"])
+                    elif "measure" in point:
+                        time_pos = position_to_time(point["measure"])
+                    elif "time_offset" in point:
+                        time_pos = time_start + float(point["time_offset"])
+                    elif "measure_offset" in point:
+                        time_pos = time_start + measure_length_to_time(point["measure_offset"], time_start)
+                    else:
+                        return {"status": "error", "message": "Each point must include time/measure or time_offset/measure_offset"}
+
+                    resolved_points.append({
+                        "time": time_pos,
+                        "value": float(point["value"]),
+                        "shape": int(point.get("shape", 0)),
+                        "tension": float(point.get("tension", 0.0)),
+                        "selected": bool(point.get("selected", False)),
+                    })
+
+            item_idx = controller.create_fx_param_automation_item(
+                track_index=track_index,
+                fx_index=fx_index,
+                param_name=param_name,
+                start_time=time_start,
+                length_time=length,
+                pool_id=pool_id,
+                points=resolved_points or None,
+            )
+            if item_idx is not None:
+                return {
+                    "status": "success",
+                    "message": f"Created automation item {item_idx} for FX param '{param_name}'",
+                    "automation_item_index": item_idx,
+                    "range": {
+                        "start": {"time": time_start, "measure": measure_start},
+                        "end": {"time": time_start + length, "measure": time_to_measure(time_start + length)}
+                    }
+                }
+            return {"status": "error", "message": "Failed to create automation item"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to create automation item: {str(e)}"}
 
     @mcp.tool("create_region")
     def create_region(ctx: Context, name: str,
@@ -380,6 +517,32 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             }
         except Exception as e:
             return {"status": "error", "message": f"Failed to get track list: {str(e)}"}
+
+    @mcp.tool("set_track_folder")
+    def set_track_folder(
+        ctx: Context,
+        parent_track_index: int,
+        first_child_index: int,
+        last_child_index: int,
+        compact: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Set a folder (subgroup) in REAPER using a parent track and child range.
+
+        Args:
+            parent_track_index: Track index of the folder parent
+            first_child_index: First child track index
+            last_child_index: Last child track index (closes the folder)
+            compact: Optional folder compact mode (0=normal, 1=small, 2=tiny)
+        """
+        try:
+            if controller.set_track_folder(parent_track_index, first_child_index, last_child_index, compact):
+                return {
+                    "status": "success",
+                    "message": f"Set folder on track {parent_track_index} for children {first_child_index}-{last_child_index}",
+                }
+            return {"status": "error", "message": "Failed to set track folder"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to set track folder: {str(e)}"}
             
     # ----- MIDI Operations -----
     
