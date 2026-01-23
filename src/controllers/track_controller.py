@@ -173,6 +173,50 @@ class TrackController(BaseController):
             self.logger.error(f"Failed to move track: {e}")
             return False
 
+    def set_track_volume(self, track_index: int, volume: float) -> bool:
+        """
+        Set the volume (fader) for a track.
+
+        Args:
+            track_index (int): Index of the track
+            volume (float): Volume level (0.0 to 1.0, linear)
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            project = reapy.Project()
+            track = project.tracks[track_index]
+            try:
+                track.volume = float(volume)
+            except Exception:
+                reapy.reascript_api.SetMediaTrackInfo_Value(track.id, "D_VOL", float(volume))
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to set track volume: {e}")
+            return False
+
+    def get_track_volume(self, track_index: int) -> float:
+        """
+        Get the volume (fader) for a track.
+
+        Args:
+            track_index (int): Index of the track
+
+        Returns:
+            float: Volume level (0.0 to 1.0, linear). Returns 0.0 on failure.
+        """
+        try:
+            project = reapy.Project()
+            track = project.tracks[track_index]
+            try:
+                return float(track.volume)
+            except Exception:
+                return float(reapy.reascript_api.GetMediaTrackInfo_Value(track.id, "D_VOL"))
+        except Exception as e:
+            self.logger.error(f"Failed to get track volume: {e}")
+            return 0.0
+
     def create_track_send(self, source_index: int, destination_index: int, volume: float = 1.0) -> Optional[int]:
         """
         Create a send from one track to another and set its volume.

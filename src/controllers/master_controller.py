@@ -70,6 +70,51 @@ class MasterController(BaseController):
             self.logger.error(f"Failed to set master pan: {e}")
             return False
 
+    def add_master_fx(self, fx_name: str) -> bool:
+        """
+        Add an FX to the master track.
+
+        Args:
+            fx_name (str): Name of the FX to add
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            project = reapy.Project()
+            master = project.master_track
+            fx = master.add_fx(fx_name)
+            if fx:
+                return True
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to add master FX: {e}")
+            return False
+
+    def get_master_fx_list(self) -> list[Dict[str, Any]]:
+        """
+        Get a list of all FX on the master track.
+
+        Returns:
+            list[dict]: List of FX info dicts (index, name, enabled)
+        """
+        try:
+            project = reapy.Project()
+            master = project.master_track
+            fx_list = []
+            for fx_index, fx in enumerate(master.fxs):
+                fx_list.append(
+                    {
+                        "index": fx_index,
+                        "name": fx.name,
+                        "enabled": fx.enabled if hasattr(fx, "enabled") else True,
+                    }
+                )
+            return fx_list
+        except Exception as e:
+            self.logger.error(f"Failed to get master FX list: {e}")
+            return []
+
     def toggle_master_mute(self, mute: Optional[bool] = None) -> bool:
         """
         Toggle or set the master track mute state.

@@ -145,6 +145,64 @@ class FXController(BaseController):
             self.logger.error(f"Failed to set FX parameter: {e}")
             return False
 
+    def load_sampler_sample(
+        self,
+        track_index: int,
+        fx_index: int,
+        file_path: str,
+        slot: int = 0,
+        param_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Load a sample file into a sampler FX (e.g., ReaSamplOmatic5000) using named config params.
+
+        Args:
+            track_index (int): Index of the track
+            fx_index (int): Index of the FX
+            file_path (str): Path to the sample file
+            slot (int): Sample slot index (used for FILE{slot} fallbacks)
+            param_name (str, optional): Explicit named config param to set (e.g., "FILE", "FILE0")
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not os.path.exists(file_path):
+                self.logger.error(f"Sample file does not exist: {file_path}")
+                return False
+
+            project = reapy.Project()
+            track = project.tracks[track_index]
+
+            candidates = []
+            if param_name:
+                candidates.append(param_name)
+            else:
+                candidates.extend(["FILE", f"FILE{int(slot)}"])
+
+            for candidate in candidates:
+                try:
+                    ok = reapy.reascript_api.TrackFX_SetNamedConfigParm(
+                        track.id, fx_index, candidate, file_path
+                    )
+                    if ok:
+                        self.logger.info(
+                            f"Loaded sample into FX {fx_index} on track {track_index} using {candidate}"
+                        )
+                        return True
+                except Exception as e:
+                    self.logger.debug(
+                        f"Failed to set named config param {candidate} for FX {fx_index}: {e}"
+                    )
+
+            self.logger.error(
+                f"Failed to load sample into FX {fx_index} using params: {candidates}"
+            )
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to load sample into sampler FX: {e}")
+            return False
+
     def get_fx_param(self, track_index: int, fx_index: int, param_name: str) -> float:
         """
         Get an FX parameter value.
