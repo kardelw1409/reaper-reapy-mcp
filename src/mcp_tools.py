@@ -91,6 +91,34 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to move track: {str(e)}"}
 
+    @mcp.tool("set_track_volume")
+    def set_track_volume(ctx: Context, track_index: int, volume: float) -> Dict[str, Any]:
+        """Set the volume (fader) for a track.
+
+        Args:
+            track_index: Track index
+            volume: Volume level (0.0 to 1.0, linear)
+        """
+        try:
+            if controller.set_track_volume(track_index, volume):
+                return {"status": "success", "message": f"Set track {track_index} volume to {volume}"}
+            return {"status": "error", "message": "Failed to set track volume"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to set track volume: {str(e)}"}
+
+    @mcp.tool("get_track_volume")
+    def get_track_volume(ctx: Context, track_index: int) -> Dict[str, Any]:
+        """Get the volume (fader) for a track.
+
+        Args:
+            track_index: Track index
+        """
+        try:
+            volume = controller.get_track_volume(track_index)
+            return {"status": "success", "volume": volume}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get track volume: {str(e)}"}
+
     @mcp.tool("create_track_send")
     def create_track_send(
         ctx: Context,
@@ -194,6 +222,35 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "Failed to set FX parameter"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to set FX parameter: {str(e)}"}
+
+    @mcp.tool("load_sampler_sample")
+    def load_sampler_sample(
+        ctx: Context,
+        track_index: int,
+        fx_index: int,
+        file_path: str,
+        slot: int = 0,
+        param_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Load a sample file into a sampler FX (e.g., ReaSamplOmatic5000).
+
+        Args:
+            track_index: Index of the track
+            fx_index: Index of the FX
+            file_path: Path to the sample file
+            slot: Sample slot index (used for FILE{slot} fallback)
+            param_name: Explicit named config param to set (e.g., "FILE", "FILE0")
+        """
+        try:
+            if controller.load_sampler_sample(track_index, fx_index, file_path, slot=slot, param_name=param_name):
+                used = param_name or f"FILE/FILE{int(slot)}"
+                return {
+                    "status": "success",
+                    "message": f"Loaded sample into FX {fx_index} on track {track_index} (param {used})",
+                }
+            return {"status": "error", "message": "Failed to load sample into sampler FX"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to load sampler sample: {str(e)}"}
 
     @mcp.tool("get_fx_param")
     def get_fx_param(ctx: Context, track_index: int, fx_index: int, param_name: str) -> Dict[str, Any]:
@@ -458,6 +515,30 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "Failed to set master pan"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to set master pan: {str(e)}"}
+
+    @mcp.tool("add_master_fx")
+    def add_master_fx(ctx: Context, fx_name: str) -> Dict[str, Any]:
+        """Add an FX to the master track."""
+        try:
+            if controller.add_master_fx(fx_name):
+                return {"status": "success", "message": f"Added master FX {fx_name}"}
+            return {"status": "error", "message": "Failed to add master FX"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to add master FX: {str(e)}"}
+
+    @mcp.tool("get_master_fx_list")
+    def get_master_fx_list(ctx: Context) -> Dict[str, Any]:
+        """Get a list of all FX on the master track."""
+        try:
+            fx_list = controller.get_master_fx_list()
+            return {
+                "status": "success",
+                "message": f"Retrieved {len(fx_list)} master FX",
+                "fx_list": fx_list,
+                "count": len(fx_list),
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get master FX list: {str(e)}"}
 
     @mcp.tool("toggle_master_mute")
     def toggle_master_mute(ctx: Context, mute: Optional[bool] = None) -> Dict[str, Any]:
@@ -1001,6 +1082,42 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": "Failed to insert audio item"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to insert audio item: {str(e)}"}
+
+    @mcp.tool("insert_midi_item")
+    def insert_midi_item(ctx: Context, track_index: int, file_path: str,
+                         start_time: Optional[float] = None, start_measure: Optional[str] = None) -> Dict[str, Any]:
+        """Insert a MIDI file as a media item on a track.
+
+        Args:
+            track_index: Index of the track
+            file_path: Path to the MIDI file
+            start_time: Start position in seconds (optional if start_measure is provided)
+            start_measure: Start position as "measure:beat,fraction" (optional if start_time is provided)
+        """
+        try:
+            if start_time is not None:
+                time_pos = float(start_time)
+                measure_pos = time_to_measure(time_pos)
+            elif start_measure is not None:
+                time_pos = position_to_time(start_measure)
+                measure_pos = start_measure
+            else:
+                return {"status": "error", "message": "Either start_time or start_measure must be provided"}
+
+            item_id = controller.insert_midi_item(track_index, file_path, time_pos)
+            if isinstance(item_id, str):
+                project = reapy.Project()
+                track = project.tracks[track_index]
+                for i, item in enumerate(track.items):
+                    if str(item.id) == item_id:
+                        return {"status": "success", "message": f"Inserted MIDI item at position {measure_pos} (time: {time_pos:.3f}s)", "item_id": i}
+                return {"status": "error", "message": "Failed to find inserted MIDI item index"}
+            elif isinstance(item_id, int):
+                if item_id >= 0:
+                    return {"status": "success", "message": f"Inserted MIDI item at position {measure_pos} (time: {time_pos:.3f}s)", "item_id": item_id}
+            return {"status": "error", "message": "Failed to insert MIDI item"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to insert MIDI item: {str(e)}"}
     
     @mcp.tool("duplicate_item")
     def duplicate_item(ctx: Context, track_index: int, item_id: Union[int, str], 

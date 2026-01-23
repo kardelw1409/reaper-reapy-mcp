@@ -10,6 +10,21 @@ from utils.item_utils import get_item_by_id_or_index, get_item_properties, selec
 
 class AudioController(BaseController):
     """Controller for audio-related operations in Reaper."""
+
+    def insert_midi_item(self, track_index: int, file_path: str, start_time: float) -> Union[int, str]:
+        """
+        Insert a MIDI file as a media item on a track.
+
+        Args:
+            track_index (int): Index of the track to add the MIDI item to
+            file_path (str): Path to the MIDI file
+            start_time (float): Start time in seconds
+
+        Returns:
+            int or str: ID of the created item
+        """
+        # Reuse the generic media insertion path (REAPER handles MIDI vs audio)
+        return self.insert_audio_item(track_index, file_path, start_time)
     
     def insert_audio_item(self, track_index: int, file_path: str, start_time: float) -> Union[int, str]:
         """
