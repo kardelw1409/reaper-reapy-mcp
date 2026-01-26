@@ -78,7 +78,10 @@ class FXController(BaseController):
         """
         try:
             project = reapy.Project()
-            track = project.tracks[track_index]
+            if track_index == -1:
+                track = project.master_track
+            else:
+                track = project.tracks[track_index]
             # Get the FX object first, then remove it
             fx = track.fxs[fx_index]
             fx.delete()
@@ -102,42 +105,71 @@ class FXController(BaseController):
         """
         try:
             project = reapy.Project()
-            track = project.tracks[track_index]
+            if track_index == -1:
+                track = project.master_track
+            else:
+                track = project.tracks[track_index]
             fx = track.fxs[fx_index]
             
-            # Try to find parameter by name
+            def normalize(name: str) -> str:
+                return re.sub(r"\s+", " ", name.strip().lower())
+
+            target = normalize(param_name)
+
+            # Try to find parameter by name (exact, then loose)
+            match_index = None
             for param_index in range(fx.n_params):
-                if fx.params[param_index].name.lower() == param_name.lower():
-                    # Store current value for logging
-                    try:
-                        current_value = fx.params[param_index].value
-                    except Exception:
-                        current_value = None
-                    
-                    # Set the new value using multiple approaches
-                    try:
-                        # Set using reapy's API
-                        fx.params[param_index].value = value
-                    except Exception as e:
-                        self.logger.debug(f"Failed to set parameter via reapy API: {e}")
-                    
-                    # Also use ReaScript API directly which may be more reliable
-                    try:
-                        reapy.reascript_api.TrackFX_SetParamNormalized(track.id, fx_index, param_index, value)
-                    except Exception as e:
-                        self.logger.debug(f"Failed to set parameter via ReaScript API: {e}")
-                    
-                    # Wait longer for REAPER to update (0.1s instead of 0.01s)
-                    time.sleep(0.1)
-                    
-                    # Verify the change was applied
-                    try:
-                        new_value = reapy.reascript_api.TrackFX_GetParamNormalized(track.id, fx_index, param_index)
-                        self.logger.debug(f"Verified new value is {new_value}")
-                    except Exception:
-                        pass
-                    
-                    return True
+                if normalize(fx.params[param_index].name) == target:
+                    match_index = param_index
+                    break
+
+            if match_index is None:
+                # Fallback: substring match
+                for param_index in range(fx.n_params):
+                    if target in normalize(fx.params[param_index].name):
+                        match_index = param_index
+                        break
+
+            if match_index is None:
+                # Fallback: numeric index
+                try:
+                    idx = int(param_name)
+                    if 0 <= idx < fx.n_params:
+                        match_index = idx
+                except Exception:
+                    pass
+
+            if match_index is not None:
+                # Store current value for logging
+                try:
+                    current_value = fx.params[match_index].value
+                except Exception:
+                    current_value = None
+                
+                # Set the new value using multiple approaches
+                try:
+                    # Set using reapy's API
+                    fx.params[match_index].value = value
+                except Exception as e:
+                    self.logger.debug(f"Failed to set parameter via reapy API: {e}")
+                
+                # Also use ReaScript API directly which may be more reliable
+                try:
+                    reapy.reascript_api.TrackFX_SetParamNormalized(track.id, fx_index, match_index, value)
+                except Exception as e:
+                    self.logger.debug(f"Failed to set parameter via ReaScript API: {e}")
+                
+                # Wait longer for REAPER to update (0.1s instead of 0.01s)
+                time.sleep(0.1)
+                
+                # Verify the change was applied
+                try:
+                    new_value = reapy.reascript_api.TrackFX_GetParamNormalized(track.id, fx_index, match_index)
+                    self.logger.debug(f"Verified new value is {new_value}")
+                except Exception:
+                    pass
+                
+                return True
             
             self.logger.warning(f"FX parameter '{param_name}' not found 1")
             return False
@@ -172,7 +204,10 @@ class FXController(BaseController):
                 return False
 
             project = reapy.Project()
-            track = project.tracks[track_index]
+            if track_index == -1:
+                track = project.master_track
+            else:
+                track = project.tracks[track_index]
 
             candidates = []
             if param_name:
@@ -217,7 +252,10 @@ class FXController(BaseController):
         """
         try:
             project = reapy.Project()
-            track = project.tracks[track_index]
+            if track_index == -1:
+                track = project.master_track
+            else:
+                track = project.tracks[track_index]
             fx = track.fxs[fx_index]
             
             # Try to find parameter by name
@@ -252,47 +290,65 @@ class FXController(BaseController):
             self.logger.error(f"Failed to get FX parameter: {e}")
             return 0.0
 
-    def get_fx_param_list(self, track_index: int, fx_index: int) -> List[Dict[str, Any]]:
+    def get_fx_param_list(
+        self,
+        track_index: int,
+        fx_index: int,
+        include_values: bool = True,
+        max_params: int = 0,
+        start_param: int = 0,
+    ) -> List[Dict[str, Any]]:
         """
         Get a list of all parameters for an FX.
         
         Args:
             track_index (int): Index of the track
             fx_index (int): Index of the FX
+            include_values (bool): Whether to query param values (can be slow on some plugins)
+            max_params (int): Optional cap on number of params to return (0 = no cap)
+            start_param (int): Optional start index for paging
             
         Returns:
             List[Dict[str, Any]]: List of parameter information dictionaries
         """
         try:
             project = reapy.Project()
-            track = project.tracks[track_index]
+            if track_index == -1:
+                track = project.master_track
+            else:
+                track = project.tracks[track_index]
             fx = track.fxs[fx_index]
             
             param_list = []
             for param_index in range(fx.n_params):
+                if param_index < start_param:
+                    continue
+                if max_params and param_index >= start_param + max_params:
+                    break
                 param = fx.params[param_index]
                 param_info = {
                     "index": param_index,
                     "name": param.name
                 }
-                
-                # Safely get parameter value using exception handling
-                try:
-                    param_info["value"] = param.value
-                except AttributeError:
-                    # If direct value access fails, try using get_value() method
+
+                if include_values:
+                    # Safely get parameter value using exception handling
                     try:
-                        param_info["value"] = param.get_value() if hasattr(param, 'get_value') else 0.0
+                        param_info["value"] = param.value
+                    except AttributeError:
+                        # If direct value access fails, try using get_value() method
+                        try:
+                            param_info["value"] = param.get_value() if hasattr(param, 'get_value') else 0.0
+                        except Exception:
+                            # As a fallback, provide a default value
+                            param_info["value"] = 0.0
+                            self.logger.warning(f"Could not get value for parameter {param.name}")
+
+                    # Safely get formatted value
+                    try:
+                        param_info["formatted_value"] = param.formatted_value if hasattr(param, 'formatted_value') else str(param_info["value"])
                     except Exception:
-                        # As a fallback, provide a default value
-                        param_info["value"] = 0.0
-                        self.logger.warning(f"Could not get value for parameter {param.name}")
-                
-                # Safely get formatted value
-                try:
-                    param_info["formatted_value"] = param.formatted_value if hasattr(param, 'formatted_value') else str(param_info["value"])
-                except Exception:
-                    param_info["formatted_value"] = str(param_info["value"])
+                        param_info["formatted_value"] = str(param_info["value"])
                 
                 param_list.append(param_info)
                 

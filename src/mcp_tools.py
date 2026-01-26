@@ -262,10 +262,23 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             return {"status": "error", "message": f"Failed to get FX parameter: {str(e)}"}
             
     @mcp.tool("get_fx_param_list")
-    def get_fx_param_list(ctx: Context, track_index: int, fx_index: int) -> Dict[str, Any]:
+    def get_fx_param_list(
+        ctx: Context,
+        track_index: int,
+        fx_index: int,
+        include_values: bool = True,
+        max_params: int = 0,
+        start_param: int = 0,
+    ) -> Dict[str, Any]:
         """Get a list of all parameters for an FX."""
         try:
-            param_list = controller.get_fx_param_list(track_index, fx_index)
+            param_list = controller.get_fx_param_list(
+                track_index,
+                fx_index,
+                include_values=include_values,
+                max_params=max_params,
+                start_param=start_param,
+            )
             if param_list:
                 return {"status": "success", "message": f"Retrieved {len(param_list)} parameters", "parameters": param_list}
             return {"status": "error", "message": f"Failed to get parameters for FX {fx_index} on track {track_index}"}
