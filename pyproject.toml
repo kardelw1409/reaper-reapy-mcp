@@ -35,8 +35,8 @@ Homepage = "https://github.com/wegitor/reaper-reapy-mcp"
 Repository = "https://github.com/wegitor/reaper-reapy-mcp.git"
 Issues = "https://github.com/wegitor/reaper-reapy-mcp/issues"
 
-[tool.setuptools]
-package-dir = {"reaper_reapy_mcp" = "src"}
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.scripts]
 reaper_reapy_mcp = "reaper_reapy_mcp:main"
