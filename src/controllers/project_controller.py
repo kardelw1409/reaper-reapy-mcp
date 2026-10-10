@@ -5,6 +5,7 @@ from typing import Optional, Union
 from utils.position_utils import get_time_map_info
 from .base_controller import BaseController
 import os
+import time
 
 class ProjectController(BaseController):
     """Controller for project-level operations in Reaper."""
@@ -109,7 +110,19 @@ class ProjectController(BaseController):
                 RPR.GetSetProjectInfo(project.id, "RENDER_SETTINGS", 0, True)  # Reset settings
                 RPR.GetSetProjectInfo(project.id, "RENDER_CHANNELS", channels, True)
                 RPR.GetSetProjectInfo(project.id, "RENDER_SRATE", samplerate, True)
-                RPR.GetSetProjectInfo_String(project.id, "RENDER_FILE", output_path, True)
+
+                # IMPORTANT: RENDER_FILE is a DIRECTORY in REAPER, not a file path.
+                # Passing the full output path here made REAPER create a directory
+                # named "<something>.wav" and write the real file inside it under
+                # the previous RENDER_PATTERN. Set the directory and the filename
+                # pattern separately, and remove any stale file so the existence
+                # check below cannot be satisfied by a leftover from a prior run.
+                out_dir = os.path.dirname(output_path)
+                out_name = os.path.basename(output_path)
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                RPR.GetSetProjectInfo_String(project.id, "RENDER_FILE", out_dir, True)
+                RPR.GetSetProjectInfo_String(project.id, "RENDER_PATTERN", out_name, True)
                 
                 # Apply any additional render settings
                 for key, value in kwargs.items():
@@ -120,8 +133,18 @@ class ProjectController(BaseController):
                 
                 # Execute render
                 reapy.perform_action(41824)  # Render project (simple)
-                
-                if os.path.exists(output_path):
+
+                # The render is asynchronous; wait for the file to appear and settle.
+                prev_size = -1
+                for _ in range(120):
+                    if os.path.isfile(output_path):
+                        size = os.path.getsize(output_path)
+                        if size > 1024 and size == prev_size:
+                            break
+                        prev_size = size
+                    time.sleep(0.25)
+
+                if os.path.isfile(output_path):
                     self.logger.debug(f"Render completed: {output_path}")
                     return True
                 else:
