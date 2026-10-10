@@ -1,7 +1,7 @@
 # 12 — Testing Strategy
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
-Test-first obligations for Phase E, derived from the POC's proven layering
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
+Test-first obligations for the implementation session (P0–P10), derived from the POC's proven layering
 [A: 02 §16] and its recorded defects [A: 02 §17], adapted to the target repo's tooling, **extended
 by the Phase-C audit findings** (targeting, complete recovery, identity, codec contract, isolation,
 outcome schema, cache safety — AUD-001…AUD-015).
@@ -19,7 +19,7 @@ outcome schema, cache safety — AUD-001…AUD-015).
 5. **Recorded orgs are pinned.** Where a test asserts against recorded evidence (e.g. the POC's
    depth-refusal set), the test pins the *artifact* and its content hash, and the artifact names the
    run that produced it (the POC's two-writer rule: stable snapshots vs per-run evidence [A]).
-6. **The POC suite stays the Vital oracle.** V3 does not re-run or modify POC tests during Phase E
+6. **The POC suite stays the Vital oracle.** V3 does not re-run or modify POC tests during implementation
    without owner instruction (they write evidence artifacts when run — **[A]** flagged in [02 §16]);
    regression comparisons use *recorded* POC outputs, not re-executions.
 

@@ -1,6 +1,6 @@
 # 09 — Discovery and Cache
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)),
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)),
 ported from the POC's measured cache discipline [A: 02 §5, §7] **with two Phase-C corrections**: the
 key covers every behaviour-affecting provider determinant (AUD-008), and the cache-write path is
 specified to preserve foreign/mismatched files and to be crash-safe (AUD-012 — source verification

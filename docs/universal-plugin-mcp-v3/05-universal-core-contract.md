@@ -1,6 +1,6 @@
 # 05 — Universal Core Contract
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
 This document defines the domain objects, interfaces and semantics the
 Universal Core must implement. Implementation is Phase-E only, after approval.
 

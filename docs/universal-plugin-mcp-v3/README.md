@@ -1,18 +1,24 @@
 # Universal Plugin MCP V3 — Planning Documentation
 
-**Status: PHASE D — SPECIFICATION CONSOLIDATED, AWAITING OWNER APPROVAL.**
+**Status: APPROVED PLANNING BASELINE — FOUR OWNER DECISIONS `OWNER_APPROVED` (2026-10-10), PENDING
+FINAL OWNER SIGN-OFF OF THE PACKAGE. IMPLEMENTATION NOT STARTED.**
 The independent GPT-5.6 audit (Phase B) returned NOT READY with 3 Critical / 8 High / 4 Medium
-findings; all fifteen were verified against source and corrected (dispositions:
-[18-remediation-register.md](18-remediation-register.md)). Phase D consolidated the specification:
-four genuine owner decisions are collected in [19-owner-decisions.md](19-owner-decisions.md); every
-other open question now has a source-resolved answer, a recommended default or a V1 deferral
-([15 §2](15-risks-and-open-questions.md)). **IMPLEMENTATION IS NOT APPROVED.** No runtime module,
-MCP tool, provider port or migration described here may be implemented before the owner's explicit
-approval recorded in [19 §6](19-owner-decisions.md). Nothing in this set has been implemented or
-executed.
+findings; all fifteen were verified against source and corrected in documentation (dispositions:
+[18-remediation-register.md](18-remediation-register.md)). Phase D consolidated the specification and
+Phase E recorded the owner's approval of the four decisions in
+[19-owner-decisions.md](19-owner-decisions.md); every other open question carries a source-resolved
+answer, an adopted default or a V1 deferral ([15 §2](15-risks-and-open-questions.md)).
+**This is not authorization to implement in this or any planning session:** implementation happens in a
+separate session from the handoff in [20-implementation-handoff.md](20-implementation-handoff.md).
+Nothing in this set has been implemented or executed — no runtime module, MCP tool, provider port,
+test or migration exists, and every correction in [18](18-remediation-register.md) remains
+`CORRECTED_IN_DOCS`, not `VERIFIED`.
 
-- Date of this revision: 2026-10-11 (Phase C remediation, Phase D consolidation)
+- Date of this revision: 2026-10-10 (Phase C remediation, Phase D consolidation, Phase E approvals)
 - Target repository: `C:\repos\reaper-reapy-mcp` (this repository)
+- Planning documentation location: `C:\repos\reaper-reapy-mcp\docs\universal-plugin-mcp-v3\`
+  (files 00–20 plus this README; the brief's shorter `universal-plugin-mcp-v3\` path is this
+  directory)
 - POC / evidence repository: `C:\REAPER` (REAPER portable install; Vital POC under
   `C:\REAPER\Scripts\sound_design\vital`, data under `C:\REAPER\prompts\vital_sound_design`)
 
@@ -52,7 +58,29 @@ transport, projects, rendering). V3 adds a plugin-instance layer; it does not du
 | 16 | [Independent review checklist](16-independent-review-checklist.md) | For the GPT-5.6 Codex audit (Phase B) |
 | 17 | [Planning evidence index](17-planning-evidence-index.md) | Every significant claim → evidence |
 | 18 | [**Remediation register** (Phase C)](18-remediation-register.md) | AUD-001…AUD-015 dispositions → corrected contracts → tests |
-| 19 | [**Owner decisions** (Phase D approval)](19-owner-decisions.md) | The four decisions that need the owner; everything else adopted as recommended defaults |
+| 19 | [**Owner decisions** (Phase D consolidation, Phase E approvals)](19-owner-decisions.md) | The four `OWNER_APPROVED` decisions, the adopted defaults, and the technical limitations that cannot be decided away |
+| 20 | [**Implementation handoff** — start here](20-implementation-handoff.md) | Self-contained entry point for the future implementation session |
+
+## Handoff entry point (for the future implementation session)
+
+**Read [20-implementation-handoff.md](20-implementation-handoff.md) first.** It states what is being
+built and why, the target and POC paths, the binding decisions, the mandatory boundaries, the
+documents that are normative, the phase order with its gates, what must not be built, when the
+Implementer must stop and ask, and which runtime behaviours remain unverified.
+
+First-read set, in order: [20](20-implementation-handoff.md) → [04](04-architecture.md) →
+[05](05-universal-core-contract.md) → [06](06-mcp-tool-contracts.md) → [07](07-capability-profile-schema.md) →
+[08](08-provider-and-host-interfaces.md) → [11](11-planning-transactions-and-verification.md) →
+[12](12-testing-strategy.md) → [14](14-implementation-plan.md) → [19](19-owner-decisions.md) →
+[15](15-risks-and-open-questions.md) → [17](17-planning-evidence-index.md) →
+[18](18-remediation-register.md) → [00](00-project-charter.md), with [01](01-existing-system-audit.md),
+[02](02-vital-poc-audit.md), [03](03-component-responsibility-matrix.md), [09](09-discovery-and-cache.md),
+[10](10-state-modulation-dependencies.md), [13](13-existing-mcp-integration.md),
+[16](16-independent-review-checklist.md) as reference.
+
+**[14](14-implementation-plan.md) is the roadmap; P0–P10 have not begun.** The ten global gates in
+[14 §Global phase gates](14-implementation-plan.md#global-phase-gates) are conditions of the owner's
+approval, not advice.
 
 ## Evidence discipline
 

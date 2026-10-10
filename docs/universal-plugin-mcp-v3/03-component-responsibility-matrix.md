@@ -1,6 +1,6 @@
 # 03 — Component Responsibility Matrix
 
-(rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md); rows corrected for
+(rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md); rows corrected for
 AUD-001/AUD-005/AUD-008/AUD-012.)
 
 Purpose: classify every significant component of the POC and the existing MCP, and recommend
@@ -77,8 +77,9 @@ reliance on `SetTrackStateChunk`'s return value.
 
 ## 3. Explicit non-goals recorded here
 
-- No component is copied into the repository during Phase A–D. Porting decisions are executed only
-  in Phase E under [14](14-implementation-plan.md), and in V1 the Vital provider is an **in-repo,
+- No component is copied into the repository during planning. Porting decisions are executed only
+  in the implementation session (P0–P10) under [14](14-implementation-plan.md), and in V1 the Vital
+  provider is an **in-repo,
   dependency-isolated provider package** ([08 §6](08-provider-and-host-interfaces.md),
   [19 Decision 2](19-owner-decisions.md)) — **without importing the legacy `_b4_lib` module
   chain** ([02 §15](02-vital-poc-audit.md), AUD-005).

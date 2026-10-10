@@ -1,6 +1,6 @@
 # 07 — Capability Profile Schema
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
 A Capability Profile is the **versioned, cacheable, static** description of
 what a plugin/version can do. It never contains live values. Everything in this document is derived
 from the POC's proven profile/cache construction [A: 02 §6-§7] generalized to any provider, with the

@@ -3,14 +3,26 @@
 Status of every independent-audit finding (`AUD-001`…`AUD-015`) against the remediated documentation.
 Permitted statuses: `OPEN` · `CORRECTED_IN_DOCS` · `BLOCKED_ON_OWNER` · `NOT_APPLICABLE_WITH_EVIDENCE`.
 
-**Phase D (2026-10-11) does not change any status in this register.** It consolidated the
-outstanding owner questions into four decisions ([19-owner-decisions.md](19-owner-decisions.md)) and
-synchronized the affected documents; the owner-decision columns below now point at those decisions
-instead of describing a request. No finding moves to `VERIFIED` — documentation is not execution.
+**Phase D (2026-10-10) did not change any status in this register**, and **Phase E does not either**:
+Phase D consolidated the outstanding owner questions into four decisions
+([19-owner-decisions.md](19-owner-decisions.md)); Phase E recorded the owner's approval of those four
+and reconciled every finding against the implementation plan (§Phase E reconciliation below). The
+owner-decision columns below point at the decisions instead of describing a request. Corpus-wide, the
+distinction is kept explicitly in four states:
+
+| State | Meaning | Where it lives |
+|---|---|---|
+| **1. Documentation corrected** | the false or overclaimed statement has been rewritten; `CORRECTED_IN_DOCS` | this register, "Status" column |
+| **2. Implementation required** | the corrected behavior does not exist yet; it is built in the named implementation phase | "Implementation task" + [14](14-implementation-plan.md) |
+| **3. Tests specified, not run** | the cases that will turn the specification into evidence; **none has been executed** | "Required tests" + [12](12-testing-strategy.md) |
+| **4. Residual risk / limitation** | a property of the host or of V1 scope that implementation cannot remove | [15 §1](15-risks-and-open-questions.md) + [19 §7](19-owner-decisions.md) |
+
+No finding moves to `VERIFIED` — documentation is not execution, and no test described here has been
+run.
 
 **No finding is marked `VERIFIED`.** The documentation has been corrected; the runtime behavior it
 specifies has not been implemented or executed. "Corrected a false source claim" (done here) and
-"the replacement implementation is proven" (Phase E, with tests) are different states and are kept
+"the replacement implementation is proven" (in the implementation session, with tests) are different states and are kept
 different on purpose.
 
 Remediation workstreams (`DS-xx`) group the findings into coherent changes:
@@ -47,20 +59,52 @@ Remediation workstreams (`DS-xx`) group the findings into coherent changes:
 | AUD-011 | DS-11 | CORRECTED_IN_DOCS | 12, 13, 14 | Phases rewritten to the dependency-correct sequence: **P0 contracts/decisions → P1 models+mocks → P2 transaction mechanics (mock) → P3 target-aware read-only bridge → P4 profile+cache → P5 host write primitives + codec contract → P6 mock modulation/dependency → P7 codec isolation + Vital provider → P8 Vital live mutation → P9 MCP integration → P10 E2E acceptance.** No live-write acceptance depends on later phases; tool registration is tested against mocks early (P2/P6) with production integration at P9. | [14](14-implementation-plan.md) | Per-phase acceptance in [14](14-implementation-plan.md); registration/mock tests at P2/P6 | — | [14 dependency graph](14-implementation-plan.md) |
 | AUD-012 | DS-08 | CORRECTED_IN_DOCS | 02, 03, 09, 12, 17 | Removed the Phase-A overclaim that the POC preserves a foreign/mismatched file byte-identically. V3 cache rules: validate the existing file's identity before replacement; mismatched/invalid file ⇒ refuse-to-replace + **quarantine by atomic rename** (bytes preserved) + rebuild; write via temp file + `os.replace` (atomic where the FS guarantees it); interrupted writes leave only ignorable temp files; a partial target never appears. Foreign-preservation and atomicity are **new requirements**, verified by tests. | [14 P4](14-implementation-plan.md) | [12 §5](12-testing-strategy.md) B-55/B-56 (foreign file byte-identical after cache write; interrupted-write simulation) | — | [17 AV-06, AV-07](17-planning-evidence-index.md); `capability_cache.py:408-417,427-476` |
 | AUD-013 | DS-06 | CORRECTED_IN_DOCS | 04, 08, 12, 13, 14, 15 | One package topology frozen: `src/reaper_reapy_mcp/plugins/` with `host/contract.py` + `host/reaper.py` (the only `reapy` importer **within `plugins/`**), core modules flat. The repo-wide "no reapy" claim is withdrawn — existing host modules already import reapy; the boundary test is scoped to `plugins/`. Registration frozen: **unconditional** registration of the 7 tools; no applicable provider ⇒ typed `UnsupportedProvider` result; registration never depends on provider-discovery side effects. | [14 P0/P9](14-implementation-plan.md) | [12 §2](12-testing-strategy.md) L0 scoped boundary tests; registration tests at P2 (mock) and P9 (server) | Adopted default: unconditional registration (Q-05 `RECOMMENDED_DEFAULT`) — [19 §5](19-owner-decisions.md) | [04 §6](04-architecture.md); [08 §8](08-provider-and-host-interfaces.md); [13 §3-§6](13-existing-mcp-integration.md) |
-| AUD-014 | DS-12 | BLOCKED_ON_OWNER (positions consolidated into [19](19-owner-decisions.md)) | 06, 07, 14, 15, 17, 19 | All Q-01…Q-13 recorded with a status: four are `OWNER_APPROVAL_REQUIRED` and collected in [19-owner-decisions.md](19-owner-decisions.md); the rest are `RECOMMENDED_DEFAULT`, `DEFERRED_FROM_V1` or `RESOLVED_BY_SOURCE` ([15 §2](15-risks-and-open-questions.md)): dry-run default; no legacy-codec import under any placement (in-repo package per [19 Decision 2](19-owner-decisions.md)); refuse unmeasured versions (no override); only V3-blocking defect fixes (recorded separately); unconditional registration; full-channel capture as the V1 blocker; user-local configurable cache; no raw escape hatch; defer persistent restore points; preserve the staged user change; VST2 fails closed; residual external race accepted as documented; eager startup retained. Every option exposed by the schema now has semantics, errors, tests, acceptance criteria. | [14 P0](14-implementation-plan.md) | Per-document tests listed in each question's row in [15 §2](15-risks-and-open-questions.md) | **Four decisions need the owner: [19](19-owner-decisions.md); everything else is an adopted default** | [15 §2](15-risks-and-open-questions.md); [19](19-owner-decisions.md) |
+| AUD-014 | DS-12 | CORRECTED_IN_DOCS (owner questions resolved) | 06, 07, 14, 15, 17, 19 | All Q-01…Q-13 recorded with a status: the four escalated decisions were **`OWNER_APPROVED` on 2026-10-10** ([19-owner-decisions.md](19-owner-decisions.md)); the remainder are `RECOMMENDED_DEFAULT`, `DEFERRED_FROM_V1` or `RESOLVED_BY_SOURCE` ([15 §2](15-risks-and-open-questions.md), [19 §5](19-owner-decisions.md)): dry-run default; no legacy-codec import under any placement (in-repo package per [19 Decision 2](19-owner-decisions.md)); refuse unmeasured versions (no override); only V3-blocking defect fixes (recorded separately); unconditional registration; full-channel capture as the V1 blocker; user-local configurable cache; no raw escape hatch; defer persistent restore points; preserve the staged user change; VST2 fails closed; residual external race accepted as documented; eager startup retained. Every option exposed by the schema now has semantics, errors, tests, acceptance criteria. | [14 P0](14-implementation-plan.md) | Per-document tests listed in each question's row in [15 §2](15-risks-and-open-questions.md) | **Four decisions approved; everything else is an adopted default — no open owner dependency** | [15 §2](15-risks-and-open-questions.md); [19](19-owner-decisions.md) |
 | AUD-015 | DS-02 | CORRECTED_IN_DOCS | 02, 12, 17 | L4 evidence claim corrected: the POC suite restores document+routes (route list predicate-verified) and does **not** restore the captured control vector. V3 L4 requires compare+restore of **every declared captured channel**, parameters included; "restored" is never claimed unless all manifest channels were compared after restore. | [14 P10](14-implementation-plan.md) | [12 §7](12-testing-strategy.md) L4 whole-channel restore assertions | — | [17 AV-08](17-planning-evidence-index.md); `test_l4_live_write.py:101-141` |
+
+## Phase E reconciliation — what each finding needs next
+
+Every finding is checked against the four states of the legend above. Nothing is "done" because it is
+documented: each row names the phase that must build it, the cases that must demonstrate it, and any
+limitation that survives implementation. Owner-decision pointers use the approved decisions
+(2026-10-10, [19 §6](19-owner-decisions.md)).
+
+| AUD | 1. Documentation corrected | 2. Implementation required (phase) | 3. Tests specified, not run | 4. Residual risk / limitation | Owner decision |
+|---|---|---|---|---|---|
+| AUD-001 | yes — first-block targeting defect and the `TargetedStateSlice` contract | P3 `locate_state_slice` (unique-or-refuse), P5 splice-only transport, P7 provider targeting | B-26…B-31; P8 multi-block byte-identity case | L-7 (splice fidelity unproven until a live multi-block write); R-21 | gate G-1/G-4 |
+| AUD-002 | yes — "verified rollback" scoped to captured channels; full-vector capture required | P2 snapshot assembly + per-channel rollback, P5 codec restore, P8 live proofs | B-32…B-37, B-53; P8 harness cases | L-4 (capture cost unmeasured) | **Decision 1 approved** |
+| AUD-003 | yes — fingerprint × target token × state revision separated | P1 identity objects, P3 token issuance/revalidation | B-38…B-43 | L-3 (identical-build replacement may be indistinguishable) | Decision 3 (locking/revalidation) |
+| AUD-004 | yes — codec/bridge contract objects; no provider callbacks in the bridge | P5 codec contract + transport | Two-codec conformance suite | — | — |
+| AUD-005 | yes — import chain verified; extraction boundary mapped (AV-13) | P7 port + V-12 build gate | V-12 clean-process import; byte-identity fixtures | R-03 (a ported function may still need the fallback path) | **Decision 2 approved** |
+| AUD-006 | yes — lifecycle contradiction resolved; impossible promise removed | P0 documentation, P9 behaviour evidence | B-44; P9 registration/`NotConnected` rows | L-2 (no server ⇒ no invocation-level answer) | **Decision 4 approved** |
+| AUD-007 | yes — envelope schema 2, `error` separate from `outcome`, counters | P2 outcome/counters, P9 tool layer | B-45, B-46; terminal-outcome matrix | R-20 (reporting drift under refactor pressure) | — |
+| AUD-008 | yes — cache key completeness + fail-closed identity | P4 key composition and identity rules | B-47; P4 fail-closed row | R-06 (stale profile if the key regresses) | — |
+| AUD-009 | yes — one mutation policy; slot identity; restore points deferred | P2 dry-run default, P6 slot/ambiguity rules | B-48, B-49 | — | — |
+| AUD-010 | yes — concurrency contract + external-change rollback rule | P2 revision/lock mechanics, P3 revalidation, P8 live conflict behaviour | B-50…B-54; external-divergence rollback case | L-1 (no compare-and-swap exists) | **Decision 3 approved** |
+| AUD-011 | yes — dependency-correct phase order P0–P10 | the phase order itself ([14](14-implementation-plan.md)) | per-phase test/exit criteria | — | gates G-8, G-10 |
+| AUD-012 | yes — no byte-preserving overwrite claim; quarantine + atomic replace required | P4 cache write discipline | B-55, B-56 | — | — |
+| AUD-013 | yes — one package topology; boundary tests scoped to `plugins/`; unconditional registration | P0 boundaries, P7 V-12, P9 registration | L0 boundary tests; V-12; P9-1 | — | — |
+| AUD-014 | yes — all questions carry a status | — (no implementation; the questions are answered) | per-question cases in [12](12-testing-strategy.md) | deferred items remain deferred (Q-08, Q-09) | four decisions approved; the rest are adopted defaults ([19 §5](19-owner-decisions.md)) |
+| AUD-015 | yes — POC L4 evidence corrected (control vector stored, never restored/compared) | P8 harness (compare every captured channel before "restored") | P8 cases; A-15 acceptance assertion | L-4 | **Decision 1 approved** |
+
+**AUD-014 status change:** `BLOCKED_ON_OWNER` → `CORRECTED_IN_DOCS`. The owner approved the four
+escalated decisions; every other question was a `RECOMMENDED_DEFAULT`/`DEFERRED_FROM_V1`/
+`RESOLVED_BY_SOURCE` item that never required approval ([15 §2](15-risks-and-open-questions.md),
+[19 §5](19-owner-decisions.md)). No item with a genuine, unresolved owner dependency remains.
+
+**Workstreams (DS-01…DS-12) are unchanged** — all twelve remain in place and map onto the phases as
+before: DS-01→P3/P5/P7, DS-02→P2/P5/P8, DS-03→P1/P3, DS-04→P5, DS-05→P7, DS-06→P0/P7/P9,
+DS-07→P2/P9, DS-08→P4, DS-09→P2/P6, DS-10→P2/P3/P8, DS-11→the phase order, DS-12→the decision record.
 
 ## Summary
 
-- **Critical (AUD-001..003):** corrected in docs; all three require runtime validation in Phase E and
-  P0 gates before any live mutation is authorized.
-- **High (AUD-004..011):** corrected in docs; each names its implementing phase and tests.
-- **Medium (AUD-012..015):** corrected in docs; AUD-014 sits `BLOCKED_ON_OWNER` because the
-  recommended positions require the owner's approval before the contract freeze (Phase D).
-- **Owner decisions outstanding:** four, collected in [19-owner-decisions.md](19-owner-decisions.md) —
-  (1) complete-capture-or-refuse recovery guarantee; (2) in-repo isolated provider package + codec
-  extraction; (3) acceptance of the residual cross-process race (incl. the rollback external-change
-  rule); (4) retention of the eager startup lifecycle. Every other question has an adopted
-  `RECOMMENDED_DEFAULT`, a `RESOLVED_BY_SOURCE` answer or a `DEFERRED_FROM_V1` position ([15 §2](15-risks-and-open-questions.md)).
+- **Critical (AUD-001..003):** corrected in docs; all three require runtime validation during the
+  implementation session, with the gates G-1…G-6 holding before any live mutation is authorized.
+- **High (AUD-004..011):** corrected in docs; each names its implementing phase and its tests.
+- **Medium (AUD-012..015):** corrected in docs; every one now has a phase, a test set and, where it
+  needed one, an owner decision that has been approved.
+- **Owner decisions:** four, all `OWNER_APPROVED` (2026-10-10) — [19-owner-decisions.md](19-owner-decisions.md).
+  No open owner dependency remains; the adopted defaults and deferrals are listed in [19 §5](19-owner-decisions.md).
 - **Runtime validation pending everywhere.** Nothing in this register asserts that any behavior has
-  been executed.
+  been executed: every test row is a specification. The limitations that will survive implementation
+  are listed in [19 §7](19-owner-decisions.md).

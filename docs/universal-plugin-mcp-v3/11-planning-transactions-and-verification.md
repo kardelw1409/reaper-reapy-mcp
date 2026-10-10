@@ -1,6 +1,6 @@
 # 11 — Planning, Transactions, Verification and Rollback
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)),
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)),
 extracted from the POC's measured transaction engine [A: 02 §12] **as corrected by the audit**: the
 snapshot is now complete-or-refuse across every mutable channel (AUD-002), state writes are
 slice-exact and target/revision-revalidated (AUD-001/AUD-003/AUD-010), and the outcome schema

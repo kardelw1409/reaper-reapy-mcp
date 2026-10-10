@@ -1,6 +1,6 @@
 # 17 — Planning Evidence Index
 
-(rev. 2026-10-11, Phase C remediation — see [18](18-remediation-register.md); §J added with the
+(rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md); §J added with the
 direct source verification of the audit findings, plus AV-13 with the Phase-D codec purity map.)
 
 Every significant claim/decision in this documentation set, with its evidence. Columns:
@@ -171,4 +171,7 @@ directly by the primary author; none of it was executed (no tests, no REAPER).
 
 Status note: these are **documentation corrections grounded in source verification**. They do not
 constitute implementation or runtime validation; the register in [18](18-remediation-register.md)
-tracks each finding to `CORRECTED_IN_DOCS`, not `VERIFIED`.
+tracks each finding to `CORRECTED_IN_DOCS`, not `VERIFIED`, and its Phase E reconciliation table names
+the implementation phase and test set for each finding. The four V1 decisions approved by the owner
+(2026-10-10) are recorded in [19](19-owner-decisions.md); the implementation entry point is
+[20](20-implementation-handoff.md).

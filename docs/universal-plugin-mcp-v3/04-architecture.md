@@ -1,6 +1,6 @@
 # 04 — Architecture
 
-Status: **[D] proposed** design (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)),
+Status: **[D] proposed** design (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)),
 derived from the evidence in [01](01-existing-system-audit.md), [02](02-vital-poc-audit.md) and
 [03](03-component-responsibility-matrix.md). Nothing here is implemented yet.
 

@@ -1,6 +1,6 @@
 # 06 — MCP Tool Contracts
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
 Names follow the existing repo's snake_case convention; all are
 prefixed `plugin_` to avoid collision with the existing 57 tools [A: 01 §5]. Registration happens on
 the existing FastMCP server (`Reaper Control`) via a new `setup_plugin_tools(mcp, ...)` called from

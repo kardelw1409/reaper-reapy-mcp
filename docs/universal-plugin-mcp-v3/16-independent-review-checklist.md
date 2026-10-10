@@ -183,40 +183,53 @@ against these documents' summaries.
 - [ ] Is the phase order dependency-correct per AUD-011? (P3 target-aware read bridge before any
       write primitive; P5 write primitives before P6/P7; P7 provider before P8 live mutation; P9
       registration; P10 acceptance; early mock registration tests at P2/P6.)
-- [ ] Does each phase have: goal, prerequisites, files, contracts, tests, acceptance criteria, risks,
-      verification, exit criteria? ([14])
+- [ ] Does each phase have: objective, prerequisites, scope (in/out), expected files, contracts, work
+      items, tests (with initial state → action → expected → invariant for the critical ones),
+      acceptance criteria, failure conditions, exit criteria and documentation updates? ([14])
+- [ ] Are the **ten global phase gates** stated and consistent with the approved decisions — in
+      particular no live mutation before P8, no rollback claim without per-channel comparison, and no
+      blind rollback over a detected external change? ([14 §Global phase gates](14-implementation-plan.md#global-phase-gates))
 - [ ] Is the **remediation register ([18])** consistent: every AUD-001…AUD-015 has a status, the
-      impacted documents match the actual edits, and no finding is marked `VERIFIED` on the basis of
-      documentation alone?
-- [ ] Are the risks in [15] owned and triggered? Does every open question (Q-01…Q-13) carry a
-      status, with the four `OWNER_APPROVAL_REQUIRED` items pointing at
-      [19-owner-decisions.md](19-owner-decisions.md) and no item marked `OWNER_APPROVED` without the
-      owner? Is Q-12 (residual external race) explicit about what cannot be excluded?
-- [ ] Is [19](19-owner-decisions.md) consistent with every document it cites — and is it genuinely
-      limited to decisions that change scope, existing behaviour or accepted risk (nothing routine
-      escalated, nothing decided quietly)?
+      impacted documents match the actual edits, no finding is marked `VERIFIED` on the basis of
+      documentation alone, and the Phase E reconciliation table names an implementation phase and a
+      test set for each?
+- [ ] Are the risks in [15] owned and triggered? Does every question (Q-01…Q-13) carry a status,
+      with **exactly the four** decisions marked `OWNER_APPROVED` in [19 §6](19-owner-decisions.md)
+      and nothing else marked approved? Is Q-12 (residual external race) explicit about what cannot
+      be excluded, and are the eight limitations in [19 §7](19-owner-decisions.md) presented as
+      limitations rather than as decisions awaiting the owner?
+- [ ] Is [19](19-owner-decisions.md) consistent with every document it cites — decisions limited to
+      scope, existing behaviour or accepted risk; each with its approved position, technical
+      consequences, affected documents, mandatory tests and implementation gates?
 - [ ] Do all documents state the **same** provider placement, codec-extraction approach, recovery
-      guarantee and startup lifecycle — with no stale "out-of-tree" or "proposed-only" wording left
-      anywhere ([19](19-owner-decisions.md) is the single source for those four positions)?
+      guarantee and startup lifecycle — with no stale "out-of-tree", "proposed-only" or
+      "approval-pending" wording left anywhere ([19](19-owner-decisions.md) is the single source for
+      those four positions)?
+- [ ] Is [20](20-implementation-handoff.md) self-contained for an Implementer who never saw the
+      planning conversation — target paths, what is built and why, what must not be copied, the
+      mandatory boundaries, the normative documents, the phase order with gates, what to do when
+      stopping, and the list of unverified behaviours? Does it avoid authorizing implementation
+      inside a planning session?
 - [ ] Is the evidence index [17] usable: every significant design decision traceable to a source
-      path/symbol or explicitly [D], including the Phase-C verification rows (AV-01…AV-12)?
+      path/symbol or explicitly [D], including the Phase-C verification rows (AV-01…AV-12) and AV-13
+      (the codec purity map)?
 - [ ] Is there anything that **requires** implementation knowledge not yet obtained? (If yes, it is
       a finding against documentation completeness. Known open measurements: FX-GUID replacement
       behaviour (P3), parameter-capture cost (P5/P8).)
-- [ ] Confirm the mandatory statement: implementation not approved; no code changes were made during
-      Phases A-D. (`git status --porcelain -uall` in the target repo shows only the pre-existing
+- [ ] Confirm the mandatory statement: implementation not approved in any planning session; no code
+      changes were made during Phases A-E. (`git status --porcelain -uall` in the target repo shows only the pre-existing
       staged `project_controller.py` change, the untracked probe doc, and the untracked
       `docs/universal-plugin-mcp-v3/`; nothing staged by the planner.)
 
 ## 8. Suggested audit order (highest risk first)
 
-1. [19](19-owner-decisions.md) — the four approval decisions and the adopted defaults; confirm every other document is consistent with them before auditing content.
-2. [18](18-remediation-register.md) + [17 §J](17-planning-evidence-index.md) — the dispositions and their source evidence, so the re-audit tests the corrections rather than re-derives round 1.
+1. [19](19-owner-decisions.md) + [20](20-implementation-handoff.md) — the four approved decisions, their consequences and gates, and whether the handoff actually hands off; confirm every other document is consistent with them before auditing content.
+2. [18](18-remediation-register.md) + [17 §J](17-planning-evidence-index.md) — the dispositions, the Phase E reconciliation and their source evidence, so the re-audit tests the corrections rather than re-derives round 1.
 3. [11](11-planning-transactions-and-verification.md) + [02 §12] + `adapter/transaction.py` — the safety core (capture, order, per-channel rollback, outcome, concurrency).
 4. [10 §1](10-state-modulation-dependencies.md) + `_b4_lib.py`/`bridge/state.py` — the targeting defect and the slice contract (AUD-001).
 5. [09](09-discovery-and-cache.md)/[07](07-capability-profile-schema.md) + `capability_cache.py` — key determinants and cache-write safety (AUD-008/AUD-012).
-6. [08 §6](08-provider-and-host-interfaces.md) + `_bh_session.py` imports — isolation (AUD-005) and the extraction boundary ([17 AV-13](17-planning-evidence-index.md)).
+6. [08 §6](08-provider-and-host-interfaces.md) + `_bh_session.py` imports — isolation (AUD-005), registry-directory rules and the extraction boundary ([17 AV-13](17-planning-evidence-index.md)).
 7. [05 §5](05-universal-core-contract.md)/[06](06-mcp-tool-contracts.md) — identity model + envelope + mutator defaults (AUD-003/007/009).
-8. [13](13-existing-mcp-integration.md) + [01 §3] — lifecycle Option A and unconditional registration (AUD-006/AUD-013).
-9. [12](12-testing-strategy.md) + [14](14-implementation-plan.md) — readiness, phase order (AUD-011), per-phase failure conditions and the mandatory gates.
+8. [13](13-existing-mcp-integration.md) + [01 §3] — lifecycle and unconditional registration (AUD-006/AUD-013).
+9. [12](12-testing-strategy.md) + [14](14-implementation-plan.md) — readiness, phase order (AUD-011), per-phase failure conditions and the ten global gates.
 10. [03](03-component-responsibility-matrix.md), [15](15-risks-and-open-questions.md), remaining cross-checks.

@@ -1,13 +1,30 @@
-# 14 — Implementation Plan
+# 14 — Implementation Plan (P0-P10)
 
-Status: **PHASE D — AWAITING OWNER APPROVAL** (rev. 2026-10-11; Phase C remediation in
-[18](18-remediation-register.md), Phase D consolidation in [19](19-owner-decisions.md)).
-Executable only after the Phase-B audit findings are resolved (**done in docs, see
-[18](18-remediation-register.md)**) and the four owner decisions in
-[19 §6](19-owner-decisions.md) are recorded as approved. **Phase order corrected per audit AUD-011:** no live-write work may
-precede the target-aware bridge, the complete recovery contract, the host write primitives and the
-provider codec; every phase names its tests and exit conditions; no phase begins before the previous
-phase's exit criteria are met.
+Status: **APPROVED ROADMAP — NOT STARTED.** Owner decisions 1-4 are `OWNER_APPROVED` (2026-10-10,
+[19-owner-decisions.md](19-owner-decisions.md)); this plan is the roadmap the future implementation
+session executes under the handoff in [20-implementation-handoff.md](20-implementation-handoff.md).
+None of P0-P10 has begun; every test listed here is **specified but not run** and no phase may be
+treated as proven because it is documented. **Phase order corrected per audit AUD-011:** no
+live-write work may precede the target-aware bridge, the complete recovery contract, the host write
+primitives and the provider codec; every phase names its tests, failure conditions and exit
+conditions; no phase begins before the previous phase's exit criteria are met.
+
+## How to read a phase
+
+Every phase below is organized as:
+
+| Label | Section in the phase | Label | Section in the phase |
+|---|---|---|---|
+| **A** | Goal (the problem it solves) | **G** | Tests (existing list) + Critical tests (initial → action → expected → invariant) |
+| **B** | Prerequisites | **H** | Acceptance criteria |
+| **C** | Scope — in / out | **I** | Failure conditions |
+| **D** | Expected files | **J** | Exit criteria |
+| **E** | Contracts touched | **K** | Documentation updates |
+| **F** | Work items (numbered, in order) | | |
+
+Expected files are **implementation targets for the future session**, not files to create now, and
+they use the approved topology ([04 §6](04-architecture.md), [08 §8](08-provider-and-host-interfaces.md)):
+`src/reaper_reapy_mcp/plugins/` with core modules flat plus `host/` and `providers/vital/`.
 
 Global rules for every phase:
 
@@ -16,6 +33,8 @@ Global rules for every phase:
 - No Vital identifiers inside the plugin core modules; **within `plugins/`**, `reapy` is imported only
   by `plugins/host/reaper.py` (L0 tests scoped to `plugins/` — AUD-013).
 - No import of the legacy `_b4_lib`/`_bh_session` chain anywhere in `plugins/` or the provider (AUD-005).
+- Owner decisions 1-4 are binding; a phase that finds it needs to contradict one **stops and asks the
+  owner** — it does not silently re-plan around an approved decision.
 - Every phase ends with: offline suite result (counts), new tests listed, evidence artifacts named,
   and a short design note appended to this document if a contract changed.
 - A phase that modifies the staged `project_controller.py` content, reverts or rewrites unrelated
@@ -23,6 +42,8 @@ Global rules for every phase:
   has failed **regardless of its test results** ([01 §7]).
 - Every phase states its **failure conditions** — the observable outcomes that mean the phase did
   not succeed. A phase that cannot name them is not ready to start.
+- Nothing is `VERIFIED` because it is documented; a behavior becomes a claim only when its test has
+  been written **and** run successfully, in the phase that owns it.
 
 ---
 
@@ -32,8 +53,10 @@ Global rules for every phase:
 then turn the [05](05-universal-core-contract.md)–[11](11-planning-transactions-and-verification.md)
 contracts into importable, empty-bodied code artifacts so tests can be written against them.
 
-**Prerequisites:** Phase D approval of this remediated documentation set; the audit disposition in
-[18](18-remediation-register.md).
+**Prerequisites:** the owner's approval record in [19 §6](19-owner-decisions.md) (`OWNER_APPROVED`,
+2026-10-10); the audit disposition in [18](18-remediation-register.md); the handoff package
+([20](20-implementation-handoff.md)). No implementation work from P1 onward may start before this
+phase's exit criteria are met.
 
 **Expected files:** `src/reaper_reapy_mcp/plugins/{__init__.py, errors.py, model.py, profile.py,
 provider.py, host/{__init__.py, contract.py}, tools.py(skeleton)}`; unit-test stubs under
@@ -57,6 +80,47 @@ owner's answers are recorded in [19 §6](19-owner-decisions.md).
 scoped to `plugins/` (no `reapy` import; no provider identifiers in core); tool-name collision check
 (spec 7 names disjoint from the 57); mutation-default audit (every mutator spec declares
 `dry_run: true`).
+
+**Scope — in (C).** The `plugins/` package skeleton with importable, side-effect-free modules; the
+normative error taxonomy; the envelope/tool tables; the profile schema validator; unit-test stubs;
+the decision record (already approved, transcribed into code-adjacent docs where needed).
+
+**Scope — out (C).** Any host access, any `reapy` import outside `plugins/host/reaper.py`, any
+behavioral implementation (models stay declarative, `tools.py` stays a skeleton), provider code,
+registration into `create_server()`, and any change to the existing 57 tools or to `pyproject.toml`
+dependencies.
+
+**Work items (F).**
+1. Create the package tree (`plugins/__init__.py`, `errors.py`, `model.py`, `profile.py`,
+   `provider.py`, `host/{__init__.py,contract.py}`, `tools.py` skeleton) with empty/decorator-only
+   bodies and `from __future__ import annotations` for 3.10 compatibility.
+2. Transcribe [05 §7] into `errors.py` as the closed exception list, each with a stable `code`
+   string and a `to_dict()` returning `{code, message, detail}`.
+3. Transcribe [05 §2, §2.9] object field tables into `model.py`/`profile.py` as dataclasses or
+   typed dicts **without** behavior, keeping names identical to the documents.
+4. Declare the `PluginProvider`/`StateCodec`/`HostBridge` protocols in `provider.py` /
+   `host/contract.py` exactly as [08 §2-§4](08-provider-and-host-interfaces.md), including the
+   `plan_state_writes` unit model and the absence of any provider callback in the bridge.
+5. Encode the [07 §4] validation table as a validator plus one test row per rule.
+6. Create `tools.py` as `TOOL_NAMES`/`SPEC`/`DISPATCH` tables for the 7 tools with `dry_run: true`
+   defaults and synthesized docstrings — no tool bodies ([06](06-mcp-tool-contracts.md)).
+7. Write the L0 boundary test scoped to `plugins/` (no `reapy` import outside `host/reaper.py`, no
+   provider identifiers in core) with an explicit non-empty path list so it cannot pass vacuously.
+8. Write the import-smoke and tool-name-collision tests; add the xfail protocol-conformance stubs.
+9. Append the P0 design note recording any naming/typing decision that deviates from the documents.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P0-1 | fresh checkout, REAPER closed | `python -c "import reaper_reapy_mcp.plugins"` | imports successfully, no host call, no filesystem read of the registry/cache | import is side-effect free — a server with zero providers touches nothing |
+| P0-2 | plugin core modules present | run the L0 boundary test with a probe file that imports `reapy` in core | test fails | a boundary test that cannot fail on a violation is not a boundary test |
+| P0-3 | 57 existing tools registered | compare the 7 spec names against the existing names | empty intersection | tool names are disjoint by construction, not by inspection |
+| P0-4 | every mutator spec in the table | read the declared defaults | all mutators declare `dry_run: true` | no mutating call applies without an explicit opt-in ([19 Decision 1](19-owner-decisions.md) discipline) |
+
+**Documentation updates (K).** Record any deviation from [05]/[06]/[07]/[08] naming in the P0 design
+note; if a contract must actually change, amend the document first ([00 §7]) — the implementation does
+not lead the specification.
 
 **Acceptance criteria:** all modules import with zero side effects; boundary tests pass; the profile
 schema file is committed as a JSON-Schema-like validator with the [07 §4] table encoded as tests;
@@ -91,6 +155,44 @@ document shape ([12 §6]).
 `plugins/resolve.py` (token model, session-scoped); `tests/plugins/mock_host.py`,
 `tests/plugins/mock_provider.py`, `tests/plugins/mock_codec_b.py`, fixture factories
 (multi-block chunks, token/revision fixtures).
+
+**Scope — in (C).** The domain objects of [05 §2/§2.9] with real bodies and validation; the identity
+objects (profile fingerprint, session-scoped target token, mutable state revision); the test doubles
+and fixture factories everything else is proven against.
+
+**Scope — out (C).** Host access, transactions, planning, cache, provider code, tool bodies. Mocks
+may model *more* behavior than the bridge implements, but never hide a host failure mode.
+
+**Work items (F).**
+1. Implement the [05 §2.9] object set (`FxHostFacts`, `TargetedStateSlice`, `StateRevision`,
+   `StateSnapshot`, `StateWriteUnit`, `StateWritePlan`, `WriteAttempt`, `VerificationReport`) with
+   owner + invariants from the table.
+2. Implement `resolve.py`'s token model: issuance from live facts, session scope, revalidation API,
+   and a `__repr__`/serializer that **cannot** leak the token into output ([05 §5]).
+3. Implement revision advance rules: derive-from-verified-readback only; a helper that answers
+   "did this change come from my own verified write?" ([19 Decision 3](19-owner-decisions.md)).
+4. Build `MockHostBridge` with a call log, byte-accurate multi-block chunks, a replaceable instance
+   handle, and failure injection (`raise`, `wedge`, `store-nothing`, `drop-after-return`).
+5. Build `MockProvider` plus a second codec with a different document shape and different batching
+   ([12 §6](12-testing-strategy.md)), so no test can depend on Vital's shape.
+6. Create fixture factories: multi-block chunks (preceding foreign VST, two Vitals), token/revision
+   fixtures, and byte-comparison utilities.
+7. Implement counters/serialization for the outcome object and assert the verdict↔final_state mapping
+   table is total and single-valued.
+8. Append the P1 design note (any field added beyond the documents is rejected or documented first).
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P1-1 | a valid token and a stale token fixture | revalidate each against changed fresh facts | valid passes, stale fails with `TargetChanged`, never a silent re-target | a stale target can never be written |
+| P1-2 | two consecutive verified writes from one transaction | advance the expected revision from the read-backs | no conflict reported (no self-conflict); an interleaved external value **does** conflict | own writes are not mistaken for external ones |
+| P1-3 | a mock host with a multi-block chunk | read the chunk and compare non-selected blocks byte-wise | identical bytes outside the selected span | fixtures cannot drift from the byte contract |
+| P1-4 | injected `store-nothing` mode | perform a mock write and read back | visible as "API success, nothing stored" | the harness can reproduce the F4 failure |
+| P1-5 | any serialized outcome | scan the JSON for the token | absent | the token is session-scoped and never durable |
+
+**Documentation updates (K).** [05 §2.9] if an object gains a field; [12 §6] if a mock needs a new
+injection mode. Everything else waits for its phase.
 
 **Contracts touched:** [05 §2, §2.9, §5, §7]; [12 §6].
 
@@ -140,6 +242,49 @@ fixture (B-37); space-correctness regression; "API success, stores nothing" ⇒ 
 multi-unit partial failure (B-23); **token/revision per-unit revalidation (B-41/B-42)**;
 cancellation transitions (B-51/B-52); counter consistency (B-46); injected settle/retry timings.
 
+**Scope — in (C).** The complete mock-proven transaction: preflight → plan → complete-capture-or-
+refuse snapshot → ordered units with per-unit token/revision revalidation → verify in the written
+space → commit or per-channel verified rollback → outcome. Planning, value resolution/laws, the
+finding engine and the projection are implemented here.
+
+**Scope — out (C).** Any host code, any live call, any provider-specific rule, cache, tool
+registration. The engine is generic: it must work unchanged against codec B.
+
+**Work items (F).**
+1. Implement value resolution and the law/range projection ([05 §4], [10 §3]).
+2. Implement the finding engine and its surfacing in dry-run output ([10 §3]).
+3. Implement the plan builder: requested changes → `StateWritePlan` with ordered units via
+   `plan_state_writes()` (not a count), slot identity for route mutations ([10 §2.1]).
+4. Implement the snapshot assembler: capture document + routes + full parameter vector; if any
+   channel cannot be captured, refuse with `SnapshotUnavailable` **before any write**.
+5. Implement the stage machine with the F1-F12 failure taxonomy and the 8 verdicts, including the
+   verdict↔final_state mapping.
+6. Implement unit execution: revalidate token+revision before each unit, write, settle, re-read, verify
+   in the written space, advance the expected revision from that verified read-back.
+7. Implement per-channel verified rollback in the provider-declared order (document → parameters),
+   with the external-change rule: leave divergent channels untouched and report
+   `not_restored (external_change)`.
+8. Implement accounting: `reads`, `write_calls_attempted`, `write_effects_verified`,
+   `write_effects_unknown`, and the rule that "zero writes" requires `write_calls_attempted == 0`.
+9. Wire mock-provider dependency refusals and multi-unit sequencing (N routes ⇒ N ordered units).
+10. Write the early registration/schema tests for the 7 tools against mocks (AUD-011).
+11. Append the P2 design note (any state-machine edge added beyond [11]).
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P2-1 | mock host where the parameter channel cannot be read | request a document write | typed `SnapshotUnavailable`, `write_calls_attempted == 0`, nothing written | incomplete capture refuses **before** the first write |
+| P2-2 | mock that fails after the document unit is verified | request a two-unit write | rollback attempts BOTH channels; `FAILED_AND_RESTORED` only if both were compared; otherwise partial/unknown | rollback truthfulness ([19 Decision 1](19-owner-decisions.md)) |
+| P2-3 | codec whose document restore resets parameters | run the document-reset fixture | parameters restored **after** the document, then both verified | restore order is enforced, not assumed |
+| P2-4 | expected revision changes mid-sequence (mock external write) | continue the transaction | refuse before the next unit, or roll back; never proceed | a detected external change stops writes |
+| P2-5 | every mutating op | call without `dry_run: false` | zero writes; plan/findings returned | dry-run default is absolute |
+| P2-6 | each verdict produced by injection | read the outcome | exactly one `final_state` per verdict; counters consistent | the outcome cannot claim more than was observed |
+
+**Documentation updates (K).** [11] if a state-machine transition or verdict changes; [12 §5] if a
+case is added; [10] if a rule's semantics change. The POC symbol implementing each ported behavior is
+recorded in the test docstring for traceability ([17](17-planning-evidence-index.md)).
+
 **Acceptance criteria:** every verdict and every F1–F12 row has a test; no test uses a wall-clock
 sleep; the transaction performs one batched parameter write and one state unit per structural unit
 on the mock; registration/tool schemas of the 7 tools are testable against mocks **now** (early
@@ -181,7 +326,48 @@ fixtures — with byte-equality of non-selected blocks and `TargetSliceAmbiguous
 `plugin_instances`/`plugin_describe` semantics offline via mocks; live: enumerate/resolve the test
 instance, read params in a batch, read the selected slice; counters prove one call per batch;
 wedge/timeout behaviour; **the FX-GUID measurement** recorded as evidence (feeds the identical-build
-replacement question, Q-02 scope).
+replacement question, [19 §7 L-3](19-owner-decisions.md)).
+
+**Scope — in (C).** The read half of `plugins/host/reaper.py`: lazy connect, one timeout/wedge
+chokepoint, `fx_facts`, batched parameter reads, chunk read, and `locate_state_slice()` — the
+`TargetedStateSlice` mechanism with unique-or-refuse enforcement. Plus instance resolution and target
+token issuance in `resolve.py`.
+
+**Scope — out (C).** Every write verb (`write_params`, `write_state_slice`, settle-and-re-read are
+P5), the codec, the provider, the cache, and any semantic decision inside the bridge (no provider
+predicates or verification callbacks — AUD-004).
+
+**Work items (F).**
+1. Implement lazy connection and the single timeout/wedge chokepoint, mapping reapy failures to
+   `NotConnected` / `Wedged` / `Unreadable` ([05 §7]).
+2. Implement `fx_facts()` returning everything identity needs (name, class hex, module string,
+   format, version, param_count, FX-GUID) as `FxHostFacts`.
+3. Implement batched parameter reads through one in-process hop (mirroring the POC's measured
+   batch shape, [17 AV-12](17-planning-evidence-index.md)) and assert one call per batch.
+4. Implement `read_state_chunk()` and `locate_state_slice()`: find the block by **unique** match of
+   the declared identity (never by ordinal), return the span + header + framing, and refuse with
+   `TargetSliceAmbiguous` when the match is not unique (AUD-001).
+5. Implement instance resolution: selector → candidates → `InstanceNotFound`/`AmbiguousInstance`, and
+   target-token issuance bound to the resolved facts ([05 §5]).
+6. Run the `TrackFX_GetFXGUID` measurement probe and record the observed behaviour as evidence
+   (identical-build replacement, Q-02 scope → [19 §7 L-3](19-owner-decisions.md)).
+7. Write the host-bridge conformance **read** suite so the same tests can run against the mock and
+   the real bridge.
+8. Write a grep-assertion test that the module contains no write verb.
+9. Append the P3 design note with the measured host facts (reapy version, REAPER version).
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P3-1 | chunk containing a foreign VST before the Vital block | locate the slice | span covers only the Vital block; all other bytes identical | a foreign block is never touched (AUD-001) |
+| P3-2 | chunk containing two Vital blocks | locate the slice | `TargetSliceAmbiguous` refusal, zero reads beyond the chunk | ambiguity refuses rather than guesses |
+| P3-3 | live REAPER with the designated test instance | enumerate + resolve + read identity | identity matches the recorded fingerprint; FX-GUID behaviour measured | identity comes from measured host facts, not assumptions |
+| P3-4 | live instance with 775 parameters | read the full parameter batch | one host hop; counters prove one call per batch | the read path is batched, not per-control |
+| P3-5 | any point in the phase | attempt to write through the bridge | no write verb exists in the module | no live mutation is possible before P8 |
+
+**Documentation updates (K).** [08 §4] if a bridge method's shape changes; [12 §4] conformance-suite
+rows; [17] the new measurement evidence row; [02 §19.8] the FX-GUID observation.
 
 **Acceptance criteria:** live read of the designated test instance succeeds and matches recorded
 identity (fingerprint); **no write path exists in the module (grep-asserted)**; slice location is
@@ -223,6 +409,44 @@ codec revision, verification policy, provider version, registry data); **B-55 fo
 quarantine (byte-compare)**; **B-56 interrupted write**; truncation fails two checks; no-identity ⇒
 no file **and writes/mutations disabled** (AUD-008 fail-closed); hot-path assertion (cache hit ⇒
 zero host param reads).
+
+**Scope — in (C).** Profile building and validation, the corrected cache key, and the corrected cache
+write discipline (validate identity → quarantine by atomic rename → atomic temp+replace).
+
+**Scope — out (C).** Provider-specific rules and registry data (P7 supplies them through the provider
+interface; P4 works against the mock provider and pinned fixtures), and any cache of *live state*
+(the cache holds capability profiles only, never instance state).
+
+**Work items (F).**
+1. Implement the profile builder over the provider interface: identity, controls, modules, laws,
+   capabilities, dependencies, write order, verification policy, limits, provenance.
+2. Implement the cache key exactly as [09 §3](09-discovery-and-cache.md): fingerprint +
+   provider_revision + provider_artifact_digest + source_digest + schema/format.
+3. Implement load: validate the existing file's identity **before** any replacement; a mismatched,
+   foreign or corrupt file is quarantined by atomic rename (bytes preserved) with the reason recorded.
+4. Implement save: write to a temp file in the same directory, then `os.replace`; an interrupted write
+   leaves only ignorable temp files and never a partial target.
+5. Implement the fail-closed identity rule: no identity ⇒ no cache file **and** writes/mutations
+   disabled, with limited diagnostic reads marked provisional ([09 §5](09-discovery-and-cache.md)).
+6. Implement the hot-path assertion: a cache hit performs zero host parameter reads and records
+   `meta.cache.source`.
+7. Make the cache directory configurable (user-local default, `REAPER_MCP_PLUGIN_CACHE`), refusing a
+   default inside a source tree.
+8. Write the key-change matrix (B-47) as a parameterised test, plus B-55/B-56.
+9. Append the P4 design note with the chosen default directory and the quarantine layout.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P4-1 | a valid cache file for instance X | request a profile for an instance whose identity differs | the file is quarantined (bytes identical to before), a new profile is built | foreign bytes are never destroyed (AUD-012) |
+| P4-2 | cache write interrupted between temp write and replace | inspect the cache directory | only a temp file remains; the previous good file is intact | a partial target never appears |
+| P4-3 | identical instance, nothing changed | second `plugin_describe` | served from cache, zero host parameter reads | the cache is the difference between a cache and a lie ([09 §3](09-discovery-and-cache.md)) |
+| P4-4 | provider revision / registry digest / codec revision changed | request the profile | different key, profile rebuilt, old profile never served | every behavior-affecting determinant is in the key (AUD-008) |
+| P4-5 | no usable identity (identity fields unavailable) | attempt a write and a cache save | no file written, writes/mutations refused, reads marked provisional | fail closed on missing identity |
+
+**Documentation updates (K).** [09] for any key component or quarantine rule change; [07] for schema
+fields; [12 §5] for added cases. A key change is a compatibility event and is recorded explicitly.
 
 **Acceptance criteria:** with the mock provider, describe works fully offline; with the live host,
 profile key derived from live fingerprint + declared provider revision/artifacts; cache directory
@@ -269,6 +493,40 @@ write-attempt accounting (B-46); the full document-reset restore-order fixture o
 **No live mutation is performed in this phase** — splice/transport logic is proven against captured
 chunk strings and the mock host; the live-write gate stays at P8.
 
+**Scope — in (C).** The write-side **transport** (`write_params`, `write_state_slice` that splices
+only the located span, `SetTrackStateChunk`, settle, re-read) and the `StateCodec` contract
+(`plan_state_writes`, `encode_slice`, `verify`, snapshot/restore parts), wired into the P2 engine.
+
+**Scope — out (C).** Any live write, any provider-specific predicate inside the bridge, and any
+semantic decision in the transport layer (AUD-004). Also out: the cache and tool registration.
+
+**Work items (F).**
+1. Implement `write_params` as one batched ident-addressed call with read-back.
+2. Implement `read_slice`/`write_state_slice`: splice only the located span into the freshly read
+   chunk, write the whole chunk once, settle, re-read, and return the observed bytes.
+3. Implement the codec protocol methods and their invariants (ordered `StateWriteUnit`s;
+   `verify` returning per-channel evidence).
+4. Wire unit execution into the P2 state machine and extend snapshot assembly to every declared
+   channel.
+5. Prove splice byte-fidelity against captured real chunks (every byte outside the span unchanged).
+6. Extend the conformance suite so **two** codecs with different shapes/batching pass it unchanged.
+7. Add a grep-assertion that the bridge contains no provider predicate or verify callback (AUD-004).
+8. Write the write-attempt accounting test on the transport path (counters, no phantom writes).
+9. Append the P5 design note with the final codec method signatures.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P5-1 | captured multi-block chunk | splice a document change | only the selected span differs; all other bytes identical | a foreign or sibling block is never modified (AUD-001) |
+| P5-2 | two mock codecs with different shapes | run one conformance suite | both pass unchanged | the contract is not Vital-shaped (AUD-004) |
+| P5-3 | mock host returning success without storing | write and re-read | `WriteNotApplied` with `write_effects_verified == 0` | "API success" is never reported as a write effect |
+| P5-4 | two sequential structural units | execute the plan | live slice re-read between units; revisions sequential; expected revision advanced from own read-backs | sequential writes rebase on observed state, not on assumptions |
+| P5-5 | any code path in the module | attempt a live call in this phase | no live host connection is made by the write primitives' tests | the live-write gate holds until P8 |
+
+**Documentation updates (K).** [05 §2.9/§3] and [08 §3-§4] for codec/bridge signature changes;
+[10 §1] for the targeting contract; [11 §2.4] for unit execution semantics.
+
 **Acceptance criteria:** two codecs pass one conformance suite; splice byte-fidelity proven on
 captured multi-block chunks; snapshot/restore contract complete and mock-verified; the bridge module
 contains no provider predicate/verify callback (AUD-004).
@@ -304,6 +562,40 @@ mutation selector refused (B-48)**; slot resolved in plan reported; vocabulary p
 depth refusal (mock provider declares a fit refusal); hard dependency ⇒ refusal with
 `write_calls_attempted == 0`; projected-world fixture re-run at this layer; multi-unit sequence
 (N routes ⇒ N ordered verified units on the mock); **mutation-default audit re-run (B-49)**.
+
+**Scope — in (C).** `plugin_modulation` operations (list/create/update/remove/depth) plus the provider
+dependency hook, wired through the P5 codec and the P2 engine, entirely against mocks.
+
+**Scope — out (C).** Live writes, real Vital rules content, real depth-fit tables (the mock provider
+declares a fit refusal to exercise the path), and any dependency DSL — rule content stays data.
+
+**Work items (F).**
+1. Implement the modulation tool body over the plan/transaction engine (dry-run default; explicit
+   `dry_run: false` to apply).
+2. Implement route mutations requiring explicit slot identity; ambiguous selectors refuse with the
+   candidate list ([10 §2.1](10-state-modulation-dependencies.md)).
+3. Implement read-side ambiguity semantics (deterministic first match + remaining list) and keep them
+   strictly separate from mutation semantics (B-48).
+4. Implement the depth-conversion hook and its refusal path with first-class reasons ([10 §3]).
+5. Implement the dependency evaluation hook and hard-dependency refusal with
+   `write_calls_attempted == 0`.
+6. Re-run the projected-world fixture at this layer and assert the plan matches the projection.
+7. Add the N-routes ⇒ N-ordered-verified-units test on the mock provider.
+8. Re-run the mutation-default audit over the registered specs (B-49).
+9. Append the P6 design note describing the hook interfaces the provider implements in P7.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P6-1 | a modulation request whose selector matches two routes | attempt the mutation | refusal listing both candidates; zero writes | ambiguity refuses; it never picks one ([10 §2.1](10-state-modulation-dependencies.md)) |
+| P6-2 | a request violating a hard dependency | attempt the mutation | `DependencyViolation`, `write_calls_attempted == 0` | unsatisfied dependencies stop before any write |
+| P6-3 | a depth request the mock provider refuses | request the conversion | refusal with the declared reason; no approximation | refusals are data, never guesses |
+| P6-4 | a three-route change on the mock | apply with `dry_run: false` | three ordered, individually verified units; revisions sequential | structural writes are ordered and verified per unit |
+| P6-5 | any mutating modulation op | call without `dry_run: false` | zero writes | the dry-run default holds across the whole surface |
+
+**Documentation updates (K).** [10 §2-§3] for hook semantics; [06 §9] for the tool body's result shape;
+[12 §5] for added cases.
 
 **Acceptance criteria:** all [10 §4] tests green on mocks; the mock provider's two-route model
 exercises ordered-unit sequencing end-to-end.
@@ -347,6 +639,50 @@ V-9 line_mapping refusal/warning; V-10 version gate with hard refusal; **V-11 sl
 on multi-block fixtures**; **V-12 import cleanliness: a clean process importing the provider pulls in
 no `reapy`/`ReaperController`/`_bh_session`/`_b4_lib` and does not change the working directory**;
 plus L3 live read of the Vital instance through the provider. **No live writes in this phase.**
+
+**Scope — in (C).** The provider package, its codec ported from the AV-13 host-free set, the registry
+loader with the approved resolution/validation/error behaviour ([08 §6](08-provider-and-host-interfaces.md)),
+the dependency rules and depth-fit data, and the V-1…V-12 conformance/regression tests.
+
+**Scope — out (C).** Every live mutation (P8), any Core change (a needed Core change reopens [05]/[08]
+first), any second repository/distribution (rejected in [19 Decision 2](19-owner-decisions.md)), and
+any import of `_b4_lib`/`_bh_session`.
+
+**Work items (F).**
+1. Create `plugins/providers/vital/` with `__init__.py`, `provider.py`, `profile_build.py`,
+   `codec.py`, `dependencies_rules.py`, `depth.py`.
+2. Port the AV-13 host-free functions into `codec.py` (excluding `_get_chunk`, `_set_chunk`,
+   `_default_ctrl` and the module aliases) and record per-function provenance comments.
+3. Validate the ported codec against the POC's byte-identity fixtures; on any function that proves
+   not host-free, apply the approved fallback (clean re-implementation against the same fixtures) and
+   record the reason.
+4. Implement the registry loader: resolution order, path normalisation, validation and the exact error
+   behaviour of [08 §6](08-provider-and-host-interfaces.md) (`IncompatibleSettings` with the resolved
+   path, no fallback; `UnsupportedProvider` when the provider is not enabled; nothing at import time).
+5. Implement `build_profile` from the registry data with `provenance.source_digest` and the provider
+   `implementation_revision`/artifact digest ([07 §1, §5](07-capability-profile-schema.md)).
+6. Implement `identify`/`matches`, the version gate (measured set only) and the format gate (VST3 only,
+   VST2 fails closed).
+7. Implement `plan_state_writes`, dependency rules and the depth-fit table.
+8. Implement the recursive import-boundary test (V-12) as a **build gate**: fresh process, provider
+   imported, assert no `reapy`/`ReaperController`/`_bh_session`/`_b4_lib` in `sys.modules` and cwd
+   unchanged.
+9. Run V-1…V-12 against recorded POC artifacts and the live read path (read-only).
+10. Append the P7 design note listing any function that required the fallback path.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P7-1 | fresh process, no legacy modules imported | import the provider package | none of `reapy`/`ReaperController`/`_bh_session`/`_b4_lib` in `sys.modules`; cwd unchanged | isolation is mechanical, not aspirational (AUD-005) |
+| P7-2 | POC byte-identity fixtures | encode/decode through the ported codec | byte-identical round-trips for every fixture | the proven algorithm is preserved exactly |
+| P7-3 | `REAPER_MCP_VITAL_REGISTRY_DIR` pointing at a missing directory | request a profile | `IncompatibleSettings` naming the variable and path; **no fallback** to the default | a config error cannot silently read different data |
+| P7-4 | provider not enabled (`REAPER_MCP_PLUGIN_PROVIDERS` unset) | call a plugin tool | `UnsupportedProvider`; registry directory untouched | a server with zero providers touches no data directory |
+| P7-5 | a VST2 Vital instance and an unmeasured version | attempt to describe and to write | describe reports the limitation in `limits[]`; writes refuse (`VersionMismatch`) with no override | unsupported targets fail closed |
+| P7-6 | a multi-block track containing a foreign VST and the Vital instance | locate the slice through the provider | unique match; foreign block byte-identical | the provider inherits the target-aware contract (AUD-001) |
+
+**Documentation updates (K).** [08 §6-§7] mapping table; [17] new evidence rows for the codec port and
+confirmed host facts; [07] if a profile field is added; [15 R-03] once the isolation test passes.
 
 **Acceptance criteria:** V-1…V-12 green against recorded artifacts; live read matches POC-observed
 identity fields; the recursive import test passes; **the host-touching functions (`_get_chunk`,
@@ -392,6 +728,43 @@ proving untouched blocks byte-identical**; a cancellation case (B-51) reporting 
 JSON per run. **Every case's restore compares every captured channel — document, routes AND
 parameters — before the word "restored" may appear (AUD-015).**
 
+**Scope — in (C).** The first live writes, performed only through the complete P2/P5/P7 stack, on the
+designated test project, with the full-channel self-restoring harness and per-run evidence files.
+
+**Scope — out (C).** Writes to any other project or instance, writes without a complete capture, new
+features, performance tuning beyond documentation, and any use of a live write to "prove" a phase
+that was supposed to prove itself on mocks.
+
+**Work items (F).**
+1. Prepare the designated test project and record the preconditions the harness will check (identity,
+   responsiveness, instance match, project path).
+2. Implement the harness: full-channel capture → action → verify → restore → verify restore, with
+   per-run evidence naming (per-run identifier + content hash, never overwriting a different run's
+   evidence).
+3. Implement the abort path and prove it refuses when a precondition fails.
+4. Run the approved cases: one parameter; one enum; one state path; two routes (sequential units); a
+   dependency-refused request (zero write calls); an induced failure → per-channel verified rollback;
+   a multi-block track case proving untouched blocks byte-identical; a cancellation case.
+5. Record before/after whole-range digests and the per-channel comparison results for every case.
+6. Measure the parameter-capture cost (full-vector capture) and record it as evidence ([19 §7 L-4](19-owner-decisions.md)).
+7. Confirm the test project is left exactly as captured at the end of the phase.
+8. Append the P8 design note with measured costs and any observed host quirk.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P8-1 | live instance on the designated test project | full capture → change one parameter → verify → restore → verify restore | read-back confirms the change; restore returns every captured channel to its captured value | recovery is verified per channel, not asserted ([19 Decision 1](19-owner-decisions.md)) |
+| P8-2 | a parameter change that the host accepts but does not store | request it | `WriteNotApplied`; the outcome does not claim a write effect | "API success" is not an effect |
+| P8-3 | induced failure after the document unit was verified | complete the sequence | the parameter and document channels are restored and compared; `FAILED_AND_RESTORED` only then | no rollback claim without comparison (AUD-015) |
+| P8-4 | multi-block track with a foreign VST before the Vital block | change plugin state | the foreign block is byte-identical before/after | untouched blocks are proven untouched (AUD-001) |
+| P8-5 | cancellation mid-write | cancel | truthful `unknown`/partial reporting with counters; nothing claims "unchanged" | outcome truthfulness under uncertainty |
+| P8-6 | harness precondition violated (wrong instance / unresponsive host) | run the harness | refuses before any write | the harness can refuse to test |
+
+**Documentation updates (K).** [12 §7] with the executed cases and evidence names; [17] new measured
+facts; [15] risk-status updates for R-19/R-21 once the live proofs exist; [19 §7 L-4/L-7] with measured
+values.
+
 **Acceptance criteria:** every live case's response contains per-item read-back and a per-channel
 rollback status; the harness refuses to run if preconditions (identity, responsiveness,
 test-instance match) fail; before/after whole-range digest recorded; **no case claims restoration of
@@ -434,6 +807,40 @@ inspector smoke (`test_mcp.bat` path exists [A]); docstring presence (the LLM se
 via the registered specs (B-49)**; startup lifecycle documented per AUD-006 Option A (the process
 requires REAPER; post-startup loss ⇒ typed `NotConnected`).
 
+**Scope — in (C).** The single-line integration into `create_server()`, the final tool docstrings, and
+the compatibility evidence for the existing 57 tools.
+
+**Scope — out (C).** Any change to the existing 57 tools (including their error shape), any change to
+startup semantics ([19 Decision 4](19-owner-decisions.md)), any new provider, and any packaging change
+(no new dependencies, no entry points).
+
+**Work items (F).**
+1. Add `setup_plugin_tools(mcp, config=...)` to `create_server()` immediately after
+   `setup_mcp_tools(...)` — one line, no other edit ([13 §3](13-existing-mcp-integration.md)).
+2. Finalize tool docstrings: purpose, arguments, destructive-ness, envelope shape, dry-run default
+   ([06 §10](06-mcp-tool-contracts.md)).
+3. Verify the in-process FastMCP client lists 64 tools with the 7 `plugin_*` names present.
+4. Exercise each plugin tool with zero providers configured and assert a typed `UnsupportedProvider`
+   result (unconditional registration, AUD-013).
+5. Smoke every existing tool via the client (or the inspector) to prove no regression, and record the
+   tool list as evidence.
+6. Verify the removal path: deleting the registration line restores the previous server exactly.
+7. Document the startup/disconnect behaviour in the README section added in this phase.
+8. Append the P9 design note with the inspector evidence.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P9-1 | server started with zero providers | call each of the 7 tools | each answers a typed `UnsupportedProvider` result; all 7 are listed | V3 is visible but inert without a provider (AUD-013) |
+| P9-2 | server started normally | list tools | 64 tools; the 57 existing names and shapes unchanged | integration is additive |
+| P9-3 | registration line removed | start the server | exactly the previous tool set; no import error | the integration is reversible by one line |
+| P9-4 | a lost connection after a successful start (mock/simulated) | call a plugin tool | typed `NotConnected` with the truthful outcome row ([19 Decision 4](19-owner-decisions.md)) | no claim the process cannot keep |
+| P9-5 | every mutating tool | inspect the registered default | `dry_run: true` in each spec | the dry-run default survives registration |
+
+**Documentation updates (K).** [13] rollout/status; the repo README section for the plugin tools and
+provider configuration; [06] if a docstring/argument changes; [01 §8] if the registration point moves.
+
 **Acceptance criteria:** all 64 tools listed; plugin tools answer typed refusals when no provider is
 configured; removing the registration line restores the prior server exactly; existing host tools
 untouched.
@@ -460,11 +867,55 @@ the startup-lifecycle consequence is undocumented.
 
 **Expected files:** validation report (evidence-linked); final tool docs; risk-register updates.
 
+**Contracts touched:** [00 §6](00-project-charter.md) acceptance items 1-7 (the scenario being
+validated); [06 §2](06-mcp-tool-contracts.md) envelope as observed; [07 §3.2](07-capability-profile-schema.md)
+`limits[]`; [11 §3](11-planning-transactions-and-verification.md) verdicts/final-state as reported;
+[12 §7-§9](12-testing-strategy.md) evidence conventions. No new contract is introduced by this phase.
+
 **Tests (L3/L4):** the acceptance scenario: `plugin_instances` → `plugin_describe` → `plugin_find`
 → `plugin_read` → dry-run `plugin_write` (**the default**) → committed `plugin_write`
 (`dry_run:false`; controls + one route) → `plugin_state(inspect)` → `plugin_modulation(list)` →
 **full-channel restore of the test project with every captured channel compared**. Each step records
 evidence; the final restore's per-channel verification is part of the report.
+
+**Scope — in (C).** The end-to-end acceptance scenario of [00 §6](00-project-charter.md), hardening,
+and the documentation of verified behaviour.
+
+**Scope — out (C).** New features, deferred items from [19 §5](19-owner-decisions.md) (raw escape
+hatch, persistent restore points), performance work beyond documentation, and any claim not backed by
+an evidence artifact.
+
+**Work items (F).**
+1. Run the acceptance scenario end to end: `plugin_instances` → `plugin_describe` → `plugin_find` →
+   `plugin_read` → dry-run `plugin_write` → committed `plugin_write` (`dry_run: false`; controls + one
+   route) → `plugin_state(inspect)` → `plugin_modulation(list)` → full-channel restore.
+2. Capture an evidence artifact per step (inputs, observed output, counters, digests) using the
+   per-run naming convention of P8.
+3. Reconcile every declared limit in the profile with the observed behaviour; a limit that surfaced in
+   practice but was not declared is a finding against [07].
+4. Resolve every ambiguous outcome: an acceptance run ending `unknown`/`partially_restored` must be
+   explained (cause + evidence) or repeated; it is never averaged away.
+5. Write the validation report citing run artifacts, and update the risk register with anything the
+   acceptance run actually measured.
+6. Record the owner sign-off row in [19 §6](19-owner-decisions.md) territory (a separate sign-off
+   record; the four decision statuses are not edited).
+7. Update the V3 README status from "approved baseline" to "implemented and validated" **only** for the
+   behaviours the evidence supports.
+8. Close the implementation cycle: subsystem → tests → boundary → review → next.
+
+**Critical tests — initial state → action → expected → invariant (G).**
+
+| # | Initial state | Action | Expected result | Safety invariant |
+|---|---|---|---|---|
+| P10-1 | a live instance on the designated project | run the full acceptance scenario | every step produces evidence; the write step shows per-item read-back; the restore compares every captured channel | acceptance is demonstrated, not asserted ([00 §6]) |
+| P10-2 | the write step | inspect untouched blocks | byte-identical | the layer never disturbs foreign state (AUD-001) |
+| P10-3 | any unmeasured plugin version/format | attempt a write during acceptance | typed refusal naming the measured set | version restriction cannot be bypassed (L-5) |
+| P10-4 | an acceptance run with a `partially_restored`/`unknown` outcome | attempt to close the phase | closure blocked until the outcome is explained or resolved | no final acceptance with ambiguity ([14 gates](#global-phase-gates)) |
+| P10-5 | the docs at the end of the run | check every claim against evidence | each claim cites a run artifact; nothing is `VERIFIED` without one | documentation follows measured behaviour |
+
+**Documentation updates (K).** [14] with the final measured design notes; [12 §7-§9] with executed
+cases and evidence locations; [15] risk statuses; [17] evidence index; [19 §7] measured limitations;
+[20](20-implementation-handoff.md) marked as executed with deviations listed; the repo README.
 
 **Acceptance criteria:** [00 §6] items 1–7 each demonstrated with evidence; no unexplained failure;
 all declared limits surfaced in outputs; the run's restore verified per channel (never "restored"
@@ -481,7 +932,7 @@ the end of a run when the harness could have resolved it; the test project is le
 report claims a capability its evidence does not show.
 
 **Exit criteria:** acceptance criteria met; documentation updated; owner sign-off recorded; the
-phase-E cycle (subsystem → tests → boundary → review → next) closed.
+implementation cycle (subsystem → tests → boundary → review → next) closed.
 
 ---
 
@@ -502,25 +953,26 @@ flowchart LR
     P2 -.early tool/schema tests on mocks.-> P6
 ```
 
-**Mandatory gates (no phase may rely on functionality that does not exist yet):**
+## Global phase gates
 
-1. **No live write** before target-aware state addressing (P3 `locate_state_slice`, unique-or-refuse)
-   and the identity model (P1/P3 target tokens and revisions) are implemented.
-2. **No live write** before the complete-capture-or-refuse snapshot and recovery contract is
-   implemented and mock-proven (P2 ordered units, per-channel verified rollback). A weaker recovery
-   implementation never reaches a host.
-3. **No Vital live mutation** before codec isolation and provider conformance pass (P7 V-1…V-12,
-   including the clean-process import test). Live writes are P8 only.
-4. **No final integration acceptance** while any mutation outcome remains ambiguous: a run ending in
-   `unknown`/`partially_restored` must be resolved and explained in the P10 report, never averaged
-   away.
-5. **No phase depends on a later phase:** each phase's tests run against mocks or host paths that
-   already exist — registration/schema tests run against mocks from P2 onward even though production
-   registration is P9, and P5 implements write *primitives* while performing **no live mutation**.
-6. **No provider ported or copied before P7**, and then only the verified host-free function set
-   ([17 AV-13](17-planning-evidence-index.md)); the legacy module chain is never imported (AUD-005).
+These gates are conditions of the owner's approval ([19 §6](19-owner-decisions.md)), not advice. A
+phase that cannot satisfy a gate does not proceed; it stops and reports.
 
-A phase that needs a live write to prove itself is mis-planned and must be split.
+| # | Gate |
+|---|---|
+| G-1 | **No live mutation** before target-aware addressing and target validation are implemented and tested (P3 `locate_state_slice` unique-or-refuse; P1/P3 token issuance + revalidation). |
+| G-2 | **No live mutation** before complete snapshot/recovery behaviour passes deterministic mock tests (P2/P5: snapshot-or-refuse, ordered units, per-channel verified rollback). A weaker recovery implementation never reaches a host. |
+| G-3 | **No Vital live mutation** before codec isolation and provider conformance tests pass (P7 V-1…V-12, including the clean-process import test and the byte-identity fixtures). |
+| G-4 | **No write to a stale or ambiguous target** — a stale token, a mismatched revision or a non-unique state block refuses before any write. |
+| G-5 | **No successful rollback claim** unless restoration of every required, non-conflicting channel has been verified by comparison after the restore. |
+| G-6 | **No blind rollback over a detected external change** — a divergent channel is left untouched and reported `not_restored (external_change)`. |
+| G-7 | **No final acceptance while post-write outcomes remain ambiguous** — an `unknown`/`partially_restored` outcome must be resolved and explained, never averaged away. |
+| G-8 | **No phase depends on implementation scheduled for a later phase** — each phase's tests run against mocks or host paths that already exist (registration/schema tests run against mocks from P2 onward although production registration is P9; P5 implements write primitives while performing no live mutation). |
+| G-9 | **Unsupported or unmeasured plugin versions cannot bypass V1 write restrictions** — no override flag, no acknowledgement escape, fail closed for VST2 and unmeasured versions. |
+| G-10 | **No implementation feature silently expands beyond approved V1 scope** — a feature that needs a new contract, a new dependency or a changed guarantee stops the phase and returns to the owner as a decision ([19](19-owner-decisions.md)). |
+
+A phase that needs a live write to prove itself is mis-planned and must be split. P8 is the first phase
+in which live mutation tests may be performed; before P8, no phase may connect to REAPER to write.
 
 ## Cross-phase risks register pointer
 

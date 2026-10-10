@@ -1,6 +1,6 @@
 # 00 — Project Charter
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md);
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md);
 Phase-B audit findings AUD-001…AUD-015 resolved in documentation).
 
 ## 1. Problem
@@ -136,27 +136,34 @@ into a single-parameter tool shape.
 ## 7. Approval gates and workflow
 
 ```
-Phase A  research + planning (this documentation)                       [DONE when owner accepts]
-Phase B  independent audit by GPT-5.6 in Codex                          [mandatory gate]
-Phase C  resolve findings; update docs/contracts                        [mandatory]
-Phase D  owner explicitly authorizes implementation                     [mandatory gate]
-         (the four decisions to record are in [19-owner-decisions.md](19-owner-decisions.md))
-Phase E  incremental implementation (one subsystem → tests → boundary → review → next)
+Phase A  research + planning (docs 00-17)                                 [done]
+Phase B  independent audit by GPT-5.6 in Codex                            [done: 3 Critical / 8 High / 4 Medium]
+Phase C  resolve findings; update docs/contracts                          [done: doc 18]
+Phase D  consolidate the specification; isolate the real decisions        [done: doc 19]
+Phase E  owner approves the four decisions; final planning and handoff     [done: docs 19, 20]
+Phase F  implementation session: P0-P10, one subsystem at a time          [NOT STARTED]
+         (roadmap: [14-implementation-plan.md](14-implementation-plan.md);
+          handoff: [20-implementation-handoff.md](20-implementation-handoff.md))
 ```
 
 Additional rules carried from the brief:
 
-- No implementation before Phase D approval; documentation and read-only investigation only in A–C.
+- No implementation before the owner's approval of the four decisions (recorded 2026-10-10 in
+  [19 §6](19-owner-decisions.md)); documentation and read-only investigation only in Phases A–E.
+- Implementation happens in a **separate session** from the handoff in
+  [20](20-implementation-handoff.md); approving the decisions is **not** authorization to start
+  coding inside a planning session.
 - If implementation reveals a missing contract, the contract change is **documented first**
   (e.g. in [15](15-risks-and-open-questions.md)), not silently coded.
-- Each Phase-E subsystem ships with its tests and acceptance criteria from [14](14-implementation-plan.md).
-- GPT-5.6 Codex may independently review significant changes during Phase E.
+- Each implementation phase ships with its tests and acceptance criteria from [14](14-implementation-plan.md),
+  and stops at the ten global gates ([14 §Global phase gates](14-implementation-plan.md#global-phase-gates)).
+- GPT-5.6 Codex may independently review significant changes during implementation.
 
 ## 8. Ownership
 
 | Role | Responsibility |
 |---|---|
-| Project owner (human) | Approves documentation (Phase D), accepts risks, authorizes live-write testing |
-| Primary planner (DeepSeek, Phase A) | Research, architecture, contracts, plans, evidence index |
+| Project owner (human) | Approved the four V1 decisions (2026-10-10), accepts the documented limitations, authorizes live-write testing, gives final sign-off on the package |
+| Primary planner (DeepSeek, Phases A–E) | Research, architecture, contracts, plans, evidence index, handoff package |
 | Independent auditor (GPT-5.6 Codex, Phase B) | Verifies claims against source; challenges boundaries |
-| Implementer (Phase E) | Builds subsystem-by-subsystem under approved contracts |
+| Implementer (Phase F, separate session) | Builds subsystem-by-subsystem under the approved contracts and the [20](20-implementation-handoff.md) instructions |

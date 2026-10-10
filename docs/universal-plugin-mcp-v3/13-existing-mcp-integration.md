@@ -1,6 +1,6 @@
 # 13 — Existing MCP Integration
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md));
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md));
 the integration surface itself is **[A] verified** (files/symbols below), with two Phase-C
 resolutions: the **startup lifecycle** is AUD-006 Option A, and **registration is unconditional**
 (AUD-013).
@@ -105,7 +105,7 @@ Compatibility mitigations:
 | REAPER closed at startup | **process does not start** (pre-existing eager `reapy.connect()` raises) — the accepted V1 lifecycle ([19 Decision 4](19-owner-decisions.md), AUD-006 Option A) | the plugin layer adds no further eager connection, and a connection lost after startup yields a typed `NotConnected` [A: 01 §3]; changing this (lazy startup, Option B) is out of V1 scope and would require re-planning |
 | Working tree | **do not touch** staged `project_controller.py` change or the untracked probe doc | [01 §7] |
 
-## 7. Rollout plan (Phase E, after approval; phase IDs per [14](14-implementation-plan.md), AUD-011)
+## 7. Rollout plan (implementation session, P0–P10; phase IDs per [14](14-implementation-plan.md), AUD-011)
 
 1. **P0-P2 (offline):** land the `plugins/` package, domain models + target-token/revision objects,
    mock provider/host/codec-B, and the mock-proven transaction — **no server change yet**; offline

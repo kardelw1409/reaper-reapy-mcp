@@ -1,6 +1,6 @@
 # 08 — Provider and Host Interfaces
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
 Defines the five distinct concepts the brief requires to stay separate:
 Universal Core, Provider, Capability Profile, State Codec, Host Bridge (+ REAPER implementation).
 
@@ -116,6 +116,37 @@ from measured evidence, so a copy inside the repo would be a second source of tr
 use pinned fixture subsets, so the suite needs no `C:\REAPER`. The profile records
 `provenance.source_digest` over the files actually read, so a stale or replaced directory is visible
 and can never be served silently.
+
+**Registry directory resolution, validation and error handling (specified for P7; owner-approved
+boundary — [19 Decision 2](19-owner-decisions.md)).** The implementation must behave exactly as
+follows; no silent fallback is permitted anywhere in this sequence.
+
+1. **Resolution order.** (1) `REAPER_MCP_VITAL_REGISTRY_DIR` when set (even to an empty string — an
+   empty value is a configuration error, not "unset"); (2) otherwise the documented default
+   `C:\REAPER\prompts\vital_sound_design\registry`. The value is normalised to an absolute path
+   (`os.path.abspath` + `os.path.normpath`); `~` and environment variables are **not** expanded (a
+   literal path is required, so a typo cannot silently resolve somewhere else); relative values are
+   resolved against the process working directory **and reported as such** in the profile provenance.
+2. **Validation (at provider load / first use, before any read is served).** The path must exist and
+   be a directory; it must contain the expected registry files (`controls`, `modules`, `laws`,
+   `capabilities` — exact filenames fixed in P7 against the POC's `adapter/registry.py` [A]); each
+   file must be readable, parse as JSON, and pass the provider's schema check ([07 §4](07-capability-profile-schema.md));
+   the resolved directory and a digest over the files actually read are recorded in the profile
+   provenance.
+3. **Error handling (all fail closed, all echo the resolved path).** Variable set but invalid
+   (missing/not a directory/unreadable/invalid JSON/failed schema check) ⇒ typed
+   `IncompatibleSettings` naming the variable and the resolved path, the provider is **not** used for
+   that call, and **no fallback to the default directory occurs**. Variable unset and the default
+   directory unusable ⇒ the same typed error, naming the default. Provider not enabled at all
+   (`REAPER_MCP_PLUGIN_PROVIDERS` unset or not listing `vital`) ⇒ typed `UnsupportedProvider`, and the
+   registry directory is **not** touched (no disk access, no error if it is missing).
+4. **Startup and test isolation.** Nothing in this sequence runs at import time or at server startup:
+   resolution happens on first plugin-tool call that needs the provider, so a server with zero
+   providers never touches the filesystem and the offline suite never needs `C:\REAPER` (pinned
+   fixture subsets are used instead).
+5. **Caching interaction.** The directory's content digest is part of the profile cache key
+   ([09 §3](09-discovery-and-cache.md)); a changed directory therefore produces a different profile
+   key rather than a silently reused profile.
 
 **Codec isolation (AUD-005).** Importing the legacy `_b4_lib` chain is forbidden from Core and from
 the provider: `_b4_lib` module-level imports `_bh_session`, which at module level imports `reapy`,

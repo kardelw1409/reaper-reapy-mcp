@@ -1,6 +1,6 @@
 # 10 — State, Modulation and Dependencies
 
-Status: **[D] proposed** (rev. 2026-10-11, Phase C remediation → Phase D consolidation — see [18](18-remediation-register.md) and [19](19-owner-decisions.md)).
+Status: **[D] proposed** (rev. 2026-10-10, Phase C remediation → Phase D consolidation → Phase E approvals and handoff — see [18](18-remediation-register.md), [19](19-owner-decisions.md), [20](20-implementation-handoff.md)).
 Covers three contracts the brief keeps together: the state/document
 channel + codec boundary, the universal modulation model, and the dependency/validation mechanism.
 All three are derived from measured POC behavior [A: 02] **as corrected by the Phase-C audit**
