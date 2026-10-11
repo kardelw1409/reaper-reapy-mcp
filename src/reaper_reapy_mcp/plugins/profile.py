@@ -10,6 +10,7 @@ The validator returns problems instead of raising: the caller decides between
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,6 +18,9 @@ __all__ = [
     "PROFILE_SCHEMA_VERSION",
     "CACHE_FORMAT_KEY",
     "LAW_KINDS",
+    "LAW_DIRECTIONS",
+    "CONFIRMATION_STATES",
+    "CALIBRATION_STATES",
     "AUTHORITY_SPACES",
     "DEPENDENCY_KINDS",
     "REQUIRED_IDENTITY_FIELDS",
@@ -28,8 +32,25 @@ __all__ = [
 
 #: Bumped when the profile SHAPE changes; the cache format key moves with it so
 #: old files are rebuilt rather than mis-read (07 §3.1).
-PROFILE_SCHEMA_VERSION = 1
-CACHE_FORMAT_KEY = "capability-map-v1"
+#: v2 (2026-10-11): the calibration block, per-control `host_steps`, `unit_source`,
+#: `law_candidate` and `evidence.confirmation`, and `law.params.direction` for a
+#: measured descending law. A v1 entry is refused by its own schema check (the
+#: preload skips it, the runtime path quarantines it and rebuilds).
+PROFILE_SCHEMA_VERSION = 2
+CACHE_FORMAT_KEY = "capability-map-v2"
+
+#: Legal conversion directions a numeric law may declare (P22).
+LAW_DIRECTIONS = ("ascending", "descending")
+
+#: Legal confirmation states an `evidence.confirmation` record may carry.
+#: `consistent_within_step` is strictly weaker than `confirmed`: the law agrees
+#: with the host's text to within the host's own display granularity, not to its
+#: printed digits, and it promotes nothing.
+CONFIRMATION_STATES = ("confirmed", "consistent_within_step", "declined", "insufficient_points")
+
+#: Legal calibration-block states: applied, refused (a configured artifact failed), or
+#: absent (no preparation run yet - a normal state, not a refusal).
+CALIBRATION_STATES = ("applied", "refused", "absent")
 
 LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured")
 AUTHORITY_SPACES = ("parameter", "state")
@@ -77,7 +98,15 @@ def _nonempty(value: Any) -> bool:
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A real, **finite** number.
+
+    `json` parses the bare tokens `NaN`, `Infinity` and `-Infinity`, so a
+    validating profile could otherwise carry a value no consumer can compare -
+    and `json.dumps` would write those non-standard tokens back out.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
@@ -221,6 +250,108 @@ def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
                             f"control {control_id!r} law kind {kind!r} must not carry params",
                         )
                     )
+                # Row 6b - a declared conversion direction is one of the two the
+                # spine model expresses (P22); a typo must not silently read as
+                # ascending.
+                params = law.get("params")
+                if isinstance(params, dict) and "direction" in params:
+                    if str(params["direction"]) not in LAW_DIRECTIONS:
+                        problems.append(
+                            ProfileProblem(
+                                "law_direction_known",
+                                f"control {control_id!r} law direction {params['direction']!r} "
+                                f"not in {LAW_DIRECTIONS}",
+                            )
+                        )
+            # Row 6c - a near-fit candidate is a RECORD, never a conversion: it must
+            # name a known kind and carry the residual that refused it, and the
+            # control it sits on must not already have a working law.
+            candidate = control.get("law_candidate")
+            if candidate is not None:
+                if not isinstance(candidate, dict) or candidate.get("kind") not in LAW_KINDS:
+                    problems.append(
+                        ProfileProblem(
+                            "law_candidate_shape",
+                            f"control {control_id!r} law_candidate is not a known-kind object",
+                        )
+                    )
+                else:
+                    worst = candidate.get("worst_state")
+                    ratio = worst.get("ratio") if isinstance(worst, dict) else None
+                    if not _is_number(ratio) or float(ratio) <= 1.0:
+                        problems.append(
+                            ProfileProblem(
+                                "law_candidate_shape",
+                                f"control {control_id!r} law_candidate must record a refused fit "
+                                f"(worst ratio > 1), got {ratio!r}",
+                            )
+                        )
+                    if isinstance(law, dict) and law.get("kind") not in ("none", "unmeasured"):
+                        problems.append(
+                            ProfileProblem(
+                                "law_candidate_shape",
+                                f"control {control_id!r} carries a law_candidate although its law "
+                                f"{law.get('kind')!r} converts",
+                            )
+                        )
+            # Row 6d - host step metadata (P22): numbers and a bool, nothing else.
+            steps = control.get("host_steps")
+            if steps is not None:
+                valid = (
+                    isinstance(steps, dict)
+                    and all(_is_number(steps.get(name)) for name in ("step", "small", "large"))
+                    and isinstance(steps.get("is_toggle"), bool)
+                    and isinstance(steps.get("source"), dict)
+                )
+                if not valid:
+                    problems.append(
+                        ProfileProblem(
+                            "host_steps_valid",
+                            f"control {control_id!r} host_steps must carry numeric step/small/large, "
+                            "a boolean is_toggle and a source block",
+                        )
+                    )
+            # Row 6e - a filled unit must name where it came from (P22): an
+            # unattributed unit is what the no-invention rule exists to prevent.
+            unit_source = control.get("unit_source")
+            if unit_source is not None:
+                if not isinstance(unit_source, dict) or not _nonempty(unit_source.get("kind")):
+                    problems.append(
+                        ProfileProblem(
+                            "unit_provenance_present",
+                            f"control {control_id!r} carries a unit_source without a kind",
+                        )
+                    )
+                elif not _nonempty(control.get("unit")):
+                    problems.append(
+                        ProfileProblem(
+                            "unit_provenance_present",
+                            f"control {control_id!r} carries a unit_source but declares no unit",
+                        )
+                    )
+            # Row 6f - a confirmation record states one of the three legal states.
+            evidence = control.get("evidence")
+            confirmation = evidence.get("confirmation") if isinstance(evidence, dict) else None
+            if confirmation is not None:
+                if not isinstance(confirmation, dict) or confirmation.get("state") not in CONFIRMATION_STATES:
+                    problems.append(
+                        ProfileProblem(
+                            "confirmation_state_known",
+                            f"control {control_id!r} evidence.confirmation state "
+                            f"{(confirmation or {}).get('state') if isinstance(confirmation, dict) else None!r} "
+                            f"not in {CONFIRMATION_STATES}",
+                        )
+                    )
+                elif confirmation.get("state") == "confirmed" and not isinstance(
+                    evidence.get("strength_before"), str
+                ):
+                    problems.append(
+                        ProfileProblem(
+                            "confirmation_state_known",
+                            f"control {control_id!r} promotes evidence on a confirmation but does "
+                            "not record strength_before",
+                        )
+                    )
 
     # Row 7 - modulation declarations.
     modulation = profile.get("modulation")
@@ -322,6 +453,60 @@ def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
                     REFUSE_CACHE_WRITE,
                 )
             )
+
+    # Row 11b - the calibration block (P22): an `applied` block must name the
+    # artifact whose hash is key material, and a refused one must say why. An
+    # `applied: true` with no artifact reference would make the merges it
+    # justifies unattributable.
+    calibration = profile.get("calibration")
+    if calibration is not None:
+        if not isinstance(calibration, dict) or not isinstance(calibration.get("applied"), bool):
+            problems.append(
+                ProfileProblem(
+                    "calibration_block_valid",
+                    "the calibration block must be an object with a boolean `applied`",
+                )
+            )
+        else:
+            artifact = calibration.get("artifact")
+            has_artifact = isinstance(artifact, dict) and _nonempty(artifact.get("sha256"))
+            if calibration["applied"] and not has_artifact:
+                problems.append(
+                    ProfileProblem(
+                        "calibration_block_valid",
+                        "calibration.applied is true but the artifact reference (file+sha256) "
+                        "is missing",
+                    )
+                )
+            if calibration["applied"] and not _is_number(calibration.get("method_version")):
+                problems.append(
+                    ProfileProblem(
+                        "calibration_block_valid",
+                        "calibration.applied is true but method_version is not numeric",
+                    )
+                )
+            if artifact is not None and not isinstance(artifact, dict):
+                problems.append(
+                    ProfileProblem("calibration_block_valid", "calibration.artifact is not an object")
+                )
+            counts = calibration.get("counts")
+            if counts is not None and not isinstance(counts, dict):
+                problems.append(
+                    ProfileProblem("calibration_block_valid", "calibration.counts is not an object")
+                )
+            refusals = calibration.get("refusals")
+            if refusals is not None and not isinstance(refusals, list):
+                problems.append(
+                    ProfileProblem("calibration_block_valid", "calibration.refusals is not a list")
+                )
+            state = calibration.get("state")
+            if state is not None and state not in CALIBRATION_STATES:
+                problems.append(
+                    ProfileProblem(
+                        "calibration_block_valid",
+                        f"calibration.state {state!r} not in {CALIBRATION_STATES}",
+                    )
+                )
 
     # Row 12 - capture scope legality.
     state = profile.get("state")

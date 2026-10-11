@@ -54,7 +54,24 @@ class DependencyRuleSet:
 
 @runtime_checkable
 class PluginProvider(Protocol):
-    """Plugin-specific semantics, bindings, laws, rules and codec (08 §2)."""
+    """Plugin-specific semantics, bindings, laws, rules and codec (08 §2).
+
+    Two **optional** hooks are recognized by Core when a provider declares them
+    (they are not part of this protocol because Core's callers must work without
+    them):
+
+    - ``profile_source_rows(identity) -> list[{"file", "sha256"}]``: the data
+      sources the profile derives from, **hashed without building it**. Core uses
+      it to compute the cache key before deciding whether a build is needed, so a
+      warm cache hit costs a hash instead of a full projection. The rows must be
+      the same ones ``build_profile`` declares in ``provenance.sources``: a
+      disagreement is caught at runtime (`cache.key_material`) and the cache
+      write is refused rather than filed under an underivable key.
+    - ``adopt_profile(profile) -> None``: adopt the profile Core is about to
+      serve. A provider whose other methods consult its own last-built profile
+      (rules, limits, structural targets) needs this, because a cache hit builds
+      nothing.
+    """
 
     id: str
     """Stable provider id used in refs/profile."""

@@ -202,7 +202,7 @@ def test_b47_every_determinant_changes_the_key(tmp_path):
         provider_revision=build.provider_revision,
         provider_artifact_digest=build.provider_artifact_digest,
         source_digest=build.source_digest,
-        schema_version=2,
+        schema_version=C.PROFILE_SCHEMA_VERSION + 1,
     )
     format_key = C.compute_cache_key(
         provider_id="demo",
@@ -210,7 +210,7 @@ def test_b47_every_determinant_changes_the_key(tmp_path):
         provider_revision=build.provider_revision,
         provider_artifact_digest=build.provider_artifact_digest,
         source_digest=build.source_digest,
-        cache_format_key="capability-map-v2",
+        cache_format_key="capability-map-v99",
     )
 
     keys = {

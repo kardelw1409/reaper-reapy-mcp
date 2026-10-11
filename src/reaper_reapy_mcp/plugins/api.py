@@ -391,8 +391,13 @@ def _meta(resolution: RS.ProfileResolution) -> dict[str, Any]:
     """The sanctioned live-response metadata (cache, provisional flag, token).
 
     ``identity_basis`` is part of the honesty contract: it states what the target
-    token validated and what it explicitly does **not** claim.
+    token validated and what it explicitly does **not** claim. ``startup``
+    carries the one-shot preload summary so a caller can see whether the process
+    started with prepared profiles loaded - and that a warm call reused them
+    rather than researching the plugin again.
     """
+    from . import preload as _preload  # noqa: PLC0415 - lazy: keeps registration import-light
+
     meta = resolution.meta()
     meta["instance"] = _ref_dict(resolution.instance.ref)
     meta["target_token"] = resolution.instance.token.id
@@ -400,6 +405,9 @@ def _meta(resolution: RS.ProfileResolution) -> dict[str, Any]:
     meta["profile_key"] = resolution.build.key_for(
         str(resolution.instance.ref.provider), resolution.identity
     )
+    report = _preload.prepared_profiles().report
+    if report is not None:
+        meta["startup"] = report.summary()
     return meta
 
 

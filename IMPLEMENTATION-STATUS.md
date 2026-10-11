@@ -2247,3 +2247,446 @@ amount alone).
   stash or checkout; the index was untouched. The REAPER project was **not saved**.
   Tracks 0, 2, 3 were never written to; the only instance touched is track 1 /
   fx 0, and it now carries the final patch the owner is asked to judge.
+
+---
+
+## 27. P21 — capability cache, warm path, preload and startup (2026-10-11)
+
+**The round's question.** The plugin layer could already drive a live plugin and
+verify the result. This round asked whether the *knowledge* about the plugin is
+actually prepared, cached, loaded at startup and reused - or whether every sound
+design request re-researches the same controls. Status labels below use the
+round's vocabulary: `verified` = implemented and proven end-to-end;
+`implemented, not e2e` ; `partial` ; `absent` ; `deliberately blocked`.
+
+### 27.1 The audit (one row per question, with its test evidence)
+
+| Question | Implementation | File / function | Test evidence | Status |
+|---|---|---|---|---|
+| **Host-parameter discovery** | `list_tracks` + per-slot `fx_facts` (name/class/module/param_count); 2858 parameters measured live; the sweep is narrowed to the addressed track/slot when the selector names them | `host/reaper.py::list_tracks/fx_facts`; `resolve.py::iter_instances` | `test_p21_warm_path_and_preload.py::test_a_location_selector_reads_only_the_addressed_tracks_slots` (`fx_facts` 4 → 1); evidence `p21_cache_timing__*` `instance_sweep` | verified |
+| **Capability Profile construction** | provider `build_profile` → Core provenance (revision, artifact digest, source digest) → `validate_profile` (07 §4 table) | `cache.py::build_capability_profile`; `providers/vital/profile_build.py::build_profile` | `test_p4_cache.py` (29 tests); `test_p21_profile_completeness.py::test_the_real_registry_accounts_for_every_host_parameter` (775 controls) | verified |
+| **Ranges and units** | registry `native_min/max` → `range`; units from the measured sweep's display strings; live corrections (`volume`, envelopes, `portamento_*`, `voice_transpose`) override the corpus ranges with a named source | `profile_build._range_from_row/_unit_from_states/_live_measured_corrections` | `test_p18_live_corrections.py`, `test_p19_filter_units.py`, `test_p16_measured_laws.py`; completeness artifact counts (`range_none` 163, `unit_none` 590) | verified (measured subset), `partial` where the registry carries none (recorded, not invented) |
+| **Enum mappings and boundaries** | declared `enum_index` positions replaced by **measured band midpoints** when the uniform arithmetic lands a member outside its own band; `switch_points` drive the read inversion | `profile_build._declared_enum_positions`; `values.py::normalized_to_native` | `test_p19_enum_positions.py` (198 lines); completeness artifact: **51 of 342 enums** carry measured positions | verified |
+| **Provenance and version checks** | key = provider + fingerprint + revision + artifact digest + source digest + schema/format; `version_refusal` refuses writes outside the measured set; entry provenance must re-derive its own key | `cache.py::compute_cache_key/_read_entry`; `resolve.py::version_refusal` | `test_p4_cache.py` B-47 matrix (every determinant moves the key); `test_p4_5_*`, `test_version_outside_the_measured_set_refuses_writes_without_override` | verified |
+| **Disk cache write/load** | one file per key, validate-before-replace, quarantine by atomic rename, temp+fsync+`os.replace`, `REAPER_MCP_PLUGIN_CACHE` override | `cache.py::ProfileCache.save/load/_quarantine` | `test_p4_cache.py` (B-55 byte-compare, B-56 interrupted write, content hash + counts as two independent checks, failed-quarantine refusal) | verified |
+| **Startup load (this round's gap)** | **new**: `plugins/preload.py` scans the cache dir at `create_server`, validates every identity-independent property once, holds the entries in memory (per-provider cap, newest first), never writes/quarantines/deletes, never raises | `preload.py::preload_from_env/_prepare_file`; `server.py::create_server` | `test_p21_warm_path_and_preload.py` (10 preload tests incl. no-write proof, cap, superseded/foreign/corrupt rows); `test_p21_profile_completeness.py::test_create_server_runs_the_preload_once_and_survives_its_failure` | verified |
+| **New plugin/provider** | generic host facts always exist; semantic rules are only ever the provider's; a provider without prepared data is served a built (uncached) profile with the cache refusing the write for missing provenance; missing provider → typed `UnsupportedProvider` | `resolve.py` fail-closed path; `cache.py::refuse_no_identity`; `providers/registry.py::load_provider` | `test_p4_5_no_identity_...`; `test_p9_tools.py`; `test_p7_vital.py` isolation/refusal tests | verified |
+| **Reaction to provider data/code change** | registry file change → source digest → new key → miss + rebuild (old entry left on disk); provider code change → artifact digest **and** `IMPLEMENTATION_REVISION` | `cache.py::digest_artifact_paths/sources_digest`; `providers/vital/provider.py` (`_PROVIDER_FILES`, r7) | `test_p4_cache.py` change matrix; measured live this round: the r6 entries were all dismissed at preload after the r7 bump (`p21_cache_timing__*` `real_cache_preload`) | verified |
+| **Metadata vs live values** | the profile holds capability data only (law, range, unit, evidence, binding.index, state keys); every current value is a fresh host read inside the call; the transaction builds its baseline from `_read_live_state` | `api.py::plugin_read`; `transaction.py::_read_live_state`; `profile_build.build_profile` (no value fields) | `test_p4_cache.py::test_hot_path_cache_hit_performs_zero_host_parameter_reads`; live `test_p18_cache_freshness.py` (independent change visible, 43.5 s); P21 tool-layer dry run (§27.6) | verified |
+| **Incomplete profile behaviour** | a required identity field missing → in-memory profile, no cache read *or* write, reads provisional, every mutation refused (`SnapshotUnavailable`); a profile that fails validation → used, not cached (or rebuilt); an entry that fails load → quarantined + rebuilt | `resolve.py::identity_missing_fields/require_writable`; `cache.py::save/load` | `test_p4_5_no_identity_means_no_cache_file_and_writes_refused`; `test_a_non_cacheable_entry_is_neither_written_nor_served`; `test_a_provider_without_revision_or_readable_sources_is_not_cacheable` | verified |
+
+### 27.2 What was already implemented, and what was actually missing
+
+Already there and **re-verified, not rewritten** (P4/P9/P18): the cache key
+covering all five determinants, atomic publication, quarantine-by-rename, the
+fail-closed identity gate, the `meta.cache` reporting, the freshness rule, and
+the P18 live freshness evidence. The P4 hot-path test ("a cache hit performs
+zero host parameter reads") passed for two phases while hiding the real cost.
+
+Missing, and confirmed by reading the code (not by inference):
+
+1. **The warm path built the profile before consulting the cache.**
+   `resolve.py` called `build_capability_profile` unconditionally and then,
+   on a hit, *discarded* the result. Measured on the real registry (6.6 MB of
+   JSON, 775 controls): registry load **155 ms**, build+digests+validate
+   **516-630 ms** on top, cache read ~40 ms - i.e. **~583-630 ms of pure compute
+   per warm call**, recomputed identically every time. The P4 hot-path test could
+   not see it: it counted *host parameter reads*, and a build performs none.
+2. **Nothing was loaded at startup.** The only references to the cache lived on
+   the per-call path; `create_server` registered the tools and touched no
+   profile. The first call after every server start paid the full cold path even
+   when a prepared profile sat on disk.
+3. **A provider object was constructed per call**, so the registry was re-read,
+   re-parsed and re-hashed on every call (`load_provider` has no memoisation) -
+   the cost that made (1) expensive.
+4. **The instance sweep read every slot of every track** even when the caller's
+   selector named the track: measured live **1536 ms** for 4 slots (one full
+   track-chunk read per slot, unheld RPCs), versus **~50 ms** for everything else
+   in a warm call.
+5. **Stale entries accumulated without policy**: the real cache directory held 11
+   entries from earlier provider revisions (15 MB), none of which can ever be
+   served again, with no reporting.
+
+### 27.3 Fixes
+
+| # | Fix | Where |
+|---|---|---|
+| F1 | **Warm path without a build**: the provider declares its key material (revision + artifact digest + data-source digests) *without projecting the profile*; Core computes the key, consults the cache first, and only builds on a miss. On a miss the built profile's own provenance must re-derive the same key, else `cache.key_material` is refused loudly and nothing is cached | `cache.py::KeyMaterial/key_material_of`; `resolve.py::resolve_instance_profile`; `providers/vital/provider.py::profile_source_rows`; `profile_build.registry_source_rows` (hash-only, no parse) |
+| F2 | **Prepared profiles at startup**: scan + validate once, hold in memory, serve the first call from the index; a file that moved since startup, or an identity that disagrees, falls through to the full disk path (which still reports and quarantines) | `preload.py`; `cache.py::_prepared_entry`; `server.py::create_server` (guarded) |
+| F3 | **Bounded preload**: superseded entries are dismissed by a text prefilter (no parse); a per-provider cap (8, newest first) bounds memory and scan time; extra files are reported as `preload.capped` and never deleted | `preload.py::PRELOAD_ENTRY_CAP_PER_PROVIDER/_newest_first/superseded_by_text` |
+| F4 | **Addressed-slot enumeration**: a selector naming `track_index` reads only that track; naming `fx_index` reads only that slot | `resolve.py::iter_instances` |
+| F5 | **Provider state adoption**: the served profile is handed to the provider, so rules/targets are evaluated against what is being served even though no build ran | `cache.py::adopt_profile`; `providers/vital/provider.py::adopt_profile`; call sites in `resolve.py` |
+| F6 | **Visibility**: `meta.cache` gains `prepared`/`built`/`key_without_build`; `meta.startup` carries the one-shot preload summary | `api.py::_meta`; `cache.CacheStatus` |
+
+### 27.4 Vital coverage (reproducible; evidence `p21_profile_completeness__*`)
+
+`2858 = 775 + 2080 + 3 + 0` - every host parameter is classified, and the
+arithmetic is the registry's own:
+
+| Class | Count | Provenance |
+|---|---|---|
+| mapped controls (semantic, writable) | **775** | correspondence rows with a `state_key`; live binding 775/775 in `p8_baseline__20261010T195509Z__…` |
+| MIDI-CC mapping slots | **2080** | `vital_controls.json::n_midi_cc` and `vital_modules.json::totals.midi_cc_mappings`; live names sampled this round read `"MIDI CC N|M"` |
+| REAPER wrapper parameters | **3** | `Bypass`/`Wet`/`Delta` at indexes 2855-2857 (`module: "REAPER wrapper"`); read live this round |
+| unclassified | **0** | - |
+
+Profile shape: 433 numeric / 342 enum controls; laws `affine` 399, `enum_index`
+342, `power` 25, `none` 6, `exponential` 1, `unmeasured` 2; 51 enums carry
+measured (non-uniform) band positions; 163 controls declare no range and 590 no
+unit (the registry has none - recorded, never invented); evidence strength
+`strong` 731 / `weak` 36 / `none` 8. **Honest gap list** (from the artifact):
+`law none` = `random_1..4_frequency`, `delay_aux_frequency`, `delay_aux_tempo`;
+`law unmeasured` = `delay_frequency`, `phaser_frequency`; the 36 `weak` rows are
+the `env_N_*_power`/`env_N_delay` families.
+
+### 27.5 Cold vs warm, measured (evidence `p21_cache_timing__20261011T185938Z__e2e67032fa1e.json`)
+
+Machine: Python 3.11.9, live REAPER 7.53, cache dir `%LOCALAPPDATA%\reaper_reapy_mcp\cache\plugins`.
+
+| Phase | Total | of which profile work | builds | cache-file reads | `meta.cache` |
+|---|---|---|---|---|---|
+| instance sweep alone (1 track, 1 slot) | 687 ms | - | - | - | host: `list_tracks` 1, `fx_facts` 1 |
+| cold (registry + build + save) | 1260 ms | ~573 ms | 1 | 0 | `source=built` |
+| warm, prepared entry on disk | 727 ms | ~40 ms | **0** | 1 | `source=cache` |
+| warm, startup index | 697 ms | **~9 ms** | **0** | **0** | `source=cache, prepared=true` |
+| pre-fix warm path (measured reconstruction of the old order: build + disk load) | - | **583 ms** | 1 | 1 | discarded |
+
+Startup: import chain in a fresh process **1.44-1.74 s** (pre-existing
+`reapy`/`mcp`/controllers chain, unchanged), `create_server` **0.11-0.18 s**, of
+which the preload was **0.035-0.075 s** for a 12-13-entry cache directory (all
+superseded → no parses); with no provider configured the preload is a measured
+no-op. Key material without a build: **8.6 ms** against ~155 ms for the registry
+load it replaces.
+
+### 27.6 Live end-to-end check through the tool layer (no host writes)
+
+`plugin_describe` → 775 controls, `no_law: 8`; `plugin_find filter_1_style` →
+enum, 5 members, measured positions present; `plugin_read` → live values with
+unit-stripped display; `plugin_write(dry_run=True)` → `ok`, `committed=None`,
+`outcome.host = {reads: 13, write_calls_attempted: 0, ...}`,
+`meta.cache = {source: cache, built: False, key_without_build: True}` - i.e. the
+write path planned against the **cached** profile, ran the dependency rules,
+and issued no write.
+
+### 27.7 Verification targets the round added
+
+`res/cache invalidation`: the r6→r7 revision bump made every pre-existing entry
+uncacheable and the preload dismissed all 12-13 of them at **0 parses**; the
+B-47 matrix tests each determinant. `freshness`: unchanged this round - the P18
+live freshness probe remains the evidence that an independent change is visible
+and no value cache or TTL exists. `preload`: 10 offline tests including
+"nothing is written, quarantined or deleted", "a changed file is not served",
+"a disagreeing identity is not served", "a broken provider becomes a report row".
+`completeness`: the classification is rebuilt offline from the registry and
+pinned on the fixture; the real 2858-arithmetic is pinned when the measured
+registry is present.
+
+### 27.8 GLM-5.3 Flash (independent studies and review)
+
+Three read-only studies (cache/startup trace; Vital completeness; performance)
+and one review of the finished diff were run with GLM-5.3 Flash. Every headline
+number was re-derived independently before being used:
+
+| GLM claim | My independent check | Outcome |
+|---|---|---|
+| the profile is rebuilt before the cache is consulted | read `resolve.py` (pre-fix): unconditional `build_capability_profile` then `load` | **confirmed** (the round's F1) |
+| `load_provider` has no memoisation → registry re-read per call | read `providers/registry.py` (`return factory()`); measured 124-176 ms per fresh provider | **confirmed** |
+| 2858 = 775 + 2080 + 3 | re-read the registry's own counters and the built profile myself (identical), then confirmed the MIDI-CC block and the wrapper names **live** | **confirmed** (added: live names `MIDI CC N|M`, `Bypass`/`Wet`/`Delta`) |
+| cost decomposition (load 157 ms / build 411 ms / load 53 ms / save 105 ms) | my own measurements: 124-176 / 377-686 / 49 / 66-118 ms | **confirmed within run-to-run noise** |
+| `plugin_write` = 23 bridge verbs, `fx_facts` ×8 | not re-measured (out of this round's scope); the P17/transaction counters are quoted as GLM measured them | **accepted with the source named, not reproduced** |
+| review finding: `registry_source_rows` ≡ `provenance.sources` claimed "pinned by a test" but **no such test existed** | grepped `tests/` - GLM was right | **fixed**: two pinning tests added (fixture + measured registry) |
+| review finding: the preload scan is unbounded (memory/time) on a pathological cache | true of the first implementation | **fixed**: per-provider cap + newest-first + `preload.capped` rows (F3), with a test |
+| review finding (Q1): freshness relies on the provider-per-call construction | read `api.py::_providers`/`registry.load_provider` | **confirmed and documented** in the hook's docstring |
+
+The review's other six questions were answered SOUND with file:line traces; its
+one cosmetic note (`if True:` wrapper in `cache._read_entry`) is a pre-existing
+leftover, acknowledged and left alone.
+
+### 27.9 Tests actually run (this round)
+
+| Command | Result |
+|---|---|
+| `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live` | **497 passed** (474 before + 16 in `test_p21_warm_path_and_preload.py` + 7 in `test_p21_profile_completeness.py`) |
+| `py -3.11 -m pytest tests/plugins/test_p4_cache.py tests/plugins/test_p3_no_write.py tests/plugins/test_p9_tools.py -q` | 60 passed (the cache layer after F1) |
+| `py -3.11 -m pytest tests/test_midi_mock.py tests/test_controller_structure.py -q` | 2 passed (repo regression) |
+| `py -3.11 tests/plugins/live/probe_p21_profile_completeness.py` | exit 0; evidence `p21_profile_completeness__20261011T185928Z__2f5f2fea60b5.json` (live, read-only) |
+| `py -3.11 tests/plugins/live/probe_p21_cache_timing.py` | exit 0; evidence `p21_cache_timing__20261011T185938Z__e2e67032fa1e.json` (live, read-only) |
+
+### 27.10 Residual gaps (named)
+
+- **The instance sweep is now the warm call** (687 ms of 697 ms): one
+  `list_tracks` + one addressed `fx_facts`, whose RPCs are **not** wrapped in
+  reapy's held context (`_hold()` is used only for the ident/name/value loops).
+  Wrapping `list_tracks`/`fx_facts` in the hold is a transport change with its
+  own measurement duty (the P8 measurement: 30x per RPC); it was **not** done in
+  this round.
+- **`meta.cache.built` reports the build, not the total work**: a provider
+  without the key-material hook still builds on a hit (documented, tested).
+- **The prepared index is per process and per directory**: a second server
+  process re-reads the entries (0.035-0.075 s here); nothing is shared.
+- **Superseded entries are never deleted** (by policy). The maintenance answer
+  proposed is the preload report: it names them (`preload.superseded`) and the
+  bytes they occupy; deleting them stays a manual act.
+- **The 8 no-law controls** (`law none`/`unmeasured`) remain non-convertible:
+  their sweeps do not fit any declared law inside the acceptance bound. They are
+  readable, not writable by value.
+- **`plugin_write`'s host-call count** (GLM's 23 verbs, `fx_facts` ×8,
+  `param_idents` ×6 with 5 full-table reads) is quoted from the study, not
+  re-measured here; it is the natural subject of a transport round.
+- **A same-size, same-mtime byte swap** inside the cache directory during a
+  process's lifetime is not detected by the prepared path (the validated
+  in-memory copy is served); the disk path detects it on the next start. The
+  cache's threat model remains "user-local data" (P4 §22).
+
+### 27.11 Git state (recorded, not changed)
+
+- `HEAD` at session start and end: `64220df41a38b0cdbdb006154a9c1115eef75f94`
+  (branch `feature/vst-bridge`), index **empty** at start (`git diff --cached`
+  showed nothing), working tree = the 7 modified + 4 new files of this round plus
+  the user's untracked `composer_v1_2_lm_probe.md`.
+- **No** `git add`, `git reset`, `git stash`, `git checkout` or `git commit` was
+  run; the REAPER project was not saved; no plugin state was mutated (all live
+  work this round was read-only except the cache directory entries the layer
+  itself wrote, plus one scratch-run identity refusal that quarantined an entry
+  of its own cache - recorded here because the behavior is the documented
+  "foreign entry" defence, not a defect of this round).
+
+---
+
+## 28. P22 - automatic capability discovery: completeness from a read-only host channel (2026-10-11)
+
+**The round's question.** P21 made the *knowledge* about a plugin prepared,
+cached and reused. The knowledge itself, though, was still only as complete as
+the registry's hand-written rows: 163 controls without a range, 590 without a
+unit, 291 enums whose band boundaries were arithmetic guesses, 8 controls whose
+sweeps fitted no law, 36 rows whose evidence said `weak`. This round asked how
+much of that can be **filled automatically, at preparation time**, without ever
+installing an unproven value and without paying for the research on every MCP
+start. Status vocabulary as in §27: `verified` = implemented and proven
+end-to-end; `implemented, not e2e`; `partial`; `absent`; `deliberately blocked`.
+
+### 28.1 The named gaps, before and after (evidence `p22_host_calibration__20261011T212110Z__49536b6cfc9c.json`)
+
+| Named gap | Before | After | What filled it | Evidence level |
+|---|---|---|---|---|
+| controls with no `range` | **163** (as recorded in §27 / the brief) | **162** | nothing was invented: the one change is a *law-shape* correction (`delay_aux_tempo` is a **label** wearing a number - `"4/1"`, `"1/2"` - and is now read as an enum, so it has member bounds). Note the probe's own "before" baseline, built with the *final* code and no calibration, already reads 162: this gain comes from the value model, not from the artifact | unchanged / measured absence |
+| controls with no `unit` | **590** | **590** | 0 fills - see 28.2: the host prints **no** unit for these, and every control whose text *does* carry a stable token already declared that unit | measured absence |
+| enums whose boundaries were arithmetic | **291** of 342 (51 carried measured positions) | **291** of 343 (52 carry measured positions - `delay_aux_tempo` joined them) | the *count* did not move: what moved is that every measured map now also carries `switch_points` (band starts), and the arithmetic path's rounding was corrected from half-to-even to **half-up**, which is what makes an exact boundary read the member the host prints (`chorus_on` at 0.5, `chorus_tempo` at 0.25 -> `8/1`) | measured (`switch_points`), derived from measured data (positions) |
+| controls whose sweep fitted no law | **8** | **4** | `direction: descending` support in the value model (3 exponentials: `delay_frequency`, `phaser_frequency`, `delay_aux_frequency`) + the faithful-number rule (`delay_aux_tempo`) | measured laws, per-state printed precision |
+| rows with `weak` evidence | **36** | **12** | 24 promoted to `strong` by an **independent instrument** (the host formatter) agreeing at every grid point inside that state's printed precision | confirmed by a second channel |
+| `strong` rows | **731** | **759** | as above | - |
+| confirmations of the profile's own mapping | 0 (no such mechanism) | **646 `confirmed` / 25 `consistent_within_step` / 100 `declined` / 4 n/a** | every grid point of 775 controls compared against the law's prediction | measured |
+| per-control host step/toggle metadata | 0 | **346** rows (`step`, `small`, `large`, `is_toggle`) | `TrackFX_GetParameterStepSizes` | measured verbatim |
+| near-fits recorded instead of installed | 0 | **4 `law_candidate`** rows (never a law) + **19 `display_offset_candidate`** rows (never applied) | the candidate channel | measured, inert |
+
+The four controls that still fit no law are `random_1..4_frequency`: the host
+prints them as a **ratio**, so their 128 states span 2**16 inside a
+five-decade display, and the endpoint-anchored exponential misses each state's
+*printed* precision (worst ratio 11.2, relative deviation 5.7e-6). They are
+recorded as `law_candidate` and stay non-convertible — a near-fit is never
+installed.
+
+### 28.2 What the host actually offers (measured read-only, never assumed)
+
+| Host API | Shape measured 2026-10-11 (REAPER 7.53 / Vital VST3) | Verdict |
+|---|---|---|
+| `TrackFX_FormatParamValueNormalized(tr, fx, idx, norm, "", 512)` | returns the display text at tuple slot 5; **formats a value the caller passes, so it cannot move the parameter**; 775 controls x 17 grid points in **13.5 s**; the read-only proof re-measured on every capture: 31 watched normalized values and the state-chunk sha256 byte-identical before/after | **available and usable** - the round's channel |
+| `TrackFX_GetParameterStepSizes` | `(retval, track, fx, param, step, small, large, istoggle)`; **346 of 775** report `step > 0`, **248** are toggles; 0.10 s for all 775 | **available** |
+| `TrackFX_GetParamEx` | `(retval, track, fx, param, min, max, mid)` answers **0.0 / 1.0 / 0.5 for every one of the 775** controls | **no semantic range exists** - the uniform normalized space is what the host exposes |
+| `TrackFX_GetNamedConfigParm 'param.N.default_value'` | retval **0 for all 775** controls (0.74 s) | **defaults are not exposed** - recorded as a measured absence, not as an omission |
+| the registry's own measured sweeps | 6.6 MB of JSON: per-control `states` (normalized + display text) | already the source of laws/positions; this round added the printed-**precision** model to it |
+
+The consequence is stated plainly: **590 controls have no unit because the host
+prints none**, and **0 units were invented**. `units_filled: 0` is a finding, not
+a failure — the 185 controls whose host text carries a stable unit token already
+declared it.
+
+### 28.3 What was automated (F1-F7)
+
+| # | Fix | Where |
+|---|---|---|
+| F1 | **Descending laws** are a first-class direction: the fit runs in spine space (`1 - normalized`), the range stays numeric extremes (min <= max), and `to_normalized` / `normalized_to_native` invert the spine for `affine`/`power`/`exponential`. 3 controls became measurable laws because of it | `values.py::direction/to_normalized/normalized_to_native`; `profile_build.derive_measured_law` |
+| F2 | **Printed-precision instrument model**: the acceptance bound is `max(per-state printed precision, half the smallest measured step)` instead of a global constant. Verified *strictly additive*: 3 new laws, no previously accepted law changed | `profile_build._display_precision/_measurement_entries/_worst_fit_ratio` |
+| F3 | **Faithful numbers**: a display that is a number wearing a label (`"1/2"`, `"x Octave"`, `" of 16"`) is not a numeric measurement, so it cannot become a numeric law | `profile_build.derive_measured_law` |
+| F4 | **Measured enum boundaries**: derived enums gain `positions` **and** `switch_points` (band *starts*, so an exact boundary reads the member that starts there). This fixed a real read bug: normalized 0.5 read "Off" while the host formats "On" | `profile_build._band_geometry`; `values.py::normalized_to_native` (half-up for the uniform path) |
+| F5 | **The calibration channel**: one read-only preparation probe writes one artifact; the profile build reads it, verifies its identity, and merges only what it can attribute. The artifact's **bytes are a declared source**, so its hash is cache-key material (changed, removed and *refused* artifacts all move the key) | `providers/vital/calibration.py`; `provider.py::_calibration_source_row/calibration_artifact_path`; `profile_build.build_profile` |
+| F6 | **The confirmation channel**: every grid point is compared against the profile's own law, per control class (enum text equality; numeric in **both** display-space hypotheses, and which one matched is recorded). Four states: `confirmed` (promotes `weak` -> `strong`, recording `strength_before`), `consistent_within_step` (within the host's own smallest printed gap - **promotes nothing**), `declined` (with the observed offset as an inert `display_offset_candidate`), `insufficient_points` | `calibration.py::_confirmation_record/apply_calibration` |
+| F7 | **Profile schema v2** + validation rows 6b-6f/11b for the calibration block, `host_steps`, `unit_source` and the candidate; `CACHE_FORMAT_KEY` -> `capability-map-v2` so a v1 entry can never be served | `profile.py`; `cache.py` (pre-existing staleness defence) |
+
+### 28.4 Completeness now (final code, live artifact, rebuilt offline)
+
+`2858 = 775 mapped + 2080 MIDI-CC + 3 REAPER wrapper + 0 unclassified` (unchanged
+from §27 and re-verified by `probe_p21_profile_completeness.py`). Of the 775
+mapped controls:
+
+| Property | Count |
+|---|---|
+| laws | `affine` 399, `enum_index` 343, `power` 25, `exponential` 4, `none` 4 |
+| `direction: descending` | **3** |
+| evidence strength | `strong` **759**, `weak` **12**, `none` 4 (before: 731 / 36 / 8) |
+| confirmations | **646 confirmed** (622 were already `strong`, 24 promoted from `weak`) / 25 `consistent_within_step` / 100 `declined` / 4 n/a (`none` laws get no record) |
+| display space measured | 285 `native_space`, 19 `percent_space`, 467 n/a (not numeric-confirmed) |
+| enum band maps | **52** of 343 enums carry measured `positions` **and** `switch_points` |
+| `host_steps` recorded | **346** |
+| `unit_source` filled | 0 (see 28.2) |
+| `law_candidate` | 4 (`random_1..4_frequency`) |
+
+### 28.5 The trust model (what a merge may and may not do)
+
+- **The merge cannot write to the plugin, by construction** - not by convention:
+  `apply_calibration(controls, calibration, *, values_module, ...)` takes **no
+  bridge**, its only call site passes `plugins.values`, and every function it can
+  reach is pure. The module imports no host module (pinned by a test), and the
+  artifact's own "read-only proof" is a claim of the *sender* that the receiver
+  never needs to trust.
+- **Laws, ranges and enums are never taken from the artifact.** It can only
+  *annotate*: fill a unit it can re-derive, record host metadata, and confirm or
+  decline the mapping the registry already claimed.
+- **The artifact's own claims are verified against its own content.** A
+  `unit_token` that disagrees with the samples it summarizes, or a `numeric` flag
+  over non-numeric text, fills **nothing** and is recorded with the reason
+  (`units_declined` rows travel into the profile). This is the fix for the review's
+  Q2 finding (28.8).
+- **No default is ever invented** (28.2), **no candidate is ever installed**
+  (a `law_candidate` has zero consumers; validation requires its worst ratio > 1
+  *and* a law that cannot convert), and a refused artifact is neither applied nor
+  hidden - it is reported, and its bytes still move the cache key.
+- **A malformed artifact is a typed refusal, never a crash**: shape, identity,
+  grid (finite, within 0..1, non-decreasing), sample count/type/length, step
+  numbers (finite) and artifact size are all checked in `load_calibration`, and
+  every failure raises `IncompatibleSettings` with the reason the profile then
+  carries.
+
+### 28.6 The controlled calibration step, and what it costs
+
+| Cost | Measured |
+|---|---|
+| live preparation sweep (read-only, one process) | **15.5 s** total: display grid 12.9 s + step sizes 0.10 s + `GetParamEx` 0.10 s + default probe 0.74 s |
+| artifact on disk | **458,075 bytes** (`%LOCALAPPDATA%\reaper_reapy_mcp\calibration\vital_host_calibration.json`, override `REAPER_MCP_VITAL_CALIBRATION`) |
+| profile size | **1,347,048 bytes** (+1.6 % against the pre-P22 registry-only projection) |
+| **does the MCP start pay this?** | **No.** `create_server` runs the preload only: 13 files scanned, **13 skipped as superseded, 0 parses**, 0.0415 s; startup import 1.4823 s + `create_server` 0.1239 s (both unchanged) |
+| cold / warm-disk / warm-index call | **1947.8 ms / 763.8 ms / 674.7 ms** (builds 1/0/0, cache reads 0/1/0). The pre-fix warm order measured **1053.4 ms**; the sweep alone is **702.7 ms** |
+| key material without a build | 0.01 s (unchanged from §27) |
+
+The research is therefore a **preparation-phase act**: it runs once, deliberately,
+and its result is a file whose hash is part of the cache key. Nothing about it is
+on the warm path, and nothing on the warm path re-derives it.
+
+### 28.7 What remains unknown, and why
+
+- **29 of the 1,088 named gap instances were closed** (24 `weak` rows promoted to
+  `strong`, 4 controls gained a converting law, 1 control's law shape changed so
+  its range now exists) and the rest are open **for stated reasons**, not for lack
+  of looking: 590 units (the host prints none), 162 ranges (the host exposes only
+  the normalized 0..1 space; a semantic range needs the registry's sweep or
+  external authority), 291 enums whose boundaries remain arithmetic (the
+  registry's sweeps for them are uniform, so there is nothing to measure), 4
+  non-fitting laws, 12 `weak` rows (`env_N_delay`, `env_N_hold` - their registry
+  sweeps are 2-point). A further 646 of the profile's mappings are now
+  **independently confirmed**, which is a completeness *claim* the round could not
+  make before even though no count moved.
+- **Defaults are unknowable from this host** (measured: retval 0 for all 775).
+  They can only come from provider documentation or an external authority.
+- **100 declined confirmations are a space disagreement, not an error**: the
+  profile's registry states print in one space while the host formats the same
+  parameter in another (the P19 `-60` semitone family among them). 19 of them are
+  explained *exactly* by a constant offset, recorded as a candidate; applying one
+  would be a change to the profile's own mapping, which this round deliberately
+  did not perform.
+- **`random_1..4_frequency` need a law kind this model does not have** (a
+  ratio-fitted curve); recorded as candidates with their measured worst ratio.
+- **The 3 REAPER wrapper parameters** (`Bypass`/`Wet`/`Delta`) belong to REAPER,
+  not to the plugin, and are not in the provider's registry at all.
+
+### 28.8 GLM-5.3 Flash in three roles, and what I did with each finding
+
+| Role | Product | My independent verification | Outcome |
+|---|---|---|---|
+| **API research** | candidate read-only calls, their shapes, and the "defaults are not exposed" reading | re-ran each call live myself and compared the shapes argument-by-argument | **confirmed**; the four rows of 28.2 are my own measurements |
+| **Completeness research** | the gap taxonomy and which gaps a formatter channel could close | rebuilt the classification offline from the registry and re-derived the counts | **confirmed**; the 590-unit finding is reproduced (28.2) |
+| **Code review** | 8 questions over the finished diff: **6 SOUND**, **1 WEAK**, **1 DEFECT**, with offline reproductions | re-ran the reviewer's own probe scripts after the fixes | **both fixed** (below) |
+
+The review's two live findings were **not** taken on faith and **not** dismissed:
+
+1. **Q2 WEAK - the unit fill trusted the artifact's own claim.** It showed a
+   counterexample: samples `"dB"` with `unit_token: "Hz"` filled `unit = "Hz"`
+   with `evidence: "measured"` and a note asserting the opposite of the artifact's
+   text, which also changes the `%`-trap's downstream behaviour. **Fixed**: the
+   token and the `numeric` flag are now **re-derived from the samples** inside the
+   merge (`_unit_token_from_samples`), the claim is only accepted where it agrees,
+   and a disagreement is recorded as `claim_disagrees_with_samples` **and now
+   travels into the profile** (`calibration.units_declined`) instead of being
+   dropped.
+2. **Q6 DEFECT - two untyped crash paths and unvalidated input.** A non-numeric
+   `steps.step` raised a raw `ValueError`, and a crafted sample `"1e999999"`
+   overflowed `0.5 * 10.0 ** n` inside the merge - both escaping the module's
+   documented "every failure is a typed refusal" contract. **Fixed**: typed
+   `IncompatibleSettings` for non-numeric/non-finite/oversized step values,
+   a guarded precision reader that treats an impossible magnitude as *unreadable*
+   (so it can never become a huge tolerance), non-finite samples skipped rather
+   than compared as `inf`, and finite-number checking in the profile validator
+   (`_is_number` now rejects the `NaN`/`Infinity` tokens Python's `json` parses).
+   Grid validation (finite, 0..1, non-decreasing), sample/artifact/grid size
+   bounds, and a scalar-only projection of the artifact's proof/space blocks were
+   added in the same pass, so an oversized blob cannot become validating profile
+   content.
+
+Re-running the **reviewer's own** scripts against the fixed code (offline, no
+repo writes): `B: applied OK` (no untyped exception), `C1/C2: unit None` (no fill
+from a self-contradicting claim), `D: refused IncompatibleSettings`, `E:
+host_steps_valid` flagged by the validator, and the key-material probe unchanged
+(`fast rows == build sources: True`, refused artifact in the key: True).
+
+### 28.9 Tests actually run (this round)
+
+| Command | Result |
+|---|---|
+| `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live` | **539 passed** (497 after P21 + 24 P22 calibration tests + 18 hardening regressions) |
+| `py -3.11 tests/plugins/live/probe_p22_host_calibration.py` | exit 0, read-only proof `True True`; artifact 458,075 bytes; evidence `p22_host_calibration__20261011T212110Z__49536b6cfc9c.json` |
+| `py -3.11 tests/plugins/live/probe_p21_cache_timing.py` | exit 0; evidence `p21_cache_timing__20261011T212208Z__c7a3c8b9feb3.json` |
+| `py -3.11 tests/plugins/live/probe_p21_profile_completeness.py` | exit 0; evidence `p21_profile_completeness__20261011T212219Z__bdefa792184b.json` |
+| the reviewer's `p22_review_probe.py` / `p22_review_h.py` | re-run after the fixes; the four falsifications are closed (28.8) |
+
+New tests this round: `tests/plugins/test_p22_calibration.py` (42 tests:
+fixture-driven outcomes per control, the unit-fill rules, refusals, key material,
+the warm path, the read-only boundary, and the trust/robustness regressions of
+28.8), plus the fixture builder
+`tests/plugins/fixtures/build_vital_calibration_fixture.py` and the fixture
+`tests/plugins/fixtures/vital_calibration/vital_host_calibration.json`.
+
+### 28.10 Residual gaps (named)
+
+- **The 19 offset candidates are recorded, not applied**: applying one is a
+  mapping change with its own before/after duty, and the round's brief was
+  explicit that no unproven value be installed.
+- **`consistent_within_step` promotes nothing** (25 controls): it is a weaker
+  statement than the profile's own evidence, so acting on it would be a
+  downgrade dressed as confirmation.
+- **The artifact's `generated_utc` changes on every re-run**, so a re-capture
+  invalidates the cache entry even when the measurements are identical. That is
+  the honest behaviour for a source whose bytes are key material, but it means a
+  re-run costs a rebuild.
+- **`host_steps` is recorded verbatim** (attributed, not verified): the host's
+  step metadata is an instrument report this layer cannot independently
+  reproduce.
+- **A `law_candidate`'s `refused_by` string is not validated** (the validator
+  checks the ratio and the non-converting law); the review's nit stands, and it is
+  acceptable while nothing consumes a candidate.
+- **The 4 ratio-parametrized controls** and the 12 remaining `weak` rows (2-point
+  sweeps) need data this project does not have, not code this round did not write.
+- **No range has a unit-independent authority**: 162 controls keep no `range`
+  because neither the host nor the registry states one, and a range invented from
+  a display would be exactly the unproven value the brief forbids.
+
+### 28.11 Git state (recorded, not changed)
+
+- `HEAD` before and after the round: `64220df41a38b0cdbdb006154a9c1115eef75f94`
+  (branch `feature/vst-bridge`); the index was **empty** and stayed empty.
+- **No** `git add`, `git commit`, `git reset`, `git stash` or `git checkout` was
+  run. The user's untracked `composer_v1_2_lm_probe.md` was not read, changed,
+  moved or deleted.
+- The REAPER project was **not saved**; no plugin parameter was mutated - every
+  live call this round was a read (`FormatParamValueNormalized`,
+  `GetParameterStepSizes`, `GetParamEx`, `GetNamedConfigParm`), each capture
+  proving byte-identical watched values and state chunk before and after.
+

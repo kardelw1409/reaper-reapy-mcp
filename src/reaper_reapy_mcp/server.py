@@ -44,6 +44,17 @@ def create_server(debug: bool = True) -> FastMCP:
     # (AUD-013). It adds the 7 `plugin_*` tools and touches nothing else: with no
     # provider configured every plugin tool answers a typed `UnsupportedProvider`.
     setup_plugin_tools(mcp)
+    # Startup preload (09 §4; owner Decision 4): when a provider is configured,
+    # the prepared profiles in the cache directory are loaded, validated and held
+    # in memory - no host contact, no profile build, no writes, and no cost at all
+    # when no provider is configured. It is bounded (see plugins/preload.py) and a
+    # failure never stops the server.
+    try:
+        from reaper_reapy_mcp.plugins import preload as plugin_preload
+
+        plugin_preload.preload_from_env()
+    except Exception:  # noqa: BLE001 - a preload that cannot run must not stop the server
+        logging.getLogger(__name__).warning("plugin profile preload did not run", exc_info=True)
     # REAPER's own error boxes freeze EVERY call - a modal blocks all reapy
     # communication (measured; T-01 in the reference troubleshooting map). The
     # dialog guard answers the boxes this project knows (render errors, render

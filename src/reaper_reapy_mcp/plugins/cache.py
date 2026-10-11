@@ -54,6 +54,7 @@ __all__ = [
     "REQUIRED_FINGERPRINT_FIELDS",
     "FINGERPRINT_FIELDS",
     "ProfileBuild",
+    "KeyMaterial",
     "CacheRefusal",
     "CacheStatus",
     "CacheLoad",
@@ -70,6 +71,7 @@ __all__ = [
     "profile_counts",
     "identity_disagreements",
     "build_capability_profile",
+    "key_material_of",
 ]
 
 
@@ -295,6 +297,89 @@ def identity_disagreements(profile: Mapping[str, Any], identity: Mapping[str, An
 
 
 @dataclass
+class KeyMaterial:
+    """The cache-key determinants a provider can declare **without a build**.
+
+    This is what makes a warm cache hit cheap: the key is computable from the
+    provider's declared revision, the digest over its behaviour-affecting source
+    files and the digest over the data sources it would read - no profile is
+    projected, no registry is parsed. The build path remains the authority for
+    *content*, and `resolve_instance_profile` cross-checks that the built
+    profile's own provenance re-derives this material's key before anything is
+    filed under it (`cache.key_material` refusal otherwise).
+    """
+
+    provider_revision: str
+    provider_artifact_digest: str
+    source_digest: str
+    source_rows: list[dict[str, Any]] = field(default_factory=list)
+    artifact_rows: list[dict[str, Any]] = field(default_factory=list)
+    declared_by: str = "provider.profile_source_rows"
+
+    def key_for(self, provider_id: str, identity: Mapping[str, Any]) -> str:
+        return compute_cache_key(
+            provider_id=provider_id,
+            identity=identity,
+            provider_revision=self.provider_revision,
+            provider_artifact_digest=self.provider_artifact_digest,
+            source_digest=self.source_digest,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_revision": self.provider_revision,
+            "provider_artifact_digest": self.provider_artifact_digest,
+            "source_digest": self.source_digest,
+            "source_rows": [dict(row) for row in self.source_rows],
+            "artifact_rows": [dict(row) for row in self.artifact_rows],
+            "declared_by": self.declared_by,
+        }
+
+
+def key_material_of(provider: Any, identity: Mapping[str, Any]) -> "KeyMaterial | None":
+    """The key determinants without building the profile, when the provider can
+    declare its source rows (optional hook, 09 §3).
+
+    ``None`` means "this provider does not offer the hook": the caller then uses
+    the established build-then-load order, which is correct but pays a full
+    build even on a cache hit. A hook that raises a typed `PluginError` (an
+    unusable registry, for instance) propagates: the failure is the provider's
+    own refusal and must not be turned into a silent fallback.
+    """
+    hook = getattr(provider, "profile_source_rows", None)
+    if hook is None or not callable(hook):
+        return None
+    rows = hook(dict(identity))
+    if rows is None:
+        return None
+    source_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
+    artifact_digest, artifact_rows = digest_artifact_paths(list(provider.artifact_paths()))
+    return KeyMaterial(
+        provider_revision=str(getattr(provider, "implementation_revision", "") or ""),
+        provider_artifact_digest=artifact_digest,
+        source_digest=sources_digest(source_rows),
+        source_rows=source_rows,
+        artifact_rows=artifact_rows,
+    )
+
+
+def adopt_profile(provider: Any, profile: Mapping[str, Any]) -> bool:
+    """Hand the profile that will be served to the provider (optional hook).
+
+    The provider's rule evaluator is built against the profile it last produced
+    (`dependencies`), so a cache hit that skipped the build must
+    still adopt the served profile - otherwise a provider-side consumer that
+    reads its own state before `normalize_request` runs would silently evaluate
+    against an empty profile. Returns True when a hook was called.
+    """
+    hook = getattr(provider, "adopt_profile", None)
+    if hook is None or not callable(hook):
+        return False
+    hook(dict(profile))
+    return True
+
+
+@dataclass
 class ProfileBuild:
     """A provider-built profile wrapped with Core-computed provenance."""
 
@@ -305,6 +390,9 @@ class ProfileBuild:
     provider_artifact_digest: str
     source_digest: str
     artifact_rows: list[dict[str, Any]] = field(default_factory=list)
+    source_rows: list[dict[str, Any]] = field(default_factory=list)
+    #: True when the profile was served from the cache instead of built now.
+    from_cache: bool = False
 
     def key_for(self, provider_id: str, identity: Mapping[str, Any]) -> str:
         return compute_cache_key(
@@ -313,6 +401,31 @@ class ProfileBuild:
             provider_revision=self.provider_revision,
             provider_artifact_digest=self.provider_artifact_digest,
             source_digest=self.source_digest,
+        )
+
+    @classmethod
+    def from_cached_profile(
+        cls,
+        *,
+        profile: dict[str, Any],
+        validation: ProfileValidation,
+        material: "KeyMaterial",
+    ) -> "ProfileBuild":
+        """A build record for a profile the cache served, using live material.
+
+        The validation is the one the load path already ran over the entry, so a
+        cache hit does not re-validate the same bytes a second time.
+        """
+        return cls(
+            profile=profile,
+            validation=validation,
+            cacheable=(not validation.rebuild_required) and validation.cacheable,
+            provider_revision=material.provider_revision,
+            provider_artifact_digest=material.provider_artifact_digest,
+            source_digest=material.source_digest,
+            artifact_rows=[dict(row) for row in material.artifact_rows],
+            source_rows=[dict(row) for row in material.source_rows],
+            from_cache=True,
         )
 
 
@@ -358,6 +471,11 @@ def build_capability_profile(
         provider_artifact_digest=artifact_digest,
         source_digest=digest,
         artifact_rows=artifact_rows,
+        source_rows=[
+            {"file": str(row.get("file")), "sha256": row.get("sha256")}
+            for row in (provenance.get("sources") or [])
+            if isinstance(row, Mapping)
+        ],
     )
 
 
@@ -391,6 +509,14 @@ class CacheStatus:
     refusals: list[CacheRefusal] = field(default_factory=list)
     quarantined: list[str] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    #: True when the entry was answered from the process's startup preload index
+    #: (a validated in-memory copy) rather than read and re-validated from disk.
+    prepared: bool = False
+    #: True when the profile was built this call (the warm path must stay False;
+    #: this is the counter an "is the prepared profile reused" test asserts on).
+    built: bool = False
+    #: True when the cache was consulted without projecting a profile first.
+    key_without_build: bool = False
 
     def snapshot(self) -> "CacheStatus":
         """A copy of the status **at this moment**.
@@ -408,6 +534,9 @@ class CacheStatus:
             refusals=list(self.refusals),
             quarantined=list(self.quarantined),
             warnings=[dict(row) for row in self.warnings],
+            prepared=self.prepared,
+            built=self.built,
+            key_without_build=self.key_without_build,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -415,6 +544,9 @@ class CacheStatus:
             "key": self.key,
             "source": self.source,
             "path": self.path,
+            "prepared": self.prepared,
+            "built": self.built,
+            "key_without_build": self.key_without_build,
             "refusals": [refusal.as_row() for refusal in self.refusals],
             "quarantined": list(self.quarantined),
             "warnings": [dict(row) for row in self.warnings],
@@ -511,13 +643,54 @@ class ProfileCache:
         self._status.source = "none"
         self._record(CacheRefusal("identity", f"{reason}: {list(missing)}"))
 
+    def refuse_key_material(self, *, built_key: str, material_key: str, provider_id: str) -> None:
+        """The fast-path consistency refusal (never silently ignored).
+
+        A provider that declares its key material without a build must satisfy
+        one property: the profile it *would* build derives the same key. When it
+        does not, the provider's declaration and its provenance disagree - the
+        write is refused rather than filing a profile under a key its own
+        provenance does not re-derive (which the loader would quarantine later,
+        after the fact).
+        """
+        self._status.source = "built"
+        self._record(
+            CacheRefusal(
+                "key_material",
+                "the provider's declared key material does not re-derive the key its built "
+                f"profile carries (provider {provider_id!r}: declared {material_key[:24]}…, "
+                f"built {built_key[:24]}…); the profile is served but not cached",
+            )
+        )
+        self._status.warnings.append(
+            {
+                "rule": "cache.key_material",
+                "reason": "declared_material_disagrees_with_built_provenance",
+                "provider": provider_id,
+                "material_key": material_key,
+                "built_key": built_key,
+            }
+        )
+
     # -- load --------------------------------------------------------------
 
     def load(self, key: str, *, identity: Mapping[str, Any] | None = None) -> CacheLoad:
-        """Read the entry for ``key``; validate it completely before use."""
+        """Read the entry for ``key``; validate it completely before use.
+
+        A prepared entry from the process's startup preload index answers first
+        (its identity-independent checks already ran at startup); anything the
+        prepared copy cannot prove - a file that moved since startup, an identity
+        disagreement - falls through to the full disk path, which reports and
+        quarantines exactly as before.
+        """
         target = self.path_for(key)
         self._status.key = key
         self._status.path = str(target)
+        prepared = self._prepared_entry(key, identity=identity)
+        if prepared is not None:
+            self._status.source = "cache"
+            self._status.prepared = True
+            return prepared
         if not target.exists():
             return CacheLoad(status="miss", path=str(target))
 
@@ -527,6 +700,32 @@ class ProfileCache:
             return outcome
         self._status.source = "rebuilt" if self._status.refusals else self._status.source
         return outcome
+
+    def _prepared_entry(self, key: str, *, identity: Mapping[str, Any] | None) -> CacheLoad | None:
+        """The in-memory answer, when the preload index still describes the file.
+
+        Two things are re-checked here because they depend on facts the preload
+        could not know: the file itself must be the one that was prepared (size
+        and mtime), and - when a live identity is supplied - the cached profile's
+        identity must agree with the instance in front of us. The re-derivation
+        of the key from the entry's own provenance also ran at preload time (it
+        needs no live facts) and is what makes a prepared entry addressable here.
+        """
+        from . import preload as _preload  # noqa: PLC0415 - lazy: keeps imports acyclic
+
+        entry = _preload.prepared_lookup(self.directory, key)
+        if entry is None:
+            return None
+        if not entry.file_unchanged():
+            return None
+        if identity is not None and identity_disagreements(entry.profile, identity):
+            return None
+        return CacheLoad(
+            status="hit",
+            path=entry.path,
+            profile=entry.profile,
+            validation=entry.validation,
+        )
 
     def _read_entry(
         self, target: Path, key: str, identity: Mapping[str, Any] | None

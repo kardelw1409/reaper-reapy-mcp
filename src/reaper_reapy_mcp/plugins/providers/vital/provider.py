@@ -22,11 +22,21 @@ Two honest boundaries are stated here rather than discovered later:
 
 from __future__ import annotations
 
+import hashlib
+import os
+from pathlib import Path
 from typing import Any, Mapping
 
 from ...binding import declared_names as _declared_names
 from ...binding import normalise_name as _normalise
-from ...errors import InvalidRoute, InvalidValue, NoConversion, UnsupportedControl, VersionMismatch
+from ...errors import (
+    InvalidRoute,
+    InvalidValue,
+    NoConversion,
+    PluginError,
+    UnsupportedControl,
+    VersionMismatch,
+)
 from ...model import (
     CaptureScope,
     Finding,
@@ -37,6 +47,7 @@ from ...model import (
     VerificationPolicy,
 )
 from ...provider import DependencyRuleSet
+from . import calibration as calibration_module
 from . import codec as codec_module
 from . import dependencies_rules as rules_module
 from . import depth as depth_module
@@ -51,6 +62,7 @@ from .profile_build import (
     VitalRegistry,
     build_profile,
     load_registry,
+    registry_source_rows,
 )
 
 __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
@@ -71,7 +83,18 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: carries - so route creation is available and only a decided violation (a pair
 #: into an OFF Filter 1/Filter 2) refuses. Undecidable subjects still refuse with
 #: the missing input named.
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r6"
+#: r7 (2026-10-11): the provider declares its cache-key material without a build
+#: (`profile_source_rows` hashes the registry instead of parsing it) and adopts
+#: the profile the cache served (`adopt_profile`) - a warm call no longer projects
+#: the profile it will discard. Both are additive to the observable profile
+#: content; the revision moves because the key must move with the semantics
+#: (07 §3.4) unless the release argues it should not.
+#: r8 (2026-10-11): the **host-calibration artifact** (a preparation-run file whose
+#: bytes are a declared source, so its hash is key material): descending laws
+#: derived from a measured sweep, units filled from the host's own formatted text,
+#: per-state law confirmations, host step/toggle metadata, and `law_candidate`
+#: records for sweeps a law nearly fits. The profile schema moves to 2 with it.
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r8"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -79,6 +102,7 @@ _PROVIDER_FILES = (
     "profile_build.py",
     "dependencies_rules.py",
     "depth.py",
+    "calibration.py",
     "__init__.py",
 )
 
@@ -96,10 +120,12 @@ class VitalProvider:
         *,
         registry: VitalRegistry | None = None,
         registry_dir: str | None = None,
+        calibration_path: str | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self._registry = registry
         self._registry_dir = registry_dir
+        self._calibration_path = calibration_path
         self._env = env
         self._last_profile: dict[str, Any] | None = None
         self._timing = TimingProfile(settle_s=0.4, retry_after_s=2.0, retry_count=1, timeout_s=20.0)
@@ -118,6 +144,102 @@ class VitalProvider:
 
         here = Path(__file__).parent
         return [str(here / name) for name in _PROVIDER_FILES]
+
+    def profile_source_rows(self, identity: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+        """The registry provenance rows for the cache key, **without a build**.
+
+        This is the hook that makes a warm cache hit cheap: the key's
+        `source_digest` needs the digest of every data file the profile derives
+        from, and hashing five files costs a fraction of the ~6.5 MB parse the
+        profile projection performs. The rows are the same ones `build_profile`
+        declares - if the loaded registry is already in hand its own rows are
+        returned verbatim, and otherwise the files are resolved and hashed by the
+        same rules (`profile_build.registry_source_rows`).
+
+        The host-calibration artifact, when one exists at the resolved path, is a
+        declared source too: its bytes decide which units/confirmations the
+        profile carries, so a changed artifact must move the key (and a created or
+        removed one must invalidate the entry).
+
+        A registry that is unusable raises the same typed `IncompatibleSettings`
+        the build would raise: the fast path never invents key material.
+
+        **Freshness equals the instance's lifetime**: a provider that has already
+        loaded its registry reports the hashes taken at load. The tool layer
+        constructs a provider per call (`api._providers`), so in production the
+        hashes are re-taken every call - memoizing provider instances would
+        freeze `source_digest` and must come with its own invalidation.
+        """
+        if self._registry is not None:
+            rows = [
+                {"file": row.get("file"), "sha256": row.get("sha256")}
+                for row in self._registry.sources
+                if isinstance(row, Mapping)
+            ]
+        else:
+            rows = registry_source_rows(directory=self._registry_dir, env=self._env)
+        calibration_row = self._calibration_source_row()
+        if calibration_row is not None:
+            rows.append(calibration_row)
+        return rows
+
+    def calibration_artifact_path(self) -> str | None:
+        """The resolved calibration path (explicit > env > user-local default).
+
+        Resolution never expands ``~``/env characters and an empty override is a
+        configuration error (the registry's own rules, 08 §6.1).
+        """
+        return calibration_module.resolve_calibration_path(self._calibration_path, self._env)
+
+    def calibration_configured(self) -> bool:
+        """Whether a calibration was *asked for* (explicit argument or override).
+
+        The difference matters for honesty: a default location that holds no file
+        is a normal state (no preparation run yet) and is reported as *absent*; a
+        path that was configured and cannot be read is a **refusal** the caller
+        must see.
+        """
+        if self._calibration_path is not None:
+            return True
+        environ = os.environ if self._env is None else self._env
+        return environ.get(calibration_module.CALIBRATION_ENV) is not None
+
+    def _calibration_source_row(self) -> dict[str, Any] | None:
+        """The calibration file's hash, or ``None`` when no usable file exists.
+
+        Read-only and parse-free (the fast path hashes, it does not decode). An
+        *unreadable* file yields no row: a source row without a hash would make
+        every profile non-cacheable, and an unreadable artifact contributes
+        nothing to the profile anyway - it is reported instead (see
+        `build_profile`).
+        """
+        path = self.calibration_artifact_path()
+        if not path:
+            return None
+        candidate = Path(path)
+        try:
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        # hashed in chunks: the key must include the artifact's bytes even when a
+        # malformed artifact is huge, and the fast path must not read it into memory
+        # to do so (the loader, which does decode, has its own size bound)
+        return {"file": candidate.name, "sha256": digest.hexdigest()}
+
+    def adopt_profile(self, profile: Mapping[str, Any]) -> None:
+        """Adopt the profile Core will serve, so provider-side consumers agree.
+
+        The dependency-rule evaluator and the structural DISABLE set are built
+        against "the last profile this provider produced" (`dependencies`,
+        `disable_targets`). On a cache hit nothing is produced, so Core hands the
+        served profile over explicitly - otherwise a consumer reached before
+        `normalize_request` would silently evaluate against an empty profile.
+        """
+        if isinstance(profile, Mapping) and profile:
+            self._last_profile = dict(profile)
 
     # -- identity -----------------------------------------------------------
 
@@ -179,7 +301,42 @@ class VitalProvider:
     # -- profile ------------------------------------------------------------
 
     def build_profile(self, identity: dict[str, Any]) -> dict[str, Any]:
-        profile = build_profile(self.registry(), identity)
+        """The registry projection plus whatever the calibration artifact justifies.
+
+        The artifact is loaded, identity-checked and applied here; a file that
+        exists but cannot be used (unparsable, wrong method version, measured on
+        another build) is **not** applied and the profile carries the reason while
+        its hash still travels in `provenance.sources` - a changed artifact must
+        invalidate the cache entry even when it is refused.
+        """
+        row = self._calibration_source_row()
+        calibration = None
+        note: str | None = None
+        path = self.calibration_artifact_path()
+        if path:
+            if row is None:
+                if self.calibration_configured():
+                    note = "the configured calibration artifact is not readable; nothing was applied"
+            else:
+                try:
+                    loaded = calibration_module.load_calibration(path)
+                except PluginError as exc:
+                    note = f"{exc.code}: {exc.message}"
+                else:
+                    if loaded.matches_identity(identity):
+                        calibration = loaded
+                    else:
+                        note = (
+                            "the artifact was measured on a different build than this "
+                            "identity; nothing was applied"
+                        )
+        profile = build_profile(
+            self.registry(),
+            identity,
+            calibration=calibration,
+            calibration_row=row,
+            calibration_note=note,
+        )
         self._last_profile = profile
         return profile
 

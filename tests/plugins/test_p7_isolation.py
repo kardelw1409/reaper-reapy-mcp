@@ -91,7 +91,7 @@ def test_constructing_the_provider_still_reads_no_registry_until_first_use():
         "print(json.dumps({'n_structs': len(paths), 'json_reads': json_reads}))\n"
     )
     payload = _run(script)
-    assert payload["n_structs"] == 6
+    assert payload["n_structs"] == 7
     assert payload["json_reads"] == [], (
         "constructing the provider must not read the registry (08 §6.4)"
     )

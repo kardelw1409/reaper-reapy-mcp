@@ -288,7 +288,7 @@ def flat_paths(value: Any, prefix: str = "") -> dict[str, Any]:
 def demo_profile() -> dict[str, Any]:
     """A schema-valid profile for the mock provider (07 §1 shape)."""
     return {
-        "profile_schema_version": 1,
+        "profile_schema_version": 2,
         "provider": DEMO_PROVIDER,
         "identity": {
             "plugin_id": DEMO_PROVIDER,

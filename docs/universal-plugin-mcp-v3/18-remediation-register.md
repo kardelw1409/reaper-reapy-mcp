@@ -289,3 +289,67 @@ corpus' own published version of the recipe.
 | h3 is 3 dB strong in the final fit (−16.5 vs −19.6) | **accepted**: it is the largest single deviation of a ≤1.5 dB fit; the neighbours (drive, mix) trade h5/h7 for it | §26.7 |
 | loudness: the reference is a normalised sample (0 dBFS, −7.1 RMS) | **stated, not matched**: the patch is left at −3 dB (peak −7.8 dBFS); the A/B copies in the evidence are loudness-aligned instead | `p20_ab_final_*` |
 | `fm_needs_modulator` on the parameter channel; `power` dropped by `plugin_modulation update`; probe-B2 `WriteNotApplied` | **still open, unchanged by this round** | §25.5, §26.7 |
+
+## Addendum 8 — P21: capability cache, warm path, preload, startup (2026-10-11)
+
+Full record in `IMPLEMENTATION-STATUS.md` §27. The round asked whether plugin
+knowledge is *prepared, cached, loaded at startup and reused* - or re-researched
+on every request. Four defects were found by reading the code and measured:
+
+1. **the warm path projected the whole profile before consulting the cache**
+   (and threw it away on a hit): 583-630 ms of pure compute per warm call on the
+   real registry. The P4 hot-path test could not see it - it counted *host
+   parameter reads*, and a build performs none;
+2. **nothing was loaded at startup** - the first call after every server start
+   paid the full cold path even with a prepared profile on disk;
+3. **a provider object was built per call**, so the 6.6 MB registry was re-read,
+   re-parsed and re-hashed every time (124-176 ms);
+4. **the instance sweep read every slot of every track** although the caller's
+   selector named the instance (measured 1536 ms for 4 slots).
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| warm call rebuilds the profile it discards | **fixed**: the provider declares its key material without a build (`profile_source_rows`, hash-only registry rows, measured 8.6 ms against 155 ms); a miss cross-checks that the built provenance re-derives the declared key, else `cache.key_material` refuses the write | `resolve.py`, `cache.py::key_material_of`, `providers/vital/provider.py`; `test_p21_warm_path_and_preload.py` (16 tests) |
+| nothing loaded at startup | **fixed**: `plugins/preload.py` validates every identity-independent property of the cache entries once at `create_server`, holds them in memory, never writes/quarantines/deletes, never raises; a moved file or disagreeing identity falls through to the full disk path | `preload.py`, `server.py`; evidence `p21_cache_timing__20261011T185938Z__e2e67032fa1e.json`; 10 preload tests |
+| the preload scan was unbounded on a large cache | **fixed after the independent review**: superseded entries dismissed by a text prefilter (no parse), per-provider cap of 8 newest, extra files reported as `preload.capped` and never deleted | `preload.py::PRELOAD_ENTRY_CAP_PER_PROVIDER/_newest_first`; `test_the_preload_holds_at_most_the_cap_and_reports_the_rest` |
+| the sweep read every slot | **fixed**: a selector naming `track_index` reads only that track, naming `fx_index` only that slot; measured 1536 ms -> 687 ms | `resolve.py::iter_instances`; `test_a_location_selector_reads_only_the_addressed_tracks_slots` |
+| the served profile was not handed to the provider | **fixed**: `adopt_profile` hook, called on every serve path (rules/targets read the provider's own state) | `cache.py::adopt_profile`, `resolve.py`, `providers/vital/provider.py` |
+| 2858 host parameters vs 775 mapped controls | **explained, every parameter classified**: `2858 = 775 mapped + 2080 MIDI-CC slots + 3 REAPER wrapper params + 0 unclassified`; the MIDI-CC block and the wrapper names were **read live** (`MIDI CC N\|M`, `Bypass`/`Wet`/`Delta`) | `tests/plugins/live/probe_p21_profile_completeness.py`; evidence `p21_profile_completeness__20261011T185928Z__2f5f2fea60b5.json`; pinned by `test_p21_profile_completeness.py` |
+| profile incompleteness had no honest inventory | **reported**: 6 controls with no law, 2 unmeasured, 163 without a range, 590 without a unit, 36 weak-evidence (the `env_*_power`/`env_*_delay` families), 51 of 342 enums carrying measured (non-uniform) band positions | the completeness artifact; §27.4 |
+| `registry_source_rows` was claimed "pinned by a test" with no such test | **fixed** (found by the independent review): the hash-only rows, `load_registry`'s rows and the built provenance are now pinned equal - on the fixture registry and on the measured one | `test_registry_source_rows_equal_the_rows_load_registry_records`, `test_registry_source_rows_equal_on_the_measured_registry_too` |
+| stale entries accumulate without policy | **reported, not deleted**: the preload names every superseded entry (`preload.superseded`) and the bytes it occupies; deletion stays manual (09 §4 policy) | evidence `p21_cache_timing__*` `real_cache_preload` (12-13 entries, 0 parses) |
+| the instance sweep is now the whole warm call (687 ms), its RPCs unheld | **open, named**: wrapping `list_tracks`/`fx_facts` in reapy's held context is a transport change with its own measurement duty | §27.10 |
+| `plugin_write`'s bridge-verb count (23; `fx_facts` x8; `param_idents` x6 with 5 full-table reads) | **quoted from the independent study, not re-measured** | §27.8, §27.10 |
+
+## Addendum 9 — P22: automatic capability discovery from a read-only host channel (2026-10-11)
+
+Full record in `IMPLEMENTATION-STATUS.md` §28. The round asked how much of the
+profile's **incompleteness** can be closed automatically at *preparation* time,
+without installing an unproven value and without paying for research on every MCP
+start. The channel is one read-only host call,
+`TrackFX_FormatParamValueNormalized` - it *formats* a normalized value the caller
+passes, so it cannot move a parameter - plus `TrackFX_GetParameterStepSizes`.
+Everything the round learned about the host was measured live and is recorded in
+§28.2, including two **measured absences**: `TrackFX_GetParamEx` reports the
+uniform 0..1 space for all 775 controls (no semantic range), and
+`TrackFX_GetNamedConfigParm 'param.N.default_value'` answers 0 for all 775 (no
+defaults).
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| 8 controls whose sweeps fitted no law | **4 closed**: `direction: descending` is now first-class in the value model (spine = `1 - normalized`, range stays numeric extremes) for `affine`/`power`/`exponential` - `delay_frequency`, `phaser_frequency`, `delay_aux_frequency`; `delay_aux_tempo` was a **label wearing a number** (`"4/1"`, `"1/2"`) and is now an enum | `values.py::direction/to_normalized/normalized_to_native`; `profile_build.derive_measured_law` |
+| the fit's acceptance bound was a global constant, so a five-decade display was refused although every state sat on the curve | **fixed**: the bound is `max(per-state printed precision, half the smallest measured step)`. Verified **strictly additive** - 3 new laws, no previously accepted law changed | `profile_build._display_precision/_measurement_entries`; `test_p16_measured_laws.py` |
+| 36 `weak` rows | **24 promoted to `strong`** by an *independent instrument* (the host formatter) agreeing at every grid point inside each state's printed precision (622 already-strong rows also confirmed; 24 confirmed rows had `strength_before: weak`, recorded per control) | evidence `p22_host_calibration__20261011T212110Z__49536b6cfc9c.json`; §28.4 |
+| enums whose boundaries were arithmetic (291 of 342) | **count unchanged, correctness changed**: every measured map now carries `switch_points` (band *starts*, so an exact boundary reads the member that starts there) and the arithmetic path rounds **half-up** - measured against the host: normalized 0.5 formats `"On"`, 0.25 on an 11-member enum formats `"8/1"`. Half-to-even read both as the wrong member | `profile_build._band_geometry`; `values.py::normalized_to_native`; `test_a_value_exactly_on_an_enum_boundary_reads_the_member_that_starts_there` |
+| 590 controls with no unit | **0 filled, and that is the finding**: the host prints no unit for them; every control (185) whose text carries a stable unit token already declared it. `units_filled: 0` with the absence recorded, never invented | §28.2, §28.4 |
+| 163 controls with no range | **162** - and the gain came from the value model (`delay_aux_tempo`), not from the artifact: a range the host does not state is not guessed | §28.1 |
+| near-fits had no honest container | **candidates**: 4 `law_candidate` rows (`random_1..4_frequency`, worst ratio 11.2) and 19 `display_offset_candidate` rows (among them the P19 `-60` semitone family). A candidate has **zero consumers**; validation requires a candidate's worst ratio > 1 **and** a law that cannot convert | `profile_build.derive_law_candidate`; `profile.py` rows 6c |
+| the artifact itself (does a new "prepared data" file create a new trust problem?) | **bounded by construction**: the merge takes **no bridge**, imports no host module (pinned by a test), and can only *annotate*. The artifact's bytes are a **declared source**, so its hash is cache-key material - a changed, removed **or refused** artifact all move the key | `providers/vital/calibration.py`; `test_p22_calibration.py` key-material tests |
+| does the MCP start pay for the research? | **no**: `create_server` runs only the preload - 13 files, **13 skipped, 0 parses, 0.0415 s**; startup 1.4823 s + 0.1239 s unchanged. Cold/warm/warm-index call: 1947.8 / 763.8 / 674.7 ms | evidence `p21_cache_timing__20261011T212208Z__c7a3c8b9feb3.json` |
+| **review finding (WEAK): the unit fill trusted the artifact's own `unit_token`** - samples `"dB"` with `unit_token: "Hz"` filled `unit = "Hz"` with a "measured" provenance note | **fixed**: the token and the `numeric` flag are re-derived **from the samples** inside the merge; a disagreement fills nothing and is recorded as `claim_disagrees_with_samples` - and now **travels into the profile** (`calibration.units_declined`), where before it was dropped | `calibration.py::_unit_token_from_samples`; `test_a_unit_claim_that_contradicts_its_own_samples_is_declined`, `test_a_numeric_claim_over_label_samples_fills_nothing` |
+| **review finding (DEFECT): two untyped crash paths** - non-numeric `steps.step` raised a raw `ValueError`; a crafted sample `"1e999999"` overflowed `0.5*10.0**n` inside the merge | **fixed**: typed `IncompatibleSettings` for non-numeric/non-finite/oversized step values and grid points outside 0..1 or out of order; a guarded precision reader treats an impossible magnitude as *unreadable* (never a huge tolerance); non-finite samples are skipped instead of compared as `inf`; the validator now rejects the `NaN`/`Infinity` tokens `json` parses. Sample/artifact/grid size bounds and a scalar-only projection of the artifact's proof blocks were added in the same pass | `calibration.py::load_calibration/display_precision/_confirmation_record`; `profile.py::_is_number`; `profile_build._scalar_subset/_MAX_DECIMAL_EXPONENT`; 6 regression tests |
+| re-verification of those fixes | the **reviewer's own** probe scripts were re-run against the fixed code (offline): `B: applied OK`, `C1/C2: unit None`, `D: refused IncompatibleSettings`, `E: host_steps_valid` flagged; key-material probe unchanged (`fast rows == build sources: True`) | §28.8 |
+| 1,059 of the 1,088 named gap instances (29 closed: 24 promotions, 4 new laws, 1 law-shape change) | **open, with reasons** (§28.7): 590 units and 162 ranges the host does not state, 291 arithmetic enum maps whose registry sweeps are uniform, 4 ratio-parametrized controls needing a law kind this model lacks, 12 two-point `weak` sweeps | §28.7, §28.10 |
+| applying the 19 offset candidates | **deliberately not done**: an offset applied to the profile's own mapping is a mapping change with its own before/after duty, and the round's brief forbade installing unproven values | §28.7, §28.10 |
+| the artifact's `generated_utc` moves on every re-run, so a re-capture invalidates the cache entry even when the measurements are identical | **accepted**: a source whose bytes are key material cannot be exempted from moving the key | §28.10 |
+| `host_steps` recorded verbatim; a `law_candidate`'s `refused_by` string unvalidated | **accepted, named**: the host's step metadata is an instrument report this layer cannot independently reproduce; nothing consumes a candidate | §28.10 |

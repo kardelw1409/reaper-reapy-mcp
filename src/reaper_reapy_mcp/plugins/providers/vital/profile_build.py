@@ -24,6 +24,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -43,8 +44,10 @@ __all__ = [
     "VITAL_MODULE",
     "VitalRegistry",
     "resolve_registry_dir",
+    "registry_source_rows",
     "load_registry",
     "derive_measured_law",
+    "derive_law_candidate",
     "build_profile",
 ]
 
@@ -192,6 +195,62 @@ def _check_shape(logical: str, data: Any, *, variable: str | None, directory: st
             bad("modulation_vocabulary.json has no 'sources'/'destinations' objects")
 
 
+def registry_source_rows(
+    *, directory: str | None = None, env: Mapping[str, str] | None = None
+) -> list[dict[str, Any]]:
+    """The registry's provenance rows **without parsing the data** (09 §3).
+
+    Same resolution order, same refusals and the same ``{"file", "sha256"}`` rows
+    `load_registry` records - but the files are read only to be hashed, so a
+    caller that needs the `source_digest` (a cache-key determinant) does not pay
+    the ~6.5 MB JSON parse that a profile build performs. A warm cache hit runs
+    this instead of `load_registry`.
+
+    `load_registry` stays the authority for the registry *data*. That this
+    function's rows equal the rows `load_registry` records is pinned by a test
+    against the fixture registry, and a drift is caught at runtime in
+    `resolve.resolve_instance_profile`: the profile a build produces must
+    re-derive the very key this declaration produced, or the cache write is
+    refused with `cache.key_material` named.
+    """
+    variable = None if directory is not None else REGISTRY_DIR_ENV
+    if directory is None:
+        environ = os.environ if env is None else env
+        variable = REGISTRY_DIR_ENV if environ.get(REGISTRY_DIR_ENV) is not None else None
+        resolved = resolve_registry_dir(env)
+    else:
+        resolved = os.path.normpath(os.path.abspath(str(directory)))
+    folder = Path(resolved)
+    if not folder.exists():
+        raise _fail(
+            "the directory does not exist" if variable else "the default directory does not exist",
+            variable=variable,
+            path=resolved,
+        )
+    if not folder.is_dir():
+        raise _fail("the path is not a directory", variable=variable, path=resolved)
+
+    rows: list[dict[str, Any]] = []
+    for name in REGISTRY_FILES.values():
+        path = folder / name
+        if not path.exists():
+            raise _fail(
+                f"the expected registry file {name} is missing",
+                variable=variable,
+                path=resolved,
+                extra={"file": str(path)},
+            )
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise _fail(
+                f"{name} cannot be read: {exc}", variable=variable, path=resolved,
+                extra={"file": str(path)},
+            ) from exc
+        rows.append({"file": name, "sha256": hashlib.sha256(data).hexdigest()})
+    return rows
+
+
 def load_registry(*, directory: str | None = None, env: Mapping[str, str] | None = None) -> VitalRegistry:
     """Resolve, validate and read the registry (08 §6.1-§6.2).
 
@@ -280,25 +339,135 @@ _MAX_DERIVED_ENUM_MEMBERS = 40
 #: stores 0.0117188 for 3/256 and the uniform arithmetic asks for 0.01171875.
 _SWEEP_NORMALIZED_TOLERANCE = 1e-5
 
+#: What may follow a number in a *faithful* numeric display: one unit-like token
+#: (letters, or the micro/degree/percent/hash signs) and nothing else. ``"/2"``,
+#: ``"x Octave"`` and ``" of 16"`` are labels wearing a number, not a numeric
+#: scale.
+_UNIT_TOKEN_RE = re.compile(r"[A-Za-z\u00b5\u00b0#%]+")
+
+#: The number at the start of a display, split so its **own printed precision**
+#: can be read off the text (``122.573`` carries +/-0.0005, ``128`` +/-0.5).
+_NUMBER_TEXT_RE = re.compile(
+    r"^(?P<sign>[+-]?)(?:(?P<int>\d+)(?:\.(?P<frac>\d*))?|\.(?P<frac_only>\d+))(?P<exp>[eE][+-]?\d+)?"
+)
+
+#: A printed magnitude beyond this cannot be a measurement of a plugin parameter.
+_MAX_DECIMAL_EXPONENT = 30
+
+
+def _scalar_subset(block: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    """The named fields of ``block``, keeping only JSON scalars.
+
+    The calibration artifact is a *source*, and a source is data, not a licence to
+    paste an arbitrarily large object into the profile: a 500 MB ``read_only_proof``
+    would otherwise become 500 MB of validating cache content. Only the fields the
+    profile's own consumers read are carried over, and each must be a scalar.
+    """
+    if not isinstance(block, dict):
+        return {}
+    subset: dict[str, Any] = {}
+    for name in names:
+        value = block.get(name)
+        if isinstance(value, bool) or isinstance(value, (int, float, str)):
+            subset[name] = value
+    return subset
+
+
+def _display_precision(display: Any, remainder: str) -> float | None:
+    """Half the reading resolution of the display's *own text*, in its units.
+
+    The sweep records what the plugin printed, and a printed number is exact only
+    to the digits it shows: ``"122.573 secs"`` is +/-0.0005, ``"0.0024255
+    secs"`` is +/-5e-8. An acceptance bound of *half the display's smallest
+    step* is the right instrument model for a narrow range, but it is provably
+    wrong for a display spanning five decades: measured 2026-10-11,
+    ``random_N_frequency`` (128 s -> 0.0019 s, ratio 2**16) was refused although
+    every one of its 257 states sits on the exponential to within the printed
+    digits - the residual was the *text's* rounding at magnitude 128 (5e-4), not
+    a shape error.
+    """
+    text = str(display).strip()
+    number_text = text[: len(text) - len(remainder)].strip() if remainder else text
+    match = _NUMBER_TEXT_RE.match(number_text)
+    if match is None:
+        return None
+    decimals = len(match.group("frac") or match.group("frac_only") or "")
+    exponent = int(match.group("exp")[1:]) if match.group("exp") else 0
+    if abs(exponent - decimals) > _MAX_DECIMAL_EXPONENT:
+        # a magnitude no display prints: unreadable, and not a huge tolerance
+        # (the power below would overflow on a hostile "1e999999")
+        return None
+    return 0.5 * 10.0 ** (exponent - decimals)
+
+
+def _measurement_entries(
+    states: list[tuple[float, str]],
+) -> list[tuple[float, float, float]] | None:
+    """``(normalized, numeric display, printed precision)`` - or ``None``.
+
+    The faithfulness rule of `_measured_pairs` plus the display's own reading
+    precision, which the fit's acceptance bound uses **per state**.
+    """
+    entries: list[tuple[float, float, float]] = []
+    for norm, display in states:
+        number = depth_module.display_number(display)
+        if number is None:
+            return None
+        remainder = depth_module.display_unit(display)
+        if remainder and not _UNIT_TOKEN_RE.fullmatch(remainder):
+            return None
+        precision = _display_precision(display, remainder)
+        if precision is None:
+            return None
+        entries.append((float(norm), float(number), float(precision)))
+    return entries
+
+
+def _worst_fit_ratio(
+    predict: Any,
+    oriented: list[tuple[float, float, float]],
+    floor: float,
+) -> tuple[float, float]:
+    """``(worst absolute residual, worst residual / that state's own bound)``.
+
+    Each state is judged against **its own** reading resolution (never below the
+    half-step floor, so every row that was accepted before stays accepted), and
+    the ratio is what the profile records: it says how close to the instrument's
+    limit the fit is, which an absolute residual cannot express across decades.
+    """
+    worst_abs = 0.0
+    worst_ratio = 0.0
+    for norm, value, precision in oriented:
+        residual = abs(value - predict(norm))
+        bound = max(precision, floor, 1e-15)
+        worst_abs = max(worst_abs, residual)
+        worst_ratio = max(worst_ratio, residual / bound)
+    return worst_abs, worst_ratio
+
 
 def _measured_pairs(states: list[tuple[float, str]]) -> list[tuple[float, float]] | None:
     """Every measured state as ``(normalized, numeric display)`` - or ``None``.
 
-    ``None`` means **at least one display is not a number**, which is the signal
-    that decides between the enum and the numeric path. It is deliberately
+    ``None`` means **at least one display is not a faithful number**, which is the
+    signal that decides between the enum and the numeric path. It is deliberately
     all-or-nothing: the POC's leading-number parser reads ``"2x Octave"`` as
     ``2.0``, so a per-state filter would let a labelled control such as
     `Oscillator 1 Stack Style` (13 labels, 2 of which start with a digit) into the
     numeric path, where a free exponent fit would then be meaningless (the
     independent audit of 2026-10-11 measured exactly that leak).
+
+    A number is *faithful* only when what follows it is empty or a single
+    unit-like token. Measured 2026-10-11: the tempo-division labels ``"4/1",
+    "1/2", "1/64"`` parse to ``4.0, 1.0, 1.0`` through the leading-number rule -
+    three distinct values for nine states, each label *claiming* to be the number
+    it starts with. That is not a numeric scale, so the row takes the label
+    (enum) path instead of a meaningless fit; a space-separated suffix such as
+    ``"2x Octave"`` is refused for the same reason.
     """
-    pairs: list[tuple[float, float]] = []
-    for norm, display in states:
-        number = depth_module.display_number(display)
-        if number is None:
-            return None
-        pairs.append((float(norm), float(number)))
-    return pairs
+    entries = _measurement_entries(states)
+    if entries is None:
+        return None
+    return [(norm, value) for norm, value, _precision in entries]
 
 
 def _measurement_quantum(values: list[float]) -> float:
@@ -359,8 +528,10 @@ def _band_spans(states: list[tuple[float, str]]) -> list[tuple[str, float, float
     return spans
 
 
-def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list[float] | None:
-    """One measured normalized position per member: the middle of its own band.
+def _band_geometry(
+    states: list[tuple[float, str]], members: list[str]
+) -> dict[str, list[float]] | None:
+    """One measured band per member: its interior midpoint **and** its start.
 
     The enum conversion in Core assumes uniformly spaced members. For
     ``Oscillator N Distortion Type`` that assumption is false and measurably so:
@@ -369,8 +540,11 @@ def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list
     (``index / (n - 1)``) lands 5 of the 11 members in the *neighbouring* band
     (audit of 2026-10-11, measured).
 
-    The position must be **interior** to the band, not at its switch point
-    (``_band_spans`` explains why the last band is mirrored).
+    Two numbers per member, because the read path and the write path need
+    different ones: the **midpoint** is interior to the band, so a write lands
+    inside it; the **start** is the switch point, where the host labels a value
+    exactly on a boundary as the member that *begins* there (P19, measured), so
+    the read inversion must use it.
     """
     spans = _band_spans(states)
     if spans is None:
@@ -385,7 +559,10 @@ def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list
     positions = {label: round((start + end) / 2.0, 6) for label, start, end in spans}
     if set(positions) != set(members):
         return None
-    return [positions[member] for member in members]
+    return {
+        "positions": [positions[member] for member in members],
+        "switch_points": [round(start, 9) for _label, start, _end in spans],
+    }
 
 
 def _declared_enum_positions(
@@ -508,9 +685,11 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
         members = _members_in_norm_order(states)
         if members is None or not (2 <= len(members) <= _MAX_DERIVED_ENUM_MEMBERS):
             return None
-        positions = _band_positions(states, members)
-        if positions is None:
+        geometry = _band_geometry(states, members)
+        if geometry is None:
             return None
+        positions = geometry["positions"]
+        switch_points = geometry["switch_points"]
         return {
             "kind": "enum_index",
             "type": "enum",
@@ -519,6 +698,14 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
             "range": None,
             "params": {
                 "positions": positions,
+                # The members' own band *starts*, for the read inversion: the host
+                # labels a value exactly at a switch point as the member that
+                # begins there (P19, measured), and a derived enum previously
+                # carried midpoints only - so a value sitting on a boundary read as
+                # the member below it. Measured 2026-10-11 through the host-display
+                # channel: `chorus_tempo` at normalized 0.25 formats as "8/1" while
+                # the nearest-midpoint inversion read "16/1".
+                "switch_points": switch_points,
                 "positions_source": "measured band midpoints of vital_scales_full.json",
                 "n_states": len(states),
             },
@@ -529,24 +716,47 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
     if len(states) < _MIN_DERIVATION_STATES:
         return None
 
-    values = [value for _norm, value in pairs]
-    quantum = _measurement_quantum(values)
-    bound = 0.5 * quantum + 1e-9
-    ordered = sorted(pairs, key=lambda pair: pair[0])
-    if any(b[1] < a[1] for a, b in zip(ordered, ordered[1:])):
-        # descending (or non-monotone) display: the range/spine model in
-        # `values.py` cannot state that direction yet, so refuse instead of
-        # writing an inverted mapping that a round-trip would not reveal
+    entries = _measurement_entries(states)
+    if entries is None:  # pragma: no cover - `pairs` was not None, so this holds
         return None
-    endpoints = _norm_ordered_endpoints(pairs)
+    values = [value for _norm, value, _precision in entries]
+    quantum = _measurement_quantum(values)
+    floor = 0.5 * quantum + 1e-9
+    ordered = sorted(entries, key=lambda entry: entry[0])
+    non_decreasing = all(b[1] >= a[1] for a, b in zip(ordered, ordered[1:]))
+    non_increasing = all(b[1] <= a[1] for a, b in zip(ordered, ordered[1:]))
+    if non_decreasing:
+        direction = "ascending"
+        oriented = ordered
+    elif non_increasing:
+        # A measured **descending** display (the seven frequency controls: 128 s
+        # at normalized 0 down to 0.0019 s at 1). The spine model in `values.py`
+        # states the direction explicitly (`law.params.direction`), so the fit
+        # runs in spine space (`1 - normalized`) and the returned range keeps
+        # `min <= max` as numeric extremes - never an inverted formula that a
+        # round-trip would not reveal.
+        direction = "descending"
+        oriented = [(1.0 - norm, value, precision) for norm, value, precision in ordered]
+    else:
+        return None  # non-monotone: no single-valued law describes the sweep
+    endpoints = _norm_ordered_endpoints([(norm, value) for norm, value, _p in oriented])
     if endpoints is None:
         return None
     low, high = endpoints
+    # carrying the direction only when it is not the default keeps every
+    # ascending row's profile byte-identical to what it was before
+    spine_params = {"direction": direction} if direction == "descending" else {}
+    bound_model = "max(printed precision of each state, half the measured display step)"
 
-    fit = depth_module.linear_fit(pairs)
+    def _accepted(predict: Any) -> tuple[bool, float, float]:
+        worst_abs, worst_ratio = _worst_fit_ratio(predict, oriented, floor)
+        return worst_ratio <= 1.0 + 1e-9, worst_abs, worst_ratio
+
+    fit = depth_module.linear_fit([(norm, value) for norm, value, _p in oriented])
     if fit is not None:
-        slope, intercept, residual = fit
-        if residual <= bound:
+        slope, intercept, _residual = fit
+        ok, worst_abs, worst_ratio = _accepted(lambda t: slope * t + intercept)
+        if ok:
             return {
                 "kind": "affine",
                 "type": "number",
@@ -557,18 +767,19 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                     "offset": 0.0,
                     "measured_slope": round(float(slope), 9),
                     "measured_intercept": round(float(intercept), 9),
-                    "fit_residual": round(float(residual), 9),
-                    "fit_bound": round(float(bound), 12),
+                    "fit_residual": round(float(worst_abs), 12),
+                    "fit_residual_ratio": round(float(worst_ratio), 9),
+                    "fit_bound": round(float(floor), 12),
+                    "fit_bound_model": bound_model,
                     "source": "vital_scales_full.json (measured sweep fit)",
                     "n_states": len(states),
+                    **spine_params,
                 },
             }
 
     if low > 0.0 and high > 0.0:
-        residual = max(
-            abs(value - low * (high / low) ** norm) for norm, value in pairs
-        )
-        if residual <= bound:
+        ok, worst_abs, worst_ratio = _accepted(lambda t: low * (high / low) ** t)
+        if ok:
             return {
                 "kind": "exponential",
                 "type": "number",
@@ -577,10 +788,13 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                 "params": {
                     "scale": 1.0,
                     "offset": 0.0,
-                    "fit_residual": round(float(residual), 9),
-                    "fit_bound": round(float(bound), 12),
+                    "fit_residual": round(float(worst_abs), 12),
+                    "fit_residual_ratio": round(float(worst_ratio), 9),
+                    "fit_bound": round(float(floor), 12),
+                    "fit_bound_model": bound_model,
                     "source": "vital_scales_full.json (measured sweep fit)",
                     "n_states": len(states),
+                    **spine_params,
                 },
             }
 
@@ -589,7 +803,7 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
     # logarithm and norm 1 pins the base by construction (`math.log(1.0) == 0.0`
     # is a ZeroDivisionError, measured 2026-10-11 while building this fit)
     exponent_points = [
-        (norm, value) for norm, value in pairs if 0.0 < norm < 1.0 and value > 0.0
+        (norm, value) for norm, value, _p in oriented if 0.0 < norm < 1.0 and value > 0.0
     ]
     distinct_values = sorted({value for _norm, value in exponent_points})
     if base > 0.0 and len(exponent_points) >= 2 and len(distinct_values) >= 2:
@@ -597,8 +811,8 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
             math.log(value / base) / math.log(norm) for norm, value in exponent_points
         ) / len(exponent_points)
         if exponent > 0.0:
-            residual = max(abs(value - base * norm**exponent) for norm, value in pairs)
-            if residual <= bound:
+            ok, worst_abs, worst_ratio = _accepted(lambda t: base * t**exponent)
+            if ok:
                 return {
                     "kind": "power",
                     "type": "number",
@@ -607,13 +821,127 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                     "params": {
                         "base": float(base),
                         "exponent": round(float(exponent), 9),
-                        "fit_residual": round(float(residual), 9),
-                        "fit_bound": round(float(bound), 12),
+                        "fit_residual": round(float(worst_abs), 12),
+                        "fit_residual_ratio": round(float(worst_ratio), 9),
+                        "fit_bound": round(float(floor), 12),
+                        "fit_bound_model": bound_model,
                         "source": "vital_scales_full.json (measured sweep fit)",
                         "n_states": len(states),
+                        **spine_params,
                     },
                 }
     return None
+
+
+#: The candidate kinds, richest-first: an exponential explains a wide dynamic
+#: range, a power a taper from a zero base, an affine a constant slope.
+_CANDIDATE_ORDER = ("exponential", "power", "affine")
+
+
+def derive_law_candidate(states: list[tuple[float, str]]) -> dict[str, Any] | None:
+    """The best-fitting law this sweep *nearly* satisfies - recorded, never applied.
+
+    Written for the rows `derive_measured_law` refuses: the fit exists and its
+    shape is visible in the sweep, but at least one state misses its own printed
+    precision, so the law is **not** installed (``values.to_native`` keeps
+    refusing) and the control keeps its ``none``/``unmeasured`` law. What the
+    profile gains is the diagnosis: which law was tried, how far outside the
+    instrument budget it landed, and at which state - so "no law" becomes "a
+    named candidate with a measured miss", and a future provider-calibration step
+    knows exactly what to verify.
+
+    Measured 2026-10-11 (``random_1..4_frequency``): the endpoint-anchored
+    exponential lands within 5.7e-6 *relative* of every printed state, but the
+    low endpoint is itself a rounded print (``0.00195312`` for 2**-9), and that
+    rounding shifts the curve by up to 11x a state's printed precision - a
+    ratio-fitted parametrization would have to be added to the law vocabulary to
+    express it, which is a Core change, not a guess this provider may make.
+    """
+    entries = _measurement_entries(states)
+    if entries is None or len(entries) < _MIN_DERIVATION_STATES:
+        return None
+    values = [value for _norm, value, _precision in entries]
+    quantum = _measurement_quantum(values)
+    floor = 0.5 * quantum + 1e-9
+    ordered = sorted(entries, key=lambda entry: entry[0])
+    non_decreasing = all(b[1] >= a[1] for a, b in zip(ordered, ordered[1:]))
+    non_increasing = all(b[1] <= a[1] for a, b in zip(ordered, ordered[1:]))
+    if non_decreasing:
+        direction = "ascending"
+        oriented = ordered
+    elif non_increasing:
+        direction = "descending"
+        oriented = [(1.0 - norm, value, precision) for norm, value, precision in ordered]
+    else:
+        return None
+    endpoints = _norm_ordered_endpoints([(norm, value) for norm, value, _p in oriented])
+    if endpoints is None:
+        return None
+    low, high = endpoints
+
+    candidates: dict[str, Any] = {}
+    fit = depth_module.linear_fit([(norm, value) for norm, value, _p in oriented])
+    if fit is not None:
+        slope, intercept, _residual = fit
+        candidates["affine"] = (lambda t, m=slope, b=intercept: m * t + b, {})
+    if low > 0.0 and high > 0.0:
+        candidates["exponential"] = (
+            lambda t: low * (high / low) ** t,
+            {"scale": 1.0, "offset": 0.0},
+        )
+    base = max(values)
+    if base > 0.0:
+        exponent_points = [
+            (norm, value) for norm, value, _p in oriented if 0.0 < norm < 1.0 and value > 0.0
+        ]
+        if len(exponent_points) >= 2 and len({value for _n, value in exponent_points}) >= 2:
+            exponent = sum(
+                math.log(value / base) / math.log(norm) for norm, value in exponent_points
+            ) / len(exponent_points)
+            if exponent > 0.0:
+                candidates["power"] = (lambda t, e=exponent: base * t**e, {"base": base, "exponent": exponent})
+    if not candidates:
+        return None
+
+    displays = {round(norm, 12): display for norm, display in states}
+    best: dict[str, Any] | None = None
+    for kind in _CANDIDATE_ORDER:
+        if kind not in candidates:
+            continue
+        predict, params = candidates[kind]
+        worst: dict[str, Any] | None = None
+        for norm, value, precision in oriented:
+            bound = max(precision, floor, 1e-15)
+            predicted = predict(norm)
+            ratio = abs(value - predicted) / bound
+            if worst is None or ratio > worst["ratio"]:
+                original_norm = norm if direction == "ascending" else 1.0 - norm
+                worst = {
+                    "normalized": round(original_norm, 9),
+                    "display": displays.get(round(original_norm, 12)),
+                    "predicted": round(float(predicted), 9),
+                    "precision": precision,
+                    "ratio": round(float(ratio), 6),
+                }
+        record = {
+            "kind": kind,
+            "direction": direction,
+            "range": {"min": low, "max": high},
+            "params": {**params, "n_states": len(states)},
+            "worst_state": worst,
+            "refused_by": "the display-precision budget: at least one state misses its own printed precision",
+            "source": "vital_scales_full.json (best-effort fit, not installed)",
+        }
+        if kind == "affine" and fit is not None:
+            record["params"].update(
+                {
+                    "measured_slope": round(float(fit[0]), 9),
+                    "measured_intercept": round(float(fit[1]), 9),
+                }
+            )
+        if best is None or (worst and worst["ratio"] < best["worst_state"]["ratio"]):
+            best = record
+    return best
 
 
 def _evidence(
@@ -799,8 +1127,26 @@ def _enum_values(states: list[tuple[float, str]]) -> list[dict[str, str]] | None
     return [{"id": label, "label": label} for label in seen]
 
 
-def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the [07 §1] profile from the loaded registry and a live identity."""
+def build_profile(
+    registry: VitalRegistry,
+    identity: Mapping[str, Any],
+    *,
+    calibration: Any = None,
+    calibration_row: dict[str, Any] | None = None,
+    calibration_note: str | None = None,
+) -> dict[str, Any]:
+    """Build the [07 §1] profile from the loaded registry and a live identity.
+
+    ``calibration`` is a loaded host-calibration artifact (`calibration.py`); when
+    present its bytes are a declared **source** (so the cache key covers it) and
+    the merges it justifies are applied with per-field provenance. When a
+    calibration file exists but could not be used, ``calibration_row`` still
+    carries its hash into the sources and ``calibration_note`` says why nothing
+    was applied - a half-applied artifact is never a silent state.
+    """
+    from . import calibration as calibration_module  # noqa: PLC0415 - one-way, lazy
+    from ... import values as values_module  # noqa: PLC0415
+
     rows = registry.rows()
     scales = registry.scales()
     vocabulary = registry.vocabulary()
@@ -832,6 +1178,12 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             declared_law["kind"] == "affine" and declared_range is None
         )
         measured = derive_measured_law(row, states) if needs_measurement else None
+        #: set for a row whose sweep nearly fits a law the display-precision
+        #: budget refused (see `derive_law_candidate`): recorded as a named
+        #: diagnosis, never installed - `values.to_native` keeps refusing
+        law_candidate: dict[str, Any] | None = (
+            derive_law_candidate(states) if needs_measurement and measured is None else None
+        )
         #: set only for a declared `enum_index` row whose *measured* bands are not
         #: uniform (see `_declared_enum_positions`); carried into the evidence
         positions_correction: dict[str, Any] | None = None
@@ -894,6 +1246,7 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
                 },
                 "law": law,
                 "evidence": evidence,
+                **({"law_candidate": law_candidate} if law_candidate else {}),
             }
         )
     for name in module_ids:
@@ -951,8 +1304,55 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
     version = registry.version or SUPPORTED_VERSIONS[0]
     compatible = sorted({version, *SUPPORTED_VERSIONS})
 
+    source_rows = [{"file": row["file"], "sha256": row["sha256"]} for row in registry.sources]
+    if calibration_row is not None:
+        source_rows.append(dict(calibration_row))
+    calibration_block: dict[str, Any] = {
+        "state": (
+            "applied"
+            if calibration is not None
+            else ("refused" if calibration_note else "absent")
+        ),
+        "applied": calibration is not None,
+        "artifact": dict(calibration_row) if calibration_row is not None else None,
+        "method_version": int(calibration.method_version) if calibration is not None else None,
+        "grid_points": len(calibration.grid) if calibration is not None else None,
+        # only *known scalar* fields travel into the profile: the artifact is data,
+        # but a wholesale copy of its blocks would let an oversized blob become
+        # unbounded profile content that still validates
+        "proof": _scalar_subset(
+            calibration.proof if calibration is not None else {},
+            ("values_unchanged", "chunk_sha256_unchanged", "watched_points", "statement"),
+        ),
+        "host_param_space": _scalar_subset(
+            calibration.host_param_space if calibration is not None else {},
+            ("call", "min", "max", "mid", "uniform_0_1", "probed", "note"),
+        ),
+        "host_default_value": _scalar_subset(
+            calibration.host_default_value if calibration is not None else {},
+            ("call", "answered", "probed", "available", "evidence"),
+        ),
+        "refusals": [calibration_note] if calibration_note else [],
+        "counts": {},
+    }
+    if calibration is not None:
+        report = calibration_module.apply_calibration(
+            controls, calibration, values_module=values_module
+        )
+        calibration_block["counts"] = dict(report.get("counts") or {})
+        calibration_block["units_filled"] = list(report.get("units_filled") or [])
+        # the *refusals* travel too: a reader must be able to see why a unit was
+        # not filled, not only that the profile has none
+        calibration_block["units_declined"] = list(report.get("units_declined") or [])
+        calibration_block["confirmations_declined"] = list(
+            report.get("confirmations_declined") or []
+        )
+        calibration_block["display_offset_candidates"] = list(
+            report.get("display_offset_candidates") or []
+        )
+
     return {
-        "profile_schema_version": 1,
+        "profile_schema_version": 2,
         "provider": "vital",
         "identity": {
             "plugin_id": "vital",
@@ -967,7 +1367,7 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
         "provenance": {
             "generated_utc": None,  # filled by Core
             "generator": "vital_provider/registry",
-            "sources": [{"file": row["file"], "sha256": row["sha256"]} for row in registry.sources],
+            "sources": source_rows,
             "measured_on": {
                 "host": "reaper",
                 "version": version,
@@ -975,6 +1375,7 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
                 "registry_dir": registry.directory,
             },
         },
+        "calibration": calibration_block,
         "modules": module_descriptors,
         "controls": controls,
         "values": {

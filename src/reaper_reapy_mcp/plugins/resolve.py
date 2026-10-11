@@ -20,10 +20,13 @@ from typing import Any
 
 from .cache import (
     REQUIRED_FINGERPRINT_FIELDS,
+    CacheLoad,
     CacheStatus,
     ProfileBuild,
     ProfileCache,
+    adopt_profile,
     build_capability_profile,
+    key_material_of,
 )
 from .errors import (
     AmbiguousInstance,
@@ -34,6 +37,7 @@ from .errors import (
     VersionMismatch,
 )
 from .model import FxHostFacts, PluginInstanceRef, utc_now_iso
+from .profile import validate_profile
 
 __all__ = [
     "IDENTITY_FACT_FIELDS",
@@ -313,10 +317,47 @@ def iter_instances(bridge: Any, provider: Any, *, selector: dict[str, Any] | Non
 
     Enumeration is host-level; ``matches`` is provider-level. A slot whose
     identity facts cannot be read does not become a candidate (fail closed).
+
+    **An addressed slot is the only slot read** (measured 2026-10-11, live).
+    A slot's facts cost a full track-state-chunk read (``fx_facts``); reading
+    every slot of every track measured **1536 ms for 4 slots** on a
+    one-FX-per-track project, while the rest of a warm call is ~50 ms - i.e. the
+    sweep, not the profile, dominated a call whose own selector already named
+    the instance. A selector naming ``track_index`` therefore restricts the
+    enumeration to that track, and one naming ``fx_index`` as well to that single
+    slot. The facts of the addressed slot are read exactly as before (identity is
+    still verified against the host, never assumed), an out-of-range slot yields
+    no candidate exactly as the loop over ``range(n_fx)`` did, and slots the
+    selector cannot match were filtered before - the filter is applied earlier,
+    not weakened.
     """
+    wanted_track: int | None = None
+    wanted_slot: int | None = None
+    if isinstance(selector, dict):
+        for name, target in (("track_index", "track"), ("fx_index", "slot")):
+            value = selector.get(name)
+            if value is None:
+                continue
+            try:
+                if target == "track":
+                    wanted_track = int(value)
+                else:
+                    wanted_slot = int(value)
+            except (TypeError, ValueError):
+                if target == "track":
+                    wanted_track = None
+                else:
+                    wanted_slot = None
     found: list[tuple[FxHostFacts, str | None]] = []
     for track in bridge.list_tracks():
-        for fx_index in range(int(track.n_fx)):
+        if wanted_track is not None and int(track.track_index) != wanted_track:
+            continue
+        slots = range(int(track.n_fx))
+        if wanted_slot is not None:
+            if wanted_slot not in slots:
+                continue
+            slots = range(wanted_slot, wanted_slot + 1)
+        for fx_index in slots:
             facts = bridge.fx_facts(track.track_index, fx_index)
             if not provider.matches(facts):
                 continue
@@ -512,6 +553,21 @@ def resolve_instance_profile(
     missing, the profile is built in memory, the cache is touched neither for
     read nor write, and the instance is write-disabled with reads marked
     provisional (07 §3.6, 09 §5.1).
+
+    **The warm path builds nothing** (owner Decision 4). When the provider can
+    declare its key material without a build (`cache.key_material_of`), the key
+    is computed from that declaration, the cache is consulted first, and a hit is
+    served directly - the profile projection, the registry parse and the
+    behaviour-affecting digest work a hit never uses are not performed. Two
+    guards keep that from weakening anything: the cache load still re-derives the
+    key from the entry's own provenance against the live identity, and a *miss*
+    is followed by the full build whose provenance must re-derive the very key
+    the fast path computed - a disagreement between the provider's declaration
+    and its own built provenance is refused loudly (`cache.key_material`) instead
+    of filing a profile under a key nothing can re-derive.
+
+    Providers without the hook keep the established build-then-load order, which
+    is correct but pays the build on every call.
     """
     instance = resolve_one(bridge, provider, selector=selector, registry=registry)
     identity = dict(instance.ref.identity)
@@ -535,16 +591,55 @@ def resolve_instance_profile(
             version_refusal_reason=None,
         )
 
+    material = key_material_of(provider, identity)
+    declared_key = material.key_for(str(provider.id), identity) if material is not None else None
+    loaded: CacheLoad | None = None
+    if declared_key is not None:
+        cache.status.key_without_build = True
+        loaded = cache.load(declared_key, identity=identity)
+        if loaded.status == "hit" and loaded.profile is not None:
+            adopt_profile(provider, loaded.profile)
+            validation = loaded.validation or validate_profile(loaded.profile)
+            return ProfileResolution(
+                instance=instance,
+                identity=identity,
+                profile=loaded.profile,
+                build=ProfileBuild.from_cached_profile(
+                    profile=loaded.profile, validation=validation, material=material
+                ),
+                cache=cache.status.snapshot(),
+                missing_identity=[],
+                version_refusal_reason=version_refusal(loaded.profile, identity.get("version")),
+            )
+
     build = build_capability_profile(provider, identity)
+    cache.status.built = True
     key = build.key_for(str(provider.id), identity)
-    loaded = cache.load(key, identity=identity)
-    if loaded.status == "hit" and loaded.profile is not None:
+    if declared_key is not None and key != declared_key:
+        cache.refuse_key_material(
+            built_key=key, material_key=declared_key, provider_id=str(provider.id)
+        )
+        adopt_profile(provider, build.profile)
+        return ProfileResolution(
+            instance=instance,
+            identity=identity,
+            profile=build.profile,
+            build=build,
+            cache=cache.status.snapshot(),
+            missing_identity=[],
+            version_refusal_reason=version_refusal(build.profile, identity.get("version")),
+        )
+
+    if declared_key is None:
+        loaded = cache.load(key, identity=identity)
+    if loaded is not None and loaded.status == "hit" and loaded.profile is not None:
         profile = loaded.profile
     else:
         profile = build.profile
         if build.cacheable:
             cache.save(key, profile)
 
+    adopt_profile(provider, profile)
     refusal = version_refusal(profile, identity.get("version"))
     return ProfileResolution(
         instance=instance,

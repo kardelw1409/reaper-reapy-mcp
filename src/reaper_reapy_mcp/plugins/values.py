@@ -16,6 +16,7 @@ from .errors import InvalidValue, NoConversion
 __all__ = [
     "LAW_KINDS",
     "law_kind",
+    "direction",
     "strict_bool",
     "unit_trap",
     "validate",
@@ -64,6 +65,22 @@ def _range(control: dict[str, Any]) -> tuple[float | None, float | None]:
 
 def _enum_members(control: dict[str, Any]) -> list[str]:
     return [str(member.get("id")) for member in control.get("enum_values") or []]
+
+
+def direction(control: dict[str, Any]) -> str:
+    """The measured conversion direction of a numeric control's law.
+
+    ``range`` always carries the numeric extremes (``min <= max``) and the law
+    maps ``normalized 0 -> range.max`` \u2192 ``normalized 1 -> range.min`` when the
+    direction is **descending**; ``normalized 0 -> range.min`` when ascending.
+    Present only where a provider *measured* the direction from the control's own
+    sweep: seven frequency controls of the first provider run from their maximum
+    at normalized 0 down to their minimum at 1 (measured 2026-10-11), and the
+    previous build refused them outright rather than inventing an inverted
+    mapping.
+    """
+    raw = str(_law_params(control).get("direction") or "ascending").strip().lower()
+    return "descending" if raw == "descending" else "ascending"
 
 
 def _enum_positions(control: dict[str, Any]) -> list[float] | None:
@@ -172,21 +189,32 @@ def to_normalized(control: dict[str, Any], native: Any) -> float:
         return 1.0 if native else 0.0
     low, high = _range(control)
     kind = law_kind(control)
+    descending = direction(control) == "descending"
     if kind == "power":
         base = float(_law_params(control).get("base") or 0.0)
         exponent = float(_law_params(control).get("exponent") or 0.0)
         offset = float(_law_params(control).get("offset") or 0.0)
         shifted = float(native) - offset
         if base > 0.0 and exponent > 0.0 and shifted >= 0.0:
-            return (shifted / base) ** (1.0 / exponent)
+            spine = (shifted / base) ** (1.0 / exponent)
+            return (1.0 - spine) if descending else spine
         raise NoConversion(
             f"control {control.get('id')!r} declares a power law without a usable base/exponent",
             detail={"control": control.get("id"), "law": kind, "base": base, "exponent": exponent},
         )
     if kind == "exponential" and low and high and low > 0 and high != low:
-        return math.log(float(native) / low) / math.log(high / low)
+        number = float(native)
+        if number <= 0.0:
+            raise NoConversion(
+                f"control {control.get('id')!r} declares an exponential law whose values are "
+                "positive; a non-positive native value has no normalized position",
+                detail={"control": control.get("id"), "law": kind, "native": number, "min": low},
+            )
+        spine = math.log(number / low) / math.log(high / low)
+        return (1.0 - spine) if descending else spine
     if low is not None and high is not None and high != low:
-        return (float(native) - low) / (high - low)
+        spine = (float(native) - low) / (high - low)
+        return (1.0 - spine) if descending else spine
     return float(native)
 
 
@@ -231,7 +259,15 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
         if positions is not None:
             nearest = min(range(len(positions)), key=lambda i: abs(positions[i] - float(normalized)))
             return float(nearest)
-        index = round(float(normalized) * max(1, len(members) - 1))
+        # Uniform bands: bands of width 1/(n-1) centred on i/(n-1), so the switch
+        # between member i and i+1 sits at (i+0.5)/(n-1) and the member that
+        # *starts* at a boundary owns it. Half-UP rounding is what states that;
+        # Python's `round()` is half-to-even, which read normalized 0.5 on a
+        # two-member control as "Off" while the host itself formats it as "On"
+        # (measured 2026-10-11 by the host-display channel: `chorus_on`,
+        # `compressor_on` and every other 2..11-member uniform enum whose grid
+        # point landed exactly on a boundary).
+        index = int(math.floor(float(normalized) * max(1, len(members) - 1) + 0.5))
         return float(max(0, min(index, len(members) - 1)))
     if ctype == "bool":
         return 1.0 if float(normalized) >= 0.5 else 0.0
@@ -239,20 +275,23 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
         return bool(normalized)
     low, high = _range(control)
     kind = law_kind(control)
+    descending = direction(control) == "descending"
     if kind == "power":
         base = float(_law_params(control).get("base") or 0.0)
         exponent = float(_law_params(control).get("exponent") or 0.0)
         offset = float(_law_params(control).get("offset") or 0.0)
         if base > 0.0 and exponent > 0.0:
-            return offset + base * float(normalized) ** exponent
+            spine = float(normalized) if not descending else 1.0 - float(normalized)
+            return offset + base * spine ** exponent
         raise NoConversion(
             f"control {control.get('id')!r} declares a power law without a usable base/exponent",
             detail={"control": control.get("id"), "law": kind, "base": base, "exponent": exponent},
         )
+    spine = (1.0 - float(normalized)) if descending else float(normalized)
     if kind == "exponential" and low and high and low > 0 and high != low:
-        return low * (high / low) ** float(normalized)
+        return low * (high / low) ** spine
     if low is not None and high is not None and high != low:
-        return low + float(normalized) * (high - low)
+        return low + spine * (high - low)
     return float(normalized)
 
 

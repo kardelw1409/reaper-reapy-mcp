@@ -326,29 +326,63 @@ def test_every_control_converts_inside_the_unit_interval(real_profile):
     assert problems == [], problems
 
 
-def test_descending_displays_stay_refused(real_profile):
-    """4 controls whose display falls as the parameter rises (audit blocker D2).
+def test_descending_displays_are_now_measured_laws_and_round_trip(real_profile):
+    """4 controls fall as the parameter rises (audit blocker D2) - now **measured**.
 
-    The range/spine model expresses one direction only; writing an inverted range
-    would produce a full-band error that the read-back (using the same law) would
-    confirm as success. They stay refused, and this test names them.
+    History: the range/spine model expressed one direction only, so a descending
+    sweep was refused rather than inverted (writing an inverted range would
+    produce a full-band error that the read-back, using the same law, would
+    confirm as success). P22 answered that blocker the honest way: the law now
+    declares its direction (`law.params.direction = "descending"`) and the fit
+    runs in spine space, so the range keeps `min <= max` as numeric extremes.
+
+    Three controls derive; one does not, and the reason is a measurement, not a
+    gap: `random_N_frequency`'s exponential is anchored on printed endpoints
+    (``0.00195312`` for 2**-9) and lands within 5.7e-6 *relative* of every state
+    but outside each state's printed precision at the large end - so it stays
+    refused with a `law_candidate` recording the miss.
     """
-    expected = {
-        "delay_frequency",
-        "phaser_frequency",
-        "delay_aux_frequency",
-        "delay_aux_tempo",
-        "random_1_frequency",
-        "random_2_frequency",
-        "random_3_frequency",
-        "random_4_frequency",
+    controls = {control["id"]: control for control in real_profile["controls"]}
+    derived = {
+        cid: controls[cid]
+        for cid in ("delay_frequency", "phaser_frequency", "delay_aux_frequency")
     }
-    refused = {
-        control["id"]
-        for control in real_profile["controls"]
-        if control["law"]["kind"] in ("none", "unmeasured")
-    }
-    assert refused == expected, sorted(refused ^ expected)
+    for control_id, control in derived.items():
+        law = control["law"]
+        params = law.get("params") or {}
+        assert law["kind"] == "exponential", (control_id, law)
+        assert params.get("direction") == "descending", (control_id, params)
+        low, high = control["range"]["min"], control["range"]["max"]
+        assert low < high, (control_id, control["range"])
+        # the spine: normalized 0 is the maximum, normalized 1 the minimum, and the
+        # inversion is exact at both ends and in the middle
+        assert math.isclose(float(V.normalized_to_native(control, 0.0)), high, rel_tol=1e-9), control_id
+        assert math.isclose(float(V.normalized_to_native(control, 1.0)), low, rel_tol=1e-9), control_id
+        for norm in (0.0, 0.25, 0.5, 0.75, 1.0):
+            native = V.normalized_to_native(control, norm)
+            assert abs(V.to_normalized(control, native) - norm) < 1e-6, (control_id, norm)
+
+    # the labelled case: `delay_aux_tempo`'s displays are fractions ("4/1"..."1/64"),
+    # which the leading-number parser reads as 4.0/1.0/1.0 - not a numeric scale,
+    # so the row takes the enum path with its measured member order
+    tempo = controls["delay_aux_tempo"]
+    assert tempo["type"] == "enum", tempo["law"]
+    assert tempo["law"]["kind"] == "enum_index"
+    members = [member["id"] for member in tempo["enum_values"]]
+    assert members[:2] == ["4/1", "2/1"] and members[-1] == "1/64", members
+    assert len(tempo["law"]["params"]["positions"]) == len(members)
+
+    # the four that remain refused carry a named candidate instead of silence
+    for cid in ("random_1_frequency", "random_2_frequency", "random_3_frequency", "random_4_frequency"):
+        control = controls[cid]
+        assert control["law"]["kind"] == "none", (cid, control["law"])
+        candidate = control.get("law_candidate")
+        assert candidate and candidate["kind"] == "exponential", (cid, candidate)
+        assert candidate["direction"] == "descending", (cid, candidate)
+        assert candidate["worst_state"]["ratio"] > 1.0, (cid, candidate)
+        # and the candidate must NOT have been installed
+        with pytest.raises(V.NoConversion):
+            V.to_native(control, float(control["law_candidate"]["range"]["max"]))
 
 
 # ---------------------------------------------------------------------------
