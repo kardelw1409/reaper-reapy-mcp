@@ -161,7 +161,10 @@ so a caller never needs a follow-up read (`read_cost_next: {needed: 0, why: …}
     case; the caller must not be able to mistake this state for safe [A: POC `RollbackFailed`]).
 - **An attempted rollback is never reported as a verified one** (AUD-007). `FAILED_AND_RESTORED`
   may not appear unless every declared captured channel was compared after restoration (AUD-002
-  acceptance; AUD-015 applies the same rule to live-test evidence).
+  acceptance; AUD-015 applies the same rule to live-test evidence) **and the restore covered the
+  whole capture** (`rollback.complete`); a deliberately excluded derived leaf is reported as a named
+  gap (`derived_leaf_not_restored`) with `complete: false`, on every path where a restore ran
+  (owner Decisions 2/5, 2026-10-10 - see §3).
 - Rollback verification tolerances mirror the primary verification; the POC executor's
   both-channels restore check (display equality **and** normalized within 1e-6) is the precedent for
   the parameter channel [A].
@@ -180,6 +183,17 @@ so a caller never needs a follow-up read (`read_cost_next: {needed: 0, why: …}
   that makes the cache quarantine a foreign file instead of replacing it ([09 §5](09-discovery-and-cache.md)).
 
 ## 3. Verdict and final-state vocabulary (normative, Phase C)
+
+**Refinement (2026-10-10, owner Decisions 2/5).** `FAILED_AND_RESTORED` requires that every captured
+channel was written back **and verified** - and it requires the restore to have been **complete**: the
+set of channels it covered is the whole capture. When a provider declares a plugin-derived leaf that
+cannot be restored (Vital: `settings.sample.samples`, re-serialized by the plugin), the restore is
+*verified but not complete*: the outcome reports `rollback.verified: true` **and**
+`rollback.complete: false` with `rollback.excluded` naming the leaf, carries the named gap
+`derived_leaf_not_restored` for it, and uses `FAILED_AND_PARTIALLY_RESTORED` / `partially_restored` -
+`unchanged_verified` would be a claim about state that is not unchanged. The same rule applies to a
+forward restore that deliberately excludes such a leaf. This **strengthens** an approved guarantee
+(it removes a case where the vocabulary would have overstated the recovery); it weakens nothing.
 
 | Verdict | Meaning | `final_state` | Result shape |
 |---|---|---|---|
@@ -241,6 +255,14 @@ contract can establish that no write was invoked.
   batch (is it still the intended instance?); expected-revision comparison against fresh reads (is
   the mutable state what we planned against?). Each failure has its own typed error and refuses;
   none silently re-targets.
+- **What revalidation can and cannot decide (measured, 2026-10-10/11).** The facts comparison detects
+  every **observable** change (location, build facts, session handle, state revision) and refuses on
+  it. It does **not** make an identical-build replacement distinguishable (same handle reproduced on
+  a repopulated slot). Consequently the layer draws the line explicitly: a **location-addressed**
+  mutation claims only "the instance at this location now", which the in-call capture/revalidate/
+  write/verify/restore sequence establishes, while a mutation carrying a **session write-target
+  token** claims continuity with an earlier validation and is refused (`IdentityContinuityUnprovable`)
+  before any host work ([05 §5](05-universal-core-contract.md), [19 §8](19-owner-decisions.md)).
 - **Retry safety:** the transaction is **not idempotent** by declaration (a write may partially
   land); therefore retries are caller-visible and post-outcome: the engine either returns a verified
   rollback (safe to re-issue after re-reading) or a loud failed/uncertain outcome (do not re-issue;

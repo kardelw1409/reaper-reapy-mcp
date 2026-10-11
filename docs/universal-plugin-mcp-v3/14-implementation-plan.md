@@ -633,6 +633,12 @@ reading recorded POC artifacts; the byte-identity fixture set for the codec; the
 **Contracts touched:** [08 §6-§7](08-provider-and-host-interfaces.md) mapping table.
 
 **Tests (L5):** V-1 ident addressing; V-2 write order; V-3 one-route-per-write; V-4 depth
+
+> **Note (2026-10-11).** V-3's engine-level case changed with the owner's safety-gate correction:
+> creating a route through the transaction is now **refused** (`route_into_off_filter` cannot be
+> evaluated), so the one-route-per-write property is proven on the codec's own plan
+> (`test_v3_one_route_per_state_write_is_the_codec_plan_not_an_engine_rule`) and the refusal is
+> proven on the engine path ([19 §9](19-owner-decisions.md)).
 acceptance/refusals match recorded fit; V-5 dependency refusals; V-6 tolerances; V-7 full capture
 scope + restore order (V3 contract); V-8 cache refusal/quarantine behaviour (V3 contract);
 V-9 line_mapping refusal/warning; V-10 version gate with hard refusal; **V-11 slice-exact targeting
@@ -978,3 +984,181 @@ in which live mutation tests may be performed; before P8, no phase may connect t
 
 All phase risks are summarized in [15 §1](15-risks-and-open-questions.md) with owners and
 triggers; a phase may not exit with an **open high-severity** risk assigned to it.
+
+---
+
+## Implementation design notes
+
+Appended by the implementation session (2026-10-10) as required by the phase rules ("append a short
+design note … if a contract changed"). The notes record implementation decisions taken inside the
+approved contracts; **no contract in [05]/[06]/[07]/[08]/[09]/[11] was changed**, and each note says
+why the decision does not move a contract.
+
+### P0 design note (implementation session)
+
+1. **P0-1 measurement, and the pre-existing package import chain.** A `sys.addaudithook` probe
+   (2026-10-10) shows that importing `reaper_reapy_mcp` executes the pre-existing `__init__` →
+   `server` → `controllers` chain, whose module-level `from reapy import reascript_api` opens sockets
+   to the reapy ports. That is **pre-existing** behaviour, consistent with the approved eager
+   startup lifecycle (19 Decision 4 / AUD-006 Option A), and was deliberately **not** changed
+   (Decision 4 forbids a lifecycle redesign; 20 §6 forbids touching unrelated behaviour). The plugin
+   package's own import performs **zero** host calls and **zero** registry/cache reads; P0-1 is
+   measured with the pre-existing chain warmed first, and the qualification is recorded in
+   `IMPLEMENTATION-STATUS.md`. If the owner ever wants the literal "no host call for
+   `import reaper_reapy_mcp.plugins` in a cold process" property, the minimal change is a PEP 562
+   lazy `reaper_reapy_mcp/__init__.py` — a new owner decision, not taken here.
+2. **Profile identity required subset.** `profile.py` fixes `REQUIRED_IDENTITY_FIELDS =
+   (fx_name, class_id, module)` plus `identity.fingerprint.param_count`, i.e. the [07 §3.5] set of
+   fields that "must match live host reads". The table's phrase "provider-required subset" is read as
+   "the declared fingerprint fields the provider must emit" — the constant is the single place a
+   provider-specific extension would change.
+3. **Envelope fault code.** `tools.py` answers an unexpected internal exception with the
+   envelope-level code `InternalError`. This is a tool-layer fault classification, **not** an
+   addition to the closed [05 §7] domain taxonomy; a missing dispatch body (a phase-state, not a
+   domain condition) answers the same code instead of raising.
+4. **L0 boundary is static by necessity.** Because the parent package imports host modules before
+   `plugins/` loads, a runtime `sys.modules` boundary check would be vacuous; `tests/plugins/l0_boundary.py`
+   therefore uses an AST + text scan with an explicit non-empty expected-module list and four
+   failure probes (P0-2).
+5. **`TargetedStateSlice.framing` is codec territory.** The field is declared in [05 §2.9] as
+   "provider framing parsed from the block text"; the P3 read bridge fills the structural fields
+   (span, header, class, ordinal, `block_text`) and leaves `framing=None` — the provider codec parses
+   framing from `block_text` when it lands (P5/P7). The bridge therefore stays free of provider
+   format knowledge, exactly as [10 §1.1] splits the responsibilities.
+
+### P2 design note (implementation session)
+
+1. **Revision digest components.** `StateRevision.compute` digests the **state channel** = the
+   located slice's block text (which carries the stored document *and* the route view the host holds
+   for that instance) plus the canonical captured parameter vector; an absent channel is digested as
+   an explicit `none` marker, never as an empty set. This keeps [05 §2.9]'s three-component intent
+   while staying codec-agnostic: for a provider whose route view lives outside the document the
+   engine would digest that channel's bytes instead.
+2. **Verified vs unknown write effects.** A read-back that establishes the effect beyond doubt -
+   including a read-back that proves the write did **not** land, or landed wrong - increments
+   `write_effects_verified`; only a transport loss, a wedge or a cancellation after a write was
+   issued increments `write_effects_unknown`. The accounting invariant `attempted == verified +
+   unknown` therefore holds in every terminal state (asserted in every P2 test).
+3. **Rollback restorability is decided for both channels BEFORE any rollback write.** [19 Decision 3]
+   compares each channel against the transaction's own last-verified revision; the implementation
+   also recognises the transaction's **own attempted write** from the bytes it sent (never from an
+   unverified read-back, which the decision forbids adopting). Deciding both channels up front
+   prevents the document restore from "laundering" a parameter channel that was already foreign.
+4. **Cancellation's error code.** The closed [05 §7] taxonomy has no cancellation code, so a
+   cancellation is reported as `PlanError` with `detail.cancelled: true` and a truthful outcome; if
+   the compensation then fails, `RollbackFailed` outranks it. **Flagged for the owner** — if the
+   taxonomy is ever extended, a dedicated code would be clearer.
+5. **The engine builds the ordered units**: the codec decomposes the state channel, and the engine
+   appends exactly one parameter unit last, enforcing `provider.write_order()` (any order other than
+   state → parameters refuses with `WriteOrderViolation`).
+6. **One token per validated target per session**, which is also what makes the target-scoped lock
+   shared between requests ([19 Decision 3]); the lock is held for the whole transaction.
+7. **Restore shape.** Document restoration is expressed as codec changes (every captured leaf returns
+   to its captured value, applied through `plan_state_writes`); the parameter channel is restored in
+   ordered batches; after a document restore the parameter channel is re-read and its expected digest
+   advanced, because the document write is the transaction's own causal effect on it.
+
+### P3 design note (implementation session)
+
+1. **Identity facts come from the chunk headers.** `TrackFX_GetNamedConfigParm` is unusable for the
+   module string (measured by the POC: it returns 0 for every key), so `fx_facts` reads the class id
+   and the module from the `<VST ...>` header of the block whose **quoted name** matches the name the
+   host reports for that slot, correlated by the slot's ordinal among name-matching slots. When that
+   correlation is not unique the facts carry no class/module and every downstream step fails closed.
+   The version is deliberately **not** produced by the bridge: it lives in the state document
+   (provider territory) and is filled at P7.
+2. **One rule, two implementations, one suite.** The production locator
+   (`plugins/host/reaper.py`) and the mock's locator implement the same unique-or-refuse correlation;
+   the P3 slicing tests run **both** on the same fixtures, so a divergence fails the build instead of
+   hiding in a mock.
+3. **The host import is lazy.** `import reapy` itself probes the host (measured 2026-10-10), so
+   `plugins/host/reaper.py` imports the host client inside its methods. The module therefore imports
+   with zero host I/O, which is what lets the offline slice/conformance tests run with REAPER closed.
+   The L0 boundary rule is unchanged: this is still the only module inside `plugins/` that may import
+   the host API, and a dedicated test asserts the import is not at module level.
+4. **Session evidence is never serialized.** The bridge records `TrackFX_GetFXGUID` as session handle
+   evidence in memory only; the read probe records presence plus a one-way digest, never the raw
+   pointer (05 §5). The repopulation measurement that would decide L-3 is implemented as a gated
+   probe (`tests/plugins/live/probe_fxguid.py`) which refuses without an explicit acknowledgement, a
+   matching project name and a designated slot; **it was not executed in P0-P3** (it is an FX-chain
+   mutation, i.e. P8-class work), so the identical-build replacement question stays open with its
+   fail-closed policy.
+5. **The live read validation that did run:** the read conformance suite and the read-only probe ran
+   against the running REAPER and recorded identity (`fx_name`, `class_id`, `module`, `param_count`),
+   the located slice span, byte-intactness outside the span and a batched parameter read; the evidence
+   artifact is named per run under `tests/plugins/live/evidence/`.
+
+
+
+---
+
+## Addendum — P8/P9/P10 design notes (recorded 2026-10-10, after execution)
+
+This addendum records what the live phases **measured**; the plan above is left as written so the
+difference between "specified" and "measured" stays visible. Phase journal:
+`IMPLEMENTATION-STATUS.md` §15–§17.
+
+### 1. Transport: batch inside one held host session
+
+Every multi-step read/write loop runs inside a single held host session
+(`reapy.inside_reaper()`), which is the largest single performance decision of these phases:
+**200 parameter-ident reads took 6.30 s unheld and 0.21 s held (≈30×)**. A full capture of the live
+instance costs **2.89 s idents + 0.31 s values + 0.43 s state read**, decode 0.0022 s, and the
+775-control identity binding 1.45–1.53 s. Without the hold, the first baseline probe exceeded the
+sample timeout and was classified `Wedged` — the timeout semantics were right, the transport was not.
+
+### 2. Identity is bound per read, never carried
+
+The provider's declared profile carries **no** usable idents (`declared_ident_kept 0`,
+`ident_refreshed 0`): during planning the profile is copied and every ident is replaced by the ident
+the host confirmed in a batched read (775/775 bound, 0 refused). Live ident shape:
+`index:effect_hash` (e.g. `104:48629` for `filter_1_cutoff`, live name `Filter 1 Cutoff`). A control
+whose live name matches no declared alias is refused with a named reason
+(`name_mismatch` / `name_unreadable` / `ident_unreadable`) instead of being guessed.
+
+### 3. The version gate is a read, not a promise
+
+`document_version()` reads the version from the decoded document (observed `1.5.5`, inside the
+measured set); a value outside the set, or a document without a version when the provider declares the
+hook, refuses the transaction before any write. This closes the "verification must not be bypassed"
+requirement at the document level rather than at the request level.
+
+### 4. Concrete defects that only the live host produced
+
+| # | Defect | Fix |
+| --- | --- | --- |
+| 1 | track name read as `str(raw[0])` returned the return code `"1"` — the mock's tuple had the name in position 0 | measured field positions (`field_string`), name is `raw[2]` |
+| 2 | `split_lines_keeping_endings` dropped a chunk's trailing newline (234 740 vs 234 741 chars), so **every** state write altered one byte outside the target span | keep the trailing empty element across the splice |
+| 3 | the codec locator looked for `{"author`, which the pad rewrite destroys; a first-brace rule also failed on a fixture with `0x7b` in the binary prefix; a **nested** wavetable JSON was decoded instead | ascending candidate scan that accepts the first brace whose object has a `settings` object |
+| 4 | the pad was inserted after the closing brace, corrupting the pad line | pad inserted before `}` |
+| 5 | restore demanded the **plugin-owned** leaf `settings.sample.samples` (88 200 bytes, re-encoded by the plugin on every write; drift measured 8 → 16 → 24 → 40 leading zero bytes per cycle), producing a genuine `WriteNotApplied` and `FAILED_AND_NOT_RESTORED` | `state.derived_leaves` declared by the provider: refused as a write target (`derived_leaf_not_writable`) and excluded from restore with the named gap `derived_leaf_not_restored` |
+
+### 5. State writes have effects beyond the request
+
+A single route write (depth 8 ⇒ amount 0.0625) changed the span by exactly one line (837 → 838) and
+**moved 3 of 2858 parameters**, which the plugin recomputed from the document. The verification model
+therefore compares the whole parameter vector and the whole writable leaf set, not the named controls.
+Bytes outside the span were intact.
+
+### 6. L-3 (identical-build replacement) — measured, and still open by design
+
+A second instance of the same build receives a **different** handle, but remove-then-re-add leaves the
+handle **unchanged** (`handle_changed: false`, identity facts identical), so an identical-build
+replacement is indistinguishable and the token does **not** refuse. The addressed instance was never
+touched (its block and parameter-vector digests were unchanged). `TrackFX_AddByName(..., instantiate=-1)`
+adds; `0`/`1` only find. The fail-closed posture stands as a recorded limitation, and
+`TargetToken.differences_against` now also compares the recorded `session_handle` (a recorded-but-fresh-absent
+handle yields `session_handle_unreadable`).
+
+### 7. Registration findings (P9)
+
+Driving the tools through the real FastMCP client found two defects that direct body calls cannot see:
+`**kwargs` is modelled as one **required** field named `kwargs` (the tool appeared un-callable), and
+omitted optional arguments arrive as `None`, which silently discarded the SPEC defaults (including
+`dry_run`). Fixed by setting an explicit `__signature__` (keyword-only, all optional) and by applying
+the declared default only to `None`, so an explicit `False`/`0` is preserved. The tool list stays
+additive and the pre-existing tools' schemas are unchanged.
+
+
+
+

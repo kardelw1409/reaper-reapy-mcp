@@ -185,6 +185,11 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
   },
   "dry_run": true }
 ```
+> **Note (2026-10-11, owner safety-gate correction).** `routes_create` (and a `routes_update` that
+> names a source/destination) is **refused** for a provider whose `route_into_off_filter` rule cannot
+> be evaluated - Vital in V1 - with `DependencyViolation` / `detail.unevaluable`, identically for
+> `dry_run` true and false ([10 §2.3a](10-state-modulation-dependencies.md)). The example above shows
+> the request **shape** the contract defines, not an operation that is currently applicable.
 - **`dry_run` default: `true` — explicit application required (AUD-009/AUD-014 Q-01).** A caller that
   wants changes applied passes `dry_run: false`; there is no `settle_s` or other caller-controlled
   timing (AUD-009 removes it; timings are provider-declared and engine-supplied).
@@ -266,7 +271,20 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
   `create` → per-route outcome incl. **resolved slot**; `update/remove` → matched slot + before/after;
   `depth` → `{ "native_amount": x, "law": {...}, "evidence": ... }` or a typed refusal (`NoConversion`)
   naming the destination as non-affine **without inventing a factor** [A: 246/316 precedent].
-- **Errors:** `InvalidRoute`, `InvalidSourceFamily` (policy; `force` the single override, echoed),
+- **Errors:** `InvalidRoute`, `InvalidSourceFamily` (policy). **`force` is declared and refused:**
+  V1 implements no override, so `force=true` answers `UnsupportedOverride` before any host work and a
+  wrong type for the argument is `InvalidValue` - an argument that looks like a permission is never
+  accepted while nothing honours it (owner Decision 4, 2026-10-10);
+- **Route creation is refused while the rule is unevaluable** (owner safety-gate correction,
+  2026-10-11): `create` (and any `update` that would name a `source`/`destination`) answers
+  `DependencyViolation` with `detail.unevaluable: ["route_into_off_filter"]` and
+  `write_calls_attempted: 0`, identically for `dry_run: true` and `false` - a preview must not present
+  an unverifiable operation as applicable. `list`, `depth`, `remove` and non-pair `update`s are
+  unaffected (see [10 §2.3a](10-state-modulation-dependencies.md));
+- **A caller-supplied `target_token` is refused for a mutation** (`IdentityContinuityUnprovable`,
+  before any host work): a token claims instance continuity, and the measured host cannot prove it
+  ([05 §5](05-universal-core-contract.md)). Reads keep accepting the token; `plugin_instances`
+  returns the instance object (`data.instances[]`) with `location` + `identity` for addressing;
   `InstanceNotFound`, `TargetChanged`, `StateConflict`, transaction outcomes for mutations.
 - **Side effects:** create/update/remove write through the state codec + transaction — only with
   `dry_run: false`; zero write calls otherwise.
@@ -277,9 +295,17 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
   listed for reads; source-family policy refusal + `force` path; depth refusal list matches provider
   (Vital: 70/316 destinations refuse); remove of an empty/None slot is typed, not silent; default
   dry-run proven; per-unit token/revision revalidation.
-- **Example:** `{"op":"create","routes":[{"source":"lfo_1","destination":"filter_1_cutoff","depth":12}],
-  "dry_run":false}` → `{"committed":true,"route_plan":{"routes_create":[{"resolved_slot":4,"source":"lfo_1",
-  "destination":"filter_1_cutoff","amount":0.1836,"depth":12}]},"outcome":{"verdict":"ALL_VERIFIED"}}`
+- **Example (shape only - this request is now REFUSED, see the route-creation bullet above):**
+  `{"op":"create","routes":[{"source":"lfo_1","destination":"filter_1_cutoff","depth":12}],
+  "dry_run":false}` → the *shape* a successful create used to answer,
+  `{"committed":true,"route_plan":{"routes_create":[{"resolved_slot":4,"source":"lfo_1",
+  "destination":"filter_1_cutoff","amount":0.1836,"depth":12}]},"outcome":{"verdict":"ALL_VERIFIED"}}`.
+  Since 2026-10-11 the answer to this call is `DependencyViolation` /
+  `REFUSED_BEFORE_ANY_WRITE` with `write_calls_attempted: 0`, for `dry_run` true and false alike;
+  the `committed: true` block is kept only as the documented envelope shape. What `remove`/`update`
+  answer today is the same envelope with `data.committed` and `outcome.verdict`/`final_state`
+  (`tests/plugins/test_p12_safety_gates.py::test_the_registered_modulation_tool_still_lists_and_removes`
+  pins a committed removal at `ALL_VERIFIED` and one `write_state_slice`).
 
 ## 10. Registration & compatibility
 

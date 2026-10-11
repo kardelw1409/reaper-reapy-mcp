@@ -108,3 +108,70 @@ DS-07→P2/P9, DS-08→P4, DS-09→P2/P6, DS-10→P2/P3/P8, DS-11→the phase or
 - **Runtime validation pending everywhere.** Nothing in this register asserts that any behavior has
   been executed: every test row is a specification. The limitations that will survive implementation
   are listed in [19 §7](19-owner-decisions.md).
+
+---
+
+## Addendum — runtime validation status (2026-10-10, after block 3/3)
+
+The sentence above described the register as it stood **before** the implementation session. For the
+rows implemented in block 3/3 it is no longer accurate, and the difference is recorded here rather than
+by editing the rows.
+
+**Now executed against the live host** (evidence artifacts under `tests/plugins/live/evidence/`, phase
+journal `IMPLEMENTATION-STATUS.md` §15–§17):
+
+| Behaviour | Evidence |
+| --- | --- |
+| live identity, batched parameter read, slice location, bytes outside the span | `p8_baseline__*` (plus the read-conformance suite) |
+| 775/775 live-verified control binding, 0 refused | `p8_baseline__20261010T195509Z__7eb5e9aa1a20.json` |
+| document version gate inside the measured set | baseline artifact + `provider.document_version` tests |
+| parameter write with independent read-back and verified restore | `p8_3_parameter_write__20261010T200037Z__8e1493d01ea9.json` |
+| state-slice (modulation route) write with verified restore and intact outside-span bytes | `p8_4_state_write__20261010T202812Z__2580c9f0d484.json` |
+| L-3 replacement measurement (handle does not change on repopulation; token does not refuse) | `p8_l3_identity__20261010T203101Z__dcd339e9c219.json` |
+| end-to-end acceptance through the registered tools, dry run and committed write | `p10_acceptance__20261010T204137Z__c2fb13177e18.json` |
+| registration: 7 tools through the real MCP client, defaults, zero-provider refusal | `tests/plugins/test_p9_tools.py` |
+
+**Still specification-only or injected, and therefore not evidence of live behaviour:**
+
+- `WriteNotApplied`, rollback ordering, host timeout and wedge classification — the live host produced
+  the first two for real (once, during the derived-leaf incident, `p8_restore__20261010T201944Z__3e8d…`)
+  and one wedge (before the held-session fix), but none can be induced on demand; the suites cover them
+  by injection.
+- Byte-exact restoration of the plugin-owned `settings.sample.samples` — deliberately not attempted;
+  it is refused as a write target and reported as the named gap `derived_leaf_not_restored`.
+- The live dependency-flag rules of P8.7 remain **declared but not evaluated** pending an owner
+  decision ([IMPLEMENTATION-STATUS.md](../IMPLEMENTATION-STATUS.md) §20).
+
+---
+
+## Addendum 2 — release-review remediation (2026-10-10)
+
+The owner reviewed the P8–P10 report and returned five decisions
+([19 §8](19-owner-decisions.md)). What changed, and what was measured while changing it:
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| `force` refused as `UnsupportedOverride` (no override in V1) | **implemented** | tool surface + Core; 22 policy tests in `tests/plugins/test_p11_force_and_identity.py` |
+| Identity claims checked, continuity disclosed as `not_claimed` | **implemented** | `meta.identity_basis` on every response; caller-supplied identity/token mismatches refuse (`TargetChanged`) with 0 writes |
+| Named gap `derived_leaf_not_restored` on every restore path + `rollback.complete` | **implemented** | `tests/plugins/test_p11_gaps.py` (internal outcome + the registered tool envelope) |
+| Unevaluated rules: honest status + a guard on the one decidable subject | **implemented** | `tests/plugins/test_p11_rules.py`; the guard also runs against the real registry when present |
+| `route_into_off_filter` / `wave_frame_needs_multiframe_wavetable` guards | **not enforceable from measured data** — *superseded for the first rule by Addendum 3* | the registry has no destination families; the second rule is informational by its own declaration → disclosed, never fired. Addendum 3 then made the **first** rule a refusal on the decidable subject (creating a pair); the second remains informational and has never fired |
+| Structural DISABLE set writing display names as document paths | **defect found and fixed** | measured: 13 phantom keys created, no real setting changed (fixture), and the captured live document has 781 settings keys, none containing a space. Targets now resolve through the profile's measured bindings; unaddressable/unjustifiable targets are typed refusals (L-9) |
+| "Every DISABLE candidate the plan keeps on" comparison | **defect found and fixed** | the comparison used `str(control_dict)`, so it never matched and every candidate was disabled regardless |
+| Live write re-verification after this remediation | **deliberately not run** | the owner's brief forbids live mutations by default; the changes are covered by mocks, and the last live-write evidence (P8.3/P8.4/P10, 20:44–21:12) **predates** this remediation - recorded, not glossed |
+
+---
+
+## Addendum 3 — safety-gate correction (2026-10-11)
+
+Owner decisions 6a/6b ([19 §9](19-owner-decisions.md)): two fail-closed contradictions were closed.
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| `route_into_off_filter` disclosed but not gated while route changes were allowed | **corrected**: creating a pair is refused before the first write, for `dry_run` true and false, from `plugin_write` and `plugin_modulation` | `tests/plugins/test_p12_safety_gates.py`; guard derived from the codec's own route representation; **no invented destination mapping**, the rule is refused rather than faked |
+| the gate's subject had to be read from every representation | **implemented**: `routes_create`, `routes_update` naming source/destination, state writes under the route table (including the table and a whole slot), and a world counting creates without specs | same file; `VC.make_routing`/`clear_routing` outputs are cross-checked against the guard so the two cannot drift |
+| route creation availability with Vital | **blocked** (new limitation **L-10**) | the deciding inputs do not exist in the registry (destination families) or in the projected world (the filter flag) → recorded, not guessed |
+| a token-carrying mutation accepted while continuity is unprovable | **corrected**: `IdentityContinuityUnprovable` before any host work, both surfaces, `dry_run` included | same file; reads keep accepting the token, location-addressed mutations stay available |
+| `plugin_instances` workflow | **unchanged for addressing**: `data.instances[]` (location + identity) is the documented way to address a mutation; the token in `meta` is for reads/diagnostics | [05 §5](05-universal-core-contract.md), [06](06-mcp-tool-contracts.md) |
+| live suite | **updated to the new policy, not run** | `test_p8_live_write.py` writes a document-only leaf now; `test_p10_acceptance.py` asserts the route refusal; both must be re-run under owner authorisation |
+| new error code | `IdentityContinuityUnprovable` added to the closed taxonomy | [05 §7](05-universal-core-contract.md), `tests/plugins/test_p0_contracts.py` |

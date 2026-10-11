@@ -1,0 +1,50 @@
+{
+ "_meta": {
+  "kind": "recorded measurements of the live Vital state chunk",
+  "note": "the full chunk bytes were not archived; this pins every recorded measurement plus item A, the 184-byte item-B prefix and the 40-byte trailer, so a fixture built from them has the recorded layout",
+  "source": "C:\\REAPER\\prompts\\vital_sound_design\\logs\\b4_state_blob.json",
+  "source_sha256": "526d5f682c867b6b7a522144eaed88d73e11022cfd2369fb77a0d83da9517e36"
+ },
+ "b64_artifact": "AAAAAAAA",
+ "b64_width": 280,
+ "b_trailer_len": 40,
+ "b_trailer_repr": "b'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00JUCEPrivateData\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'",
+ "chunk_len": 253482,
+ "end_line": 866,
+ "item_a_bytes": 44,
+ "item_a_chars": 60,
+ "item_a_hex": "a0e38a6eee5eedfe00000000020000000100000000000000020000000000000020ac020001000000ffff0000",
+ "item_b_bytes": 175136,
+ "item_b_chars": 233524,
+ "item_b_prefix_hex": "10ac0200010000005673745700000008000000010000000043636e4b0002abf8464243680000000256697461000105050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002ab60",
+ "item_b_trailer_hex": "00000000000000000000000000000000004a55434550726976617465446174610000000000000000",
+ "json_bytes": 174912,
+ "json_offset_in_B": 184,
+ "length_fields": {
+  "A[0x20:0x24]": "little-endian u32 = len(item B)",
+  "B[0x00:0x04]": "little-endian u32 = len(item B) - 16"
+ },
+ "modulations_count": 64,
+ "roundtrip": {
+  "B_identical": true,
+  "b64_identical": false,
+  "json_identical": true,
+  "json_len_orig": 174912,
+  "json_len_ours": 174912
+ },
+ "settings_count": 781,
+ "top_keys": [
+  "author",
+  "comments",
+  "macro1",
+  "macro2",
+  "macro3",
+  "macro4",
+  "preset_name",
+  "preset_style",
+  "settings",
+  "synth_version",
+  "tuning"
+ ],
+ "vst_line": 29
+}

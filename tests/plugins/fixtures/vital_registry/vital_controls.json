@@ -1,0 +1,144 @@
+{
+ "_meta": {
+  "generated_by": "tests/plugins/fixtures/build_vital_fixtures.py (manual refresh)",
+  "kind": "pinned subset of a generated registry file",
+  "note": "control rows for the chosen indices only",
+  "source": "C:\\REAPER\\prompts\\vital_sound_design\\registry\\vital_controls.json",
+  "source_sha256": "fd9649b1d2210a37c09c08cf7252e4b15f52f7b4069da3de1ea4b72b535e8ae9"
+ },
+ "controls": [
+  {
+   "control": "Beats Per Minute",
+   "duplicate_name": false,
+   "formatted_now": "120",
+   "index": 0,
+   "likely_discrete": false,
+   "module": "Global",
+   "normalized_now": 0.357143,
+   "parameter": "Beats Per Minute"
+  },
+  {
+   "control": "Filter Cutoff",
+   "duplicate_name": false,
+   "formatted_now": "60",
+   "index": 1,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.40625,
+   "parameter": "Chorus Filter Cutoff"
+  },
+  {
+   "control": "Delay 1",
+   "duplicate_name": false,
+   "formatted_now": "1.95312ms",
+   "index": 2,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.229561,
+   "parameter": "Chorus Delay 1"
+  },
+  {
+   "control": "Delay 2",
+   "duplicate_name": false,
+   "formatted_now": "7.8125 ms",
+   "index": 3,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.688683,
+   "parameter": "Chorus Delay 2"
+  },
+  {
+   "control": "Mix",
+   "duplicate_name": false,
+   "formatted_now": "50%",
+   "index": 4,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.5,
+   "parameter": "Chorus Mix"
+  },
+  {
+   "control": "Feedback",
+   "duplicate_name": false,
+   "formatted_now": "40%",
+   "index": 5,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.710526,
+   "parameter": "Chorus Feedback"
+  },
+  {
+   "control": "Tempo",
+   "duplicate_name": false,
+   "formatted_now": "4/1",
+   "index": 10,
+   "likely_discrete": false,
+   "module": "Chorus",
+   "normalized_now": 0.4,
+   "parameter": "Chorus Tempo"
+  },
+  {
+   "control": "Filter Blend",
+   "duplicate_name": false,
+   "formatted_now": "0",
+   "index": 40,
+   "likely_discrete": false,
+   "module": "Distortion",
+   "normalized_now": 0.0,
+   "parameter": "Distortion Filter Blend"
+  },
+  {
+   "control": "Cutoff",
+   "duplicate_name": false,
+   "formatted_now": "76 semitones",
+   "index": 104,
+   "likely_discrete": false,
+   "module": "Filter 1",
+   "normalized_now": 1.0,
+   "parameter": "Filter 1 Cutoff"
+  },
+  {
+   "control": "Frequency",
+   "duplicate_name": false,
+   "formatted_now": "0.5 secs",
+   "index": 157,
+   "likely_discrete": false,
+   "module": "LFO 1",
+   "normalized_now": 0.5,
+   "parameter": "LFO 1 Frequency"
+  },
+  {
+   "control": "Unison Detune",
+   "duplicate_name": false,
+   "formatted_now": "20%",
+   "index": 395,
+   "likely_discrete": false,
+   "module": "Oscillator 1",
+   "normalized_now": 0.447214,
+   "parameter": "Oscillator 1 Unison Detune"
+  },
+  {
+   "control": "Decay Time",
+   "duplicate_name": false,
+   "formatted_now": "1 secs",
+   "index": 439,
+   "likely_discrete": false,
+   "module": "Reverb",
+   "normalized_now": 0.5,
+   "parameter": "Reverb Decay Time"
+  },
+  {
+   "control": "Volume",
+   "duplicate_name": false,
+   "formatted_now": "-6.0028dB",
+   "index": 462,
+   "likely_discrete": false,
+   "module": "Global",
+   "normalized_now": 0.74,
+   "parameter": "Volume"
+  }
+ ],
+ "fx": "VST3i: Vital (Vital Audio)",
+ "n_params_total": 2858,
+ "n_real_controls": 778
+}

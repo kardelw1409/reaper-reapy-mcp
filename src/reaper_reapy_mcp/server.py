@@ -16,6 +16,7 @@ from controllers.project_controller import ProjectController
 from controllers.track_controller import TrackController
 from controllers.base_controller import BaseController
 from mcp_tools import setup_mcp_tools
+from reaper_reapy_mcp.plugins import setup_plugin_tools
 
 
 class ReaperController(
@@ -39,6 +40,10 @@ def create_server(debug: bool = True) -> FastMCP:
     controller = ReaperController(debug=debug)
     mcp = FastMCP("Reaper Control")
     setup_mcp_tools(mcp, controller)
+    # Universal Plugin Layer V3 (13 §3): ONE line, unconditional registration
+    # (AUD-013). It adds the 7 `plugin_*` tools and touches nothing else: with no
+    # provider configured every plugin tool answers a typed `UnsupportedProvider`.
+    setup_plugin_tools(mcp)
     return mcp
 
 

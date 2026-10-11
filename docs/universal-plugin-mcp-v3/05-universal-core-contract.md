@@ -151,7 +151,7 @@ and the complete outcome ([06 §2](06-mcp-tool-contracts.md)).
 | `rollback` | object | `{attempted, verified, channels: {state: bool, parameters: bool}, why}` — an **attempted** rollback is not a **verified** one |
 | `channels` | object | per-channel reports (`state`, `parameters`) with rows and mismatches |
 | `host` | object | `{reads, write_calls_attempted, write_effects_verified, write_effects_unknown}` — see accounting rules below |
-| `named_gaps` | array | diagnostics; in V1 an entry here accompanies a **refusal**, never a permitted write (principle 6) |
+| `named_gaps` | array | diagnostics; in V1 an entry here accompanies a **refusal**, never a permitted write (principle 6) - with **one contract-defined exception** (2026-10-10): a capture that deliberately excludes a provider-declared plugin-derived leaf names that exclusion (`derived_leaf_not_restored`) on every path where a restore ran, including one that restored everything else successfully. The same fact has exactly two representations: `derived_excluded` is the **mechanism** (which leaves the restore set leaves out) and the named gap is the **consequence**. `rollback.verified` (the writes landed) and `rollback.complete` (the set covered the whole capture) are reported separately |
 
 **Host accounting rules (normative):**
 - `write_calls_attempted` counts every write verb invoked on the host. A refusal is reported as
@@ -299,6 +299,25 @@ same slot matches every field.
   where the evidence cannot distinguish, the contract **fails closed**: the operation refuses when
   the distinguishing evidence is absent or ambiguous, and the limitation is reported in the
   refusal. No guarantee is claimed that cannot be established.
+- **Measured, 2026-10-10 (P8 `p8_l3_identity__20261010T203101Z`):** the host does **not** distinguish
+  it. Removing an FX and re-adding the same build at the same slot reproduced the same handle
+  (`handle_changed: false`) while a different slot reported a different one, and the build facts
+  (class id, module, name, parameter count) came back identical. The artifact records **no datum the
+  host exposes** that separates the replacement from the original - and it records no *ordinal or
+  state-digest comparison of the replacement*; the digests it does carry
+  (`original_block_digest`/`original_vector_digest` with `original_block_unchanged: true`) are there
+  to show the addressed instance never moved, which is a different question. So the token's question
+  ("is this still the exact instance I resolved?") **cannot be answered** for an identical-build
+  replacement.
+- **Consequence, binding since the owner's safety-gate correction (2026-10-11):** a
+  **caller-supplied token is refused for any mutation** (`IdentityContinuityUnprovable`, before any
+  host work), because accepting it would let the caller's belief stand in for verification - the
+  same class of defect as an accepted `force`. The remedy is stated in the refusal: address the
+  instance **by location** (or by the object `plugin_instances` returns in `data.instances[]`),
+  which is a present-tense claim the layer verifies inside the call (complete capture, per-unit
+  revalidation, write, verified read-back, verified restore). Reads keep accepting the token,
+  because a read makes no write claim; a token whose facts disagree with the host is still
+  `TargetChanged`.
 - The token must **not** depend on a mutable state digest in a way that invalidates it after the
   transaction's own successful writes; token = instance identity, revision = state.
 
@@ -328,7 +347,7 @@ retargets; the caller gets `StaleInstance` plus the single new candidate ref (if
 | Unit/space mismatch (e.g. % trap) | refusal/flag per provider declaration |
 | Enum member unknown | refusal listing legal values |
 | Control not writable / not readable | refusal naming the capability |
-| Route vocabulary violation | provider policy refusal, `force` parameter is the single explicit override (echoed in result) |
+| Route vocabulary violation | provider policy refusal; **V1 has no override** - `force=true` is itself refused (`UnsupportedOverride`), so a caller is never told a policy was overridden when it was not (owner Decision 4, 2026-10-10) |
 | State path not rooted at a declared key | refusal (POC `DOCUMENT_TOP_KEYS` guard [A]) |
 | Missing required arg | tool-level refusal, no dispatch (POC server `SPEC.required` [A]) |
 
@@ -341,12 +360,16 @@ Ported from POC `errors.py` [A], renamed into three families for the merged repo
 
 **Domain / resolution (raised by Core/Provider):** `InstanceNotFound`, `AmbiguousInstance`,
 `StaleInstance`, `WrongPlugin`, `VersionMismatch`, `UnsupportedControl`, `InvalidValue`,
-`NoConversion`, `InvalidRoute`, `InvalidSourceFamily` (policy), `DependencyViolation`,
-`IncompatibleSettings`, `PlanError`, `UnsupportedProvider` (no applicable provider configured),
-`TargetSliceAmbiguous` (AUD-001: state block cannot be uniquely correlated to the target).
+`NoConversion`, `InvalidRoute`, `InvalidSourceFamily` (policy), `UnsupportedOverride` (an
+override/escape argument V1 does not implement - the request is refused before any host work),
+`DependencyViolation`, `IncompatibleSettings`, `PlanError`, `UnsupportedProvider` (no applicable
+provider configured), `TargetSliceAmbiguous` (AUD-001: state block cannot be uniquely correlated
+to the target).
 
 **Conflict / identity (Phase C, AUD-003/AUD-010):** `TargetChanged` (token stale or mismatched —
-never a silent re-target), `StateConflict` (expected revision disagrees with the live state),
+never a silent re-target), `IdentityContinuityUnprovable` (a mutation rested on instance continuity
+the host cannot prove — the token-carrying case above; refused before any host work),
+`StateConflict` (expected revision disagrees with the live state),
 `SnapshotUnavailable` (complete capture impossible ⇒ mutation refused before first write).
 
 **Write outcomes (raised/reported by Transaction):** `WriteNotApplied`, `StateMismatch`,

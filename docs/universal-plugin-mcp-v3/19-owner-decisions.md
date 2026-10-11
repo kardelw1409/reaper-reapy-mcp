@@ -385,9 +385,98 @@ them and the tests must measure them. Each is recorded where it constrains the d
 |---|---|---|---|---|
 | L-1 | REAPER's APIs expose no compare-and-swap or transactional write, so a check-then-write race with an external writer cannot be eliminated | host capability | best-effort detection, fail-closed refusals, truthful partial/unknown outcomes, no blind rollback (Decision 3) | [11 §7](11-planning-transactions-and-verification.md) |
 | L-2 | The MCP process does not start when REAPER is closed; a server that never started returns nothing at invocation level | pre-existing lifecycle | documented consequence, no promise the process cannot keep, plugin layer adds no eager connection (Decision 4) | [13 §4, §6](13-existing-mcp-integration.md) |
-| L-3 | Identical-build plugin replacement may be indistinguishable to the host; only measured host evidence decides | host evidence gap | measured at P3 (`TrackFX_GetFXGUID` behaviour); fail closed where indistinguishable | [12 §5 B-38…B-43](12-testing-strategy.md) |
+| L-3 | Identical-build plugin replacement may be indistinguishable to the host; only measured host evidence decides | host evidence gap | **measured 2026-10-10** (P8 `p8_l3_identity__20261010T203101Z`): a repopulated slot reproduced the **same** handle, so a replacement is indistinguishable. Enforced: every *observable* difference refuses before the first write, and every response states that instance continuity is **not claimed** (`meta.identity_basis`). No test or document may claim such a replacement is detected | [12 §5 B-38](12-testing-strategy.md), [16](16-independent-review-checklist.md) |
 | L-4 | Full parameter-vector capture cost is not yet measured (feasibility is evidenced, cost is not) | unmeasured | measured at P5 on the mock/captured corpus and at P8 live; the guarantee does not depend on the number | [11 §2.3](11-planning-transactions-and-verification.md), [17 AV-12](17-planning-evidence-index.md) |
 | L-5 | V1 supports only measured plugin versions and formats (Vital 1.5.5 VST3); VST2 and unmeasured versions fail closed | V1 scope | typed refusals with the measured set in profile `limits[]`; no override flag | [07 §3.2](07-capability-profile-schema.md), Q-03/Q-11 (`§5`) |
 | L-6 | Modulated/derived values cannot always be attributed: a parameter's live value may reflect modulation rather than its stored value | plugin semantics | the codec declares read/write authority per field; modulation depth is a declared capability, refusals are first-class data | [05 §4](05-universal-core-contract.md), [10](10-state-modulation-dependencies.md) |
 | L-7 | State splice byte-fidelity is proven only on captured chunks until a live multi-block write is measured | unmeasured | P5 proves it on captured chunks; P8's live multi-block case is the acceptance gate | [12 §5 B-26…B-31](12-testing-strategy.md), [15 R-21](15-risks-and-open-questions.md) |
 | L-8 | Multi-step structural writes are multiple host calls; a transport failure between them is observable but not preventable | host capability | per-unit records, per-channel verified rollback, `unknown` where the effect is unknowable | [11 §5](11-planning-transactions-and-verification.md) |
+| L-9 | Vital's oscillator distortion-type **value space** is unmeasured (no enum members, `law: none`), so the provider cannot justify the DISABLE set's `"None"` off value for those three settings | unmeasured registry data | a structural change refuses with `disable_value_not_measurable` naming the target, instead of writing a display value into a numeric field; the fix is a measurement (or a decision to drop those targets), not a guess | [10 §2.3a](10-state-modulation-dependencies.md), [18 addendum](18-remediation-register.md) |
+| L-10 | **Route creation is unavailable with Vital in V1**: the rule `route_into_off_filter` cannot be evaluated (the registry carries no destination families; the filter on/off flag is live-document state the projected world does not carry), so creating a `(source, destination)` pair is refused | missing measured input | the refusal is typed and explicit (`DependencyViolation` / `unevaluated: ["route_into_off_filter"]`, zero writes); removal, amount-only updates and pair-clearing writes stay available. Lifting it needs one of: a measured destination-family table in the registry, or a Core change handing the dependency hook the decoded document (the shape of the accepted P8 `document_version` hook) | [10 §2.3a](10-state-modulation-dependencies.md), [19 §9](19-owner-decisions.md), [18 addendum 3](18-remediation-register.md) |
+| L-11 | **A session write-target token cannot be used for a mutation**: the token's claim (instance continuity) is unprovable on this host, so it is refused rather than honoured | host evidence gap (the L-3 measurement) | `IdentityContinuityUnprovable` before any host work, with the remedy in the refusal (address by location); reads keep the token; the guarantee for a location-addressed mutation is in-call (capture, revalidate, write, verify, restore) and is disclosed in `meta.identity_basis` | [05 §5](05-universal-core-contract.md), [19 §9](19-owner-decisions.md) |
+
+---
+
+## 8. Release-review decisions (2026-10-10, after P0–P10)
+
+The owner reviewed the P8–P10 report and the independent audit and returns **five** decisions. They
+are binding for the release-review remediation and are recorded here rather than in a commit message.
+
+**Decision 5a — unevaluated Vital dependency rules.** Do not implement the three live-flag rules by
+guesswork and do not change refusal behaviour for the appearance of completeness. Keep the honest
+`evaluated: false` status; refuse **only** where the rule's subject is decidable and its deciding
+input is not; disclose the rest. *Consequence implemented:* the FM-subject guard, the disclosure in
+every mutation response, and the `disable_targets` refusal (L-9) - see
+[10 §2.3a](10-state-modulation-dependencies.md).
+
+**Decision 5b — the plugin-owned derived leaf.** Keep the limitation. It is never a write target, the
+captured bytes are never written back blindly, and the exclusion is reported as the named gap
+`derived_leaf_not_restored` on every path where a restore ran - including a restore that brought
+everything else back. `verified` and `complete` are separate claims.
+
+**Decision 5c — identity at replacement.** Keep the fail-closed posture **and** stop implying the
+token settles it: what is decidable (caller-supplied identity, session token, build/handle/state
+differences) is enforced with a typed refusal before the first write; what is not decidable (an
+identical-build replacement) is disclosed as `not_claimed` and recorded as L-3. No new live
+replacement experiment was run for this review.
+
+**Decision 5d — `force`.** No override in V1: `force=true` is a typed refusal before any host work,
+a wrong type for the argument is `InvalidValue`, and the schema documents it. Nothing in the response
+may suggest a policy was overridden.
+
+**Decision 5e — gap reporting.** One fact, one meaning: `derived_excluded` = mechanism, named gap =
+consequence; both are checked against each other by tests; the gap must survive the Core → MCP
+envelope boundary (tested at the registered tool).
+
+---
+
+## 9. Safety-gate correction (2026-10-11, after the release-review report)
+
+Two contradictions remained between the fail-closed policy and the code, and the owner returned them
+as a **correction** rather than a new phase. Both are binding.
+
+**Decision 6a — `route_into_off_filter` is now a gate, not a disclosure.** Route changes were
+allowed while the rule was declared but not evaluated. That is the exact shape a fail-closed layer
+must not have, so creating a modulation `(source, destination)` pair is **refused before the first
+write**, from every surface and through every representation:
+
+- `routes_create[*]` (a new pair) and `routes_update[*]` that names a non-empty `source`/`destination`;
+- a state write under the codec's route table that does not **clear** a pair field - including
+  writing the whole table or a whole slot, so the state channel cannot bypass the route API;
+- a projected world that counts creates without carrying their specs (not decidable ⇒ refused);
+- the refusal is `DependencyViolation` with `detail.unevaluated: ["route_into_off_filter"]`, the
+  per-finding `evaluated: false`, `write_calls_attempted: 0` and `REFUSED_BEFORE_ANY_WRITE` - and it
+  is **identical for `dry_run: true` and `false`**, so a preview never presents it as applicable.
+
+Operations whose safety provably does not depend on the rule stay available: `routes_remove[*]`,
+`routes_update[*]` without source/destination, a state write that clears a pair field, state writes
+outside the route table, and every read-only operation. The guard is derived from the codec's own
+layout (`parse_route_pair_path` / `addresses_route_table`) rather than from a hand-typed name list,
+and a test ties the two together. **No destination mapping was invented**, and the rule is not
+presented as evaluated: it is refused. Consequence recorded as **L-10**: with Vital's rule table,
+route *creation* is unavailable until the deciding inputs exist (a measured destination-family table,
+or a Core change handing the dependency hook the live document - the same shape as the accepted P8
+version hook).
+
+**Decision 6b — a token-carrying mutation is refused.** `not_claimed: ["instance_continuity"]` is a
+disclosure, not a protection. A caller-supplied write-target token claims *the instance that was
+validated*, and the host cannot prove that claim (measured: an identical-build replacement reproduces
+handle and the same build facts; the artifact records no exposed datum that separates them). The layer therefore refuses such a mutation with
+`IdentityContinuityUnprovable` **before any host work**, for every mutation on both surfaces, and
+states the remedy: address the instance by location (or by the `data.instances[]` object), which is a
+present-tense claim it can verify inside the call. Reads keep accepting the token; a token whose
+facts disagree is still `TargetChanged`.
+
+**Which mutations remain available, and on what basis** (the owner asked for this explicitly):
+
+| Mutation | Available? | Basis |
+|---|---|---|
+| parameter write, location-addressed | yes | in-call: complete capture, per-unit revalidation, write, verified read-back, verified restore |
+| state write to a non-route path, location-addressed | yes | same |
+| route removal / amount-only update / pair-clearing write | yes | the unevaluated route rule's subject (a created pair) is not entered |
+| route creation (any spelling) | **no** | the rule is unevaluable → Decision 6a |
+| any mutation carrying a token or an uncomparable identity claim | **no** | continuity is unprovable → Decision 6b |
+| every read-only operation | yes | reads make no write claim |
+
+No new live experiment was run for this correction: it is reproduced in mocks from the existing L-3
+evidence (`p8_l3_identity__20261010T203101Z`) and the measured rule table.

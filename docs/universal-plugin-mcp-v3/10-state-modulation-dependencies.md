@@ -94,8 +94,36 @@ transaction, outcome reporting). Unknown/unsupported state ops are typed refusal
 ### 2.3 Route vocabulary policy
 
 - Providers may declare source/destination vocabularies and family rules (Vital: 31 sources,
-  316 destinations, "no LFO → `modulation_N_amount`" from zero corpus precedent) with the
-  POC's escape shape: a single explicit `force` flag, echoed in the result, never a default [A].
+  316 destinations, "no LFO → `modulation_N_amount`" from zero corpus precedent). The POC's `force`
+  escape is **declared but not implemented in V1**: `force=true` answers `UnsupportedOverride` before
+  any host work, so a policy refusal is never presented as overridable (owner Decision 4, 2026-10-10).
+
+### 2.3a Dependency rules the provider declares but does not evaluate (2026-10-10, extended 2026-10-11)
+
+A rule the provider cannot decide must never be presented as checked. In the profile and in every
+mutation response the rules carry `evaluated: false` with the input each would need, and the response
+names them (`dependency_rules_not_evaluated`), so an empty findings list is never read as "everything
+was checked". Where a rule's **subject** is decidable and its deciding input is not, the subject is
+**guarded**: a plan that enters it is refused before the first write with the rule and the missing
+input named, and the refusal says *unevaluable* rather than *unmet*.
+
+**Two guards are enforceable** (both derived from measured data, never hand-typed):
+
+| Rule | Subject (decided) | Deciding input (missing) | Guard |
+|---|---|---|---|
+| `fm_needs_modulator` | a plan that changes an oscillator distortion **type** (spelled either way: the profile's measured `state_key`, or the DISABLE table's own name for it) | the other oscillator's level | refuse the subject |
+| `route_into_off_filter` | a plan that **creates** a `(source, destination)` pair: `routes_create[*]`, `routes_update[*]` naming a non-empty `source`/`destination`, or a state write under `settings.modulations` that does not clear a pair field (the codec's own layout, parsed by the codec), **plus** a world that counts creates without carrying their specs | whether the destination is a filter input (the registry carries no destination families) and whether that filter is on (a live-document flag) | refuse the subject |
+
+`wave_frame_needs_multiframe_wavetable` stays unguarded: the measured table itself declares it
+informational, so refusing on it would harden the provider's own declaration. It is disclosed and
+never fired (owner Decision 1; route guard added by the owner's safety-gate correction, Decision 6a).
+
+**What the route guard deliberately does not refuse** (its safety provably does not depend on the
+rule, so blocking it would be blocking for the appearance of completeness): `routes_remove[*]`,
+`routes_update[*]` that carries no `source`/`destination` (an amount/power/curve change on an
+existing pair), a state write that **clears** a pair field (an empty value removes a pairing), state
+writes outside the route table (e.g. `settings.modulation_<n>_amount`), and every read-only
+operation (`list`, `depth`, `plugin_state`, `plugin_read`, `plugin_find`, `plugin_describe`).
 
 ### 2.4 Known provider limit (Vital, V1)
 

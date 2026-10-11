@@ -1,0 +1,605 @@
+{
+ "author": "pinned-fixture",
+ "comments": "a Vital-shaped document with the recorded top-level keys",
+ "macro1": 0.0,
+ "macro2": 0.0,
+ "macro3": 0.0,
+ "macro4": 0.0,
+ "preset_name": "Pinned Fixture",
+ "preset_style": "Init",
+ "settings": {
+  "beats_per_minute": 0.0,
+  "chorus_cutoff": 0.0,
+  "chorus_delay_1": 0.0,
+  "chorus_delay_2": 0.0,
+  "chorus_dry_wet": 0.0,
+  "chorus_feedback": 0.0,
+  "chorus_tempo": 0.0,
+  "distortion_filter_blend": 0.0,
+  "filter_1_cutoff": 0.0,
+  "lfo_1_frequency": 0.0,
+  "modulation_10_amount": 0.0,
+  "modulation_10_bipolar": 0.0,
+  "modulation_10_bypass": 0.0,
+  "modulation_10_power": 1.0,
+  "modulation_10_stereo": 0.0,
+  "modulation_11_amount": 0.0,
+  "modulation_11_bipolar": 0.0,
+  "modulation_11_bypass": 0.0,
+  "modulation_11_power": 1.0,
+  "modulation_11_stereo": 0.0,
+  "modulation_12_amount": 0.0,
+  "modulation_12_bipolar": 0.0,
+  "modulation_12_bypass": 0.0,
+  "modulation_12_power": 1.0,
+  "modulation_12_stereo": 0.0,
+  "modulation_13_amount": 0.0,
+  "modulation_13_bipolar": 0.0,
+  "modulation_13_bypass": 0.0,
+  "modulation_13_power": 1.0,
+  "modulation_13_stereo": 0.0,
+  "modulation_14_amount": 0.0,
+  "modulation_14_bipolar": 0.0,
+  "modulation_14_bypass": 0.0,
+  "modulation_14_power": 1.0,
+  "modulation_14_stereo": 0.0,
+  "modulation_15_amount": 0.0,
+  "modulation_15_bipolar": 0.0,
+  "modulation_15_bypass": 0.0,
+  "modulation_15_power": 1.0,
+  "modulation_15_stereo": 0.0,
+  "modulation_16_amount": 0.0,
+  "modulation_16_bipolar": 0.0,
+  "modulation_16_bypass": 0.0,
+  "modulation_16_power": 1.0,
+  "modulation_16_stereo": 0.0,
+  "modulation_17_amount": 0.0,
+  "modulation_17_bipolar": 0.0,
+  "modulation_17_bypass": 0.0,
+  "modulation_17_power": 1.0,
+  "modulation_17_stereo": 0.0,
+  "modulation_18_amount": 0.0,
+  "modulation_18_bipolar": 0.0,
+  "modulation_18_bypass": 0.0,
+  "modulation_18_power": 1.0,
+  "modulation_18_stereo": 0.0,
+  "modulation_19_amount": 0.0,
+  "modulation_19_bipolar": 0.0,
+  "modulation_19_bypass": 0.0,
+  "modulation_19_power": 1.0,
+  "modulation_19_stereo": 0.0,
+  "modulation_1_amount": -0.25,
+  "modulation_1_bipolar": 0.0,
+  "modulation_1_bypass": 0.0,
+  "modulation_1_power": 1.0,
+  "modulation_1_stereo": 0.0,
+  "modulation_20_amount": 0.0,
+  "modulation_20_bipolar": 0.0,
+  "modulation_20_bypass": 0.0,
+  "modulation_20_power": 1.0,
+  "modulation_20_stereo": 0.0,
+  "modulation_21_amount": 0.0,
+  "modulation_21_bipolar": 0.0,
+  "modulation_21_bypass": 0.0,
+  "modulation_21_power": 1.0,
+  "modulation_21_stereo": 0.0,
+  "modulation_22_amount": 0.0,
+  "modulation_22_bipolar": 0.0,
+  "modulation_22_bypass": 0.0,
+  "modulation_22_power": 1.0,
+  "modulation_22_stereo": 0.0,
+  "modulation_23_amount": 0.0,
+  "modulation_23_bipolar": 0.0,
+  "modulation_23_bypass": 0.0,
+  "modulation_23_power": 1.0,
+  "modulation_23_stereo": 0.0,
+  "modulation_24_amount": 0.0,
+  "modulation_24_bipolar": 0.0,
+  "modulation_24_bypass": 0.0,
+  "modulation_24_power": 1.0,
+  "modulation_24_stereo": 0.0,
+  "modulation_25_amount": 0.0,
+  "modulation_25_bipolar": 0.0,
+  "modulation_25_bypass": 0.0,
+  "modulation_25_power": 1.0,
+  "modulation_25_stereo": 0.0,
+  "modulation_26_amount": 0.0,
+  "modulation_26_bipolar": 0.0,
+  "modulation_26_bypass": 0.0,
+  "modulation_26_power": 1.0,
+  "modulation_26_stereo": 0.0,
+  "modulation_27_amount": 0.0,
+  "modulation_27_bipolar": 0.0,
+  "modulation_27_bypass": 0.0,
+  "modulation_27_power": 1.0,
+  "modulation_27_stereo": 0.0,
+  "modulation_28_amount": 0.0,
+  "modulation_28_bipolar": 0.0,
+  "modulation_28_bypass": 0.0,
+  "modulation_28_power": 1.0,
+  "modulation_28_stereo": 0.0,
+  "modulation_29_amount": 0.0,
+  "modulation_29_bipolar": 0.0,
+  "modulation_29_bypass": 0.0,
+  "modulation_29_power": 1.0,
+  "modulation_29_stereo": 0.0,
+  "modulation_2_amount": 0.0,
+  "modulation_2_bipolar": 0.0,
+  "modulation_2_bypass": 0.0,
+  "modulation_2_power": 1.0,
+  "modulation_2_stereo": 0.0,
+  "modulation_30_amount": 0.0,
+  "modulation_30_bipolar": 0.0,
+  "modulation_30_bypass": 0.0,
+  "modulation_30_power": 1.0,
+  "modulation_30_stereo": 0.0,
+  "modulation_31_amount": 0.0,
+  "modulation_31_bipolar": 0.0,
+  "modulation_31_bypass": 0.0,
+  "modulation_31_power": 1.0,
+  "modulation_31_stereo": 0.0,
+  "modulation_32_amount": 0.0,
+  "modulation_32_bipolar": 0.0,
+  "modulation_32_bypass": 0.0,
+  "modulation_32_power": 1.0,
+  "modulation_32_stereo": 0.0,
+  "modulation_33_amount": 0.0,
+  "modulation_33_bipolar": 0.0,
+  "modulation_33_bypass": 0.0,
+  "modulation_33_power": 1.0,
+  "modulation_33_stereo": 0.0,
+  "modulation_34_amount": 0.0,
+  "modulation_34_bipolar": 0.0,
+  "modulation_34_bypass": 0.0,
+  "modulation_34_power": 1.0,
+  "modulation_34_stereo": 0.0,
+  "modulation_35_amount": 0.0,
+  "modulation_35_bipolar": 0.0,
+  "modulation_35_bypass": 0.0,
+  "modulation_35_power": 1.0,
+  "modulation_35_stereo": 0.0,
+  "modulation_36_amount": 0.0,
+  "modulation_36_bipolar": 0.0,
+  "modulation_36_bypass": 0.0,
+  "modulation_36_power": 1.0,
+  "modulation_36_stereo": 0.0,
+  "modulation_37_amount": 0.0,
+  "modulation_37_bipolar": 0.0,
+  "modulation_37_bypass": 0.0,
+  "modulation_37_power": 1.0,
+  "modulation_37_stereo": 0.0,
+  "modulation_38_amount": 0.0,
+  "modulation_38_bipolar": 0.0,
+  "modulation_38_bypass": 0.0,
+  "modulation_38_power": 1.0,
+  "modulation_38_stereo": 0.0,
+  "modulation_39_amount": 0.0,
+  "modulation_39_bipolar": 0.0,
+  "modulation_39_bypass": 0.0,
+  "modulation_39_power": 1.0,
+  "modulation_39_stereo": 0.0,
+  "modulation_3_amount": 0.0,
+  "modulation_3_bipolar": 0.0,
+  "modulation_3_bypass": 0.0,
+  "modulation_3_power": 1.0,
+  "modulation_3_stereo": 0.0,
+  "modulation_40_amount": 0.0,
+  "modulation_40_bipolar": 0.0,
+  "modulation_40_bypass": 0.0,
+  "modulation_40_power": 1.0,
+  "modulation_40_stereo": 0.0,
+  "modulation_41_amount": 0.0,
+  "modulation_41_bipolar": 0.0,
+  "modulation_41_bypass": 0.0,
+  "modulation_41_power": 1.0,
+  "modulation_41_stereo": 0.0,
+  "modulation_42_amount": 0.0,
+  "modulation_42_bipolar": 0.0,
+  "modulation_42_bypass": 0.0,
+  "modulation_42_power": 1.0,
+  "modulation_42_stereo": 0.0,
+  "modulation_43_amount": 0.0,
+  "modulation_43_bipolar": 0.0,
+  "modulation_43_bypass": 0.0,
+  "modulation_43_power": 1.0,
+  "modulation_43_stereo": 0.0,
+  "modulation_44_amount": 0.0,
+  "modulation_44_bipolar": 0.0,
+  "modulation_44_bypass": 0.0,
+  "modulation_44_power": 1.0,
+  "modulation_44_stereo": 0.0,
+  "modulation_45_amount": 0.0,
+  "modulation_45_bipolar": 0.0,
+  "modulation_45_bypass": 0.0,
+  "modulation_45_power": 1.0,
+  "modulation_45_stereo": 0.0,
+  "modulation_46_amount": 0.0,
+  "modulation_46_bipolar": 0.0,
+  "modulation_46_bypass": 0.0,
+  "modulation_46_power": 1.0,
+  "modulation_46_stereo": 0.0,
+  "modulation_47_amount": 0.0,
+  "modulation_47_bipolar": 0.0,
+  "modulation_47_bypass": 0.0,
+  "modulation_47_power": 1.0,
+  "modulation_47_stereo": 0.0,
+  "modulation_48_amount": 0.0,
+  "modulation_48_bipolar": 0.0,
+  "modulation_48_bypass": 0.0,
+  "modulation_48_power": 1.0,
+  "modulation_48_stereo": 0.0,
+  "modulation_49_amount": 0.0,
+  "modulation_49_bipolar": 0.0,
+  "modulation_49_bypass": 0.0,
+  "modulation_49_power": 1.0,
+  "modulation_49_stereo": 0.0,
+  "modulation_4_amount": 0.0,
+  "modulation_4_bipolar": 0.0,
+  "modulation_4_bypass": 0.0,
+  "modulation_4_power": 1.0,
+  "modulation_4_stereo": 0.0,
+  "modulation_50_amount": 0.0,
+  "modulation_50_bipolar": 0.0,
+  "modulation_50_bypass": 0.0,
+  "modulation_50_power": 1.0,
+  "modulation_50_stereo": 0.0,
+  "modulation_51_amount": 0.0,
+  "modulation_51_bipolar": 0.0,
+  "modulation_51_bypass": 0.0,
+  "modulation_51_power": 1.0,
+  "modulation_51_stereo": 0.0,
+  "modulation_52_amount": 0.0,
+  "modulation_52_bipolar": 0.0,
+  "modulation_52_bypass": 0.0,
+  "modulation_52_power": 1.0,
+  "modulation_52_stereo": 0.0,
+  "modulation_53_amount": 0.0,
+  "modulation_53_bipolar": 0.0,
+  "modulation_53_bypass": 0.0,
+  "modulation_53_power": 1.0,
+  "modulation_53_stereo": 0.0,
+  "modulation_54_amount": 0.0,
+  "modulation_54_bipolar": 0.0,
+  "modulation_54_bypass": 0.0,
+  "modulation_54_power": 1.0,
+  "modulation_54_stereo": 0.0,
+  "modulation_55_amount": 0.0,
+  "modulation_55_bipolar": 0.0,
+  "modulation_55_bypass": 0.0,
+  "modulation_55_power": 1.0,
+  "modulation_55_stereo": 0.0,
+  "modulation_56_amount": 0.0,
+  "modulation_56_bipolar": 0.0,
+  "modulation_56_bypass": 0.0,
+  "modulation_56_power": 1.0,
+  "modulation_56_stereo": 0.0,
+  "modulation_57_amount": 0.0,
+  "modulation_57_bipolar": 0.0,
+  "modulation_57_bypass": 0.0,
+  "modulation_57_power": 1.0,
+  "modulation_57_stereo": 0.0,
+  "modulation_58_amount": 0.0,
+  "modulation_58_bipolar": 0.0,
+  "modulation_58_bypass": 0.0,
+  "modulation_58_power": 1.0,
+  "modulation_58_stereo": 0.0,
+  "modulation_59_amount": 0.0,
+  "modulation_59_bipolar": 0.0,
+  "modulation_59_bypass": 0.0,
+  "modulation_59_power": 1.0,
+  "modulation_59_stereo": 0.0,
+  "modulation_5_amount": 0.0,
+  "modulation_5_bipolar": 0.0,
+  "modulation_5_bypass": 0.0,
+  "modulation_5_power": 1.0,
+  "modulation_5_stereo": 0.0,
+  "modulation_60_amount": 0.0,
+  "modulation_60_bipolar": 0.0,
+  "modulation_60_bypass": 0.0,
+  "modulation_60_power": 1.0,
+  "modulation_60_stereo": 0.0,
+  "modulation_61_amount": 0.0,
+  "modulation_61_bipolar": 0.0,
+  "modulation_61_bypass": 0.0,
+  "modulation_61_power": 1.0,
+  "modulation_61_stereo": 0.0,
+  "modulation_62_amount": 0.0,
+  "modulation_62_bipolar": 0.0,
+  "modulation_62_bypass": 0.0,
+  "modulation_62_power": 1.0,
+  "modulation_62_stereo": 0.0,
+  "modulation_63_amount": 0.0,
+  "modulation_63_bipolar": 0.0,
+  "modulation_63_bypass": 0.0,
+  "modulation_63_power": 1.0,
+  "modulation_63_stereo": 0.0,
+  "modulation_64_amount": 0.0,
+  "modulation_64_bipolar": 0.0,
+  "modulation_64_bypass": 0.0,
+  "modulation_64_power": 1.0,
+  "modulation_64_stereo": 0.0,
+  "modulation_6_amount": 0.0,
+  "modulation_6_bipolar": 0.0,
+  "modulation_6_bypass": 0.0,
+  "modulation_6_power": 1.0,
+  "modulation_6_stereo": 0.0,
+  "modulation_7_amount": 0.0,
+  "modulation_7_bipolar": 0.0,
+  "modulation_7_bypass": 0.0,
+  "modulation_7_power": 1.0,
+  "modulation_7_stereo": 0.0,
+  "modulation_8_amount": 0.0,
+  "modulation_8_bipolar": 0.0,
+  "modulation_8_bypass": 0.0,
+  "modulation_8_power": 1.0,
+  "modulation_8_stereo": 0.0,
+  "modulation_9_amount": 0.0,
+  "modulation_9_bipolar": 0.0,
+  "modulation_9_bypass": 0.0,
+  "modulation_9_power": 1.0,
+  "modulation_9_stereo": 0.0,
+  "modulations": [
+   {
+    "destination": "chorus_delay_1",
+    "source": "lfo_1"
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   },
+   {
+    "destination": "",
+    "source": ""
+   }
+  ],
+  "osc_1_unison_detune": 0.0,
+  "reverb_decay_time": 0.0,
+  "volume": 0.0
+ },
+ "synth_version": "1.5.5",
+ "tuning": {}
+}

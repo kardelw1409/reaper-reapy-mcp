@@ -138,6 +138,53 @@ Available MCP tools:
 - `get_items_in_time_range`: Get items within a time range
   - Supports both time (seconds) and measure:beat positioning
 
+#### Plugin Tools (universal plugin layer)
+
+These tools address parameters and internal state of a specific instrument/effect
+plugin through a **provider** (a profile + codec pair). One provider ships today
+(Vital) and the layer is additive: with no provider configured these tools answer
+with a typed `UnsupportedProvider` refusal instead of failing.
+
+- `plugin_instances`: List the plugin instances on a track (fx index + identity facts)
+- `plugin_describe`: Describe the addressed instance's capability profile (controls, laws, limits)
+- `plugin_find`: Find controls by name or intent, with the live-verified identity of each match
+- `plugin_read`: Read one or more controls (display, native and normalized values)
+- `plugin_write`: Write controls and/or modulation routes — **dry run by default**
+- `plugin_state`: Inspect the plugin's internal document state (settings and routes)
+- `plugin_modulation`: List the modulation slots of the instance
+
+All seven take a target selector (`track_index`, optionally `fx_index`) plus a
+target token where the layer supports one, and every response is the same
+envelope: schema 2, with `error` and `outcome` (`final_state`, `verdict`,
+counters) and the resolved target only in `meta`.
+
+**Safety properties (measured, not aspirational):**
+
+- `dry_run` defaults to **true**; a dry run performs **zero** host write calls and
+  reports `NO_WRITES`.
+- Every write is verified by an **independent read-back**; the verdicts are
+  `ALL_VERIFIED`, `PARTIAL`, `FAILED_AND_RESTORED`, `FAILED_AND_NOT_RESTORED`.
+- A write that cannot be verified is rolled back to the captured state, and the
+  restore is verified (whole parameter vector + document leaves + bytes outside
+  the target span).
+- The plugin declares `state.derived_leaves` — leaves the plugin itself
+  re-encodes. They are refused as write targets and reported as the named gap
+  `derived_leaf_not_restored` on restore.
+- The instance's document version is gated against the provider's measured set;
+  a mismatch refuses rather than writes.
+
+**Provider configuration (environment variables):**
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `REAPER_MCP_PLUGIN_PROVIDERS` | Comma-separated provider ids to enable (e.g. `vital`) | unset ⇒ no providers |
+| `REAPER_MCP_PLUGIN_CACHE` | Directory for the discovery/profile cache | platform cache dir |
+| `REAPER_MCP_VITAL_REGISTRY_DIR` | Vital sound-design registry directory | `C:\REAPER\prompts\vital_sound_design\registry` |
+
+Design and phase documentation lives in
+[`docs/universal-plugin-mcp-v3/`](docs/universal-plugin-mcp-v3/README.md), and the
+per-phase implementation journal in [`IMPLEMENTATION-STATUS.md`](IMPLEMENTATION-STATUS.md).
+
 ### Item ID System
 All item operations use a sequential index system (0..n) for item identification. This makes it easier to work with items in scripts and automation:
 - Item IDs are zero-based indices

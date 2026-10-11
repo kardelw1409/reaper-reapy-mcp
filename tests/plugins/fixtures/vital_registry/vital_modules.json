@@ -1,0 +1,46 @@
+{
+ "_meta": {
+  "generated_by": "tests/plugins/fixtures/build_vital_fixtures.py (manual refresh)",
+  "kind": "pinned subset of a generated registry file",
+  "note": "only the modules the chosen controls belong to",
+  "source": "C:\\REAPER\\prompts\\vital_sound_design\\registry\\vital_modules.json",
+  "source_sha256": "4cd151af7eae77e59424cdd2dc00603ad58880ef0a4ca63c7a3fbce487cf6449"
+ },
+ "modules": {
+  "Chorus": {
+   "controls": 12,
+   "type": "effect"
+  },
+  "Distortion": {
+   "controls": 8,
+   "type": "effect"
+  },
+  "Filter 1": {
+   "controls": 16,
+   "type": "state-variable filter"
+  },
+  "Global": {
+   "controls": 25,
+   "type": "voice / tuning / stereo / oversampling"
+  },
+  "LFO 1": {
+   "controls": 12,
+   "type": "LFO"
+  },
+  "Oscillator 1": {
+   "controls": 30,
+   "type": "wavetable oscillator"
+  },
+  "Reverb": {
+   "controls": 13,
+   "note": "no model/style control exists",
+   "type": "effect"
+  }
+ },
+ "totals": {
+  "exposed_parameters": 2858,
+  "midi_cc_mappings": 2080,
+  "real_controls": 778,
+  "reaper_wrapper_params": 3
+ }
+}
