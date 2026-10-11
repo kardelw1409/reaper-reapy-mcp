@@ -55,7 +55,11 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         """
         try:
             track_index = controller.create_track(name)
-            return {"status": "success", "message": f"Created track {track_index}"}
+            return {
+                "status": "success",
+                "track_index": track_index,
+                "message": f"Created track {track_index}",
+            }
         except Exception as e:
             return {"status": "error", "message": f"Failed to create track: {str(e)}"}
 
@@ -194,11 +198,26 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
 
     @mcp.tool("add_fx")
     def add_fx(ctx: Context, track_index: int, fx_name: str) -> Dict[str, Any]:
-        """Add an FX to a track."""
+        """Add an FX to a track.
+
+        The controller answers a bool, so this tool must not treat its answer as an
+        index: a failed add is an error envelope, and on success the index of the
+        added FX is **re-read** from the track (the FX is appended last) instead of
+        being guessed - the tool previously answered "success" even when the add
+        failed, because ``False >= 0`` is true in Python.
+        """
         try:
-            fx_index = controller.add_fx(track_index, fx_name)
-            if fx_index >= 0:
-                return {"status": "success", "message": f"Added FX {fx_name} to track {track_index} at index {fx_index}"}
+            added = controller.add_fx(track_index, fx_name)
+            if added:
+                fx_list = controller.get_fx_list(track_index) or []
+                fx_index = len(fx_list) - 1 if fx_list else None
+                where = f" at index {fx_index}" if fx_index is not None else ""
+                return {
+                    "status": "success",
+                    "track_index": track_index,
+                    "fx_index": fx_index,
+                    "message": f"Added FX {fx_name} to track {track_index}{where}",
+                }
             return {"status": "error", "message": f"Failed to add FX to track {track_index}"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to add FX: {str(e)}"}

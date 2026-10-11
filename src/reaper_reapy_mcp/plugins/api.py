@@ -797,7 +797,18 @@ def plugin_write(
                 "label": result.plan.label,
                 "n_items": len(result.plan.changes),
                 "items": [
-                    {"subject": item.subject, "channel": item.channel, "to": item.to}
+                    {
+                        "subject": item.subject,
+                        "channel": item.channel,
+                        # `from_` is the value the plan was built against - the live
+                        # baseline read inside THIS call (plan.py builds it from
+                        # `live.parameter_readback`). Exposing it lets a caller see
+                        # what a dry run is planning to change FROM, which is how an
+                        # external change between calls becomes visible in the
+                        # preview (the P18 freshness probe asserts exactly that).
+                        "from": item.from_,
+                        "to": item.to,
+                    }
                     for item in result.plan.changes
                 ],
                 "write_order": list(result.plan.write_order),

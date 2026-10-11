@@ -32,6 +32,7 @@ from typing import Any, Callable
 from ..errors import (
     HostContractUnavailable,
     NotConnected,
+    PluginError,
     StateConflict,
     TargetSliceAmbiguous,
     Unreadable,
@@ -303,6 +304,9 @@ class ReaperHostBridge:
         self.host = host
         self._sleeper = sleeper or time.sleep
         self._connected = False
+        #: transport-lengthbook: every re-establishment, with the label that
+        #: observed the loss. Never silent - a recovery is a fact about the run.
+        self.recoveries: list[dict[str, Any]] = []
 
     # -- connection ---------------------------------------------------------
 
@@ -345,14 +349,49 @@ class ReaperHostBridge:
         return self._reapy().inside_reaper()
 
     def ensure(self) -> None:
-        """Lazy single connection; a failure is a typed ``NotConnected``.
+        """Lazy connection that must be **alive**, not merely established once.
 
-        The attempt itself runs through the same timeout chokepoint as every
-        other host call: a host that accepts the socket and then never answers
-        must not hang the server at connect time either.
+        Measured defect this replaces (2026-10-11): the bridge flipped
+        ``_connected`` to True on the first successful connect and never looked
+        again. A long-lived server process therefore returned ``NotConnected``
+        for **every** call after REAPER closed the socket while idle
+        (``ConnectionAbortedError`` WinError 10053, observed live through the
+        registered tools), until the whole server was restarted - the exact
+        opposite of a practical AI workflow. Two things changed:
+
+        * ``reapy.connect()`` alone is not enough to (re-)establish a client:
+          reapy keeps a client per host in ``machines.CLIENTS`` and ``connect``
+          **re-uses** it, dead socket included. ``reapy.reconnect()`` is the
+          public call that drops it and builds a new one - and it is also the
+          documented remedy for "REAPER was not running when reapy was
+          imported", which previously left this bridge permanently unusable in
+          an otherwise healthy session.
+        * a connect is now followed by a **handshake** (one cheap read through
+          the same timeout chokepoint), so "connected" means a live transport
+          answered - not that a function returned.
+
+        A failed attempt is retried **once** through the reconnect; the error
+        raised is the second attempt's, with the first recorded in its detail so
+        the original condition is not lost.
         """
         if self._connected:
             return
+        first: Exception | None = None
+        try:
+            self._connect_client()
+            self._handshake()
+        except Exception as exc:  # noqa: BLE001 - classified and re-raised below
+            first = exc
+            self._connected = False
+            try:
+                self._reconnect_client()
+                self._handshake()
+            except Exception as second:  # noqa: BLE001 - classified below
+                raise self._connection_error(second, first=first) from second
+        self._connected = True
+
+    def _connect_client(self) -> None:
+        """Select a client for the configured host (creating one if unknown)."""
         reapy = self._reapy()
 
         def _connect() -> None:
@@ -361,20 +400,83 @@ class ReaperHostBridge:
             else:
                 reapy.connect()
 
-        try:
-            self.call(_connect, timeout=self.timeout, label="connect")
-        except NotConnected:
-            raise
-        except Exception as exc:  # noqa: BLE001 - classified below
-            raise NotConnected(
-                "the host connection could not be established",
-                detail={"host": self.host, "error": f"{type(exc).__name__}: {exc}"},
-            ) from exc
-        self._connected = True
+        self.call(_connect, timeout=self.timeout, label="connect")
+
+    def _reconnect_client(self) -> None:
+        """Drop the client reapy holds and build a fresh one (public API).
+
+        ``reapy.reconnect()`` deletes ``machines.CLIENTS[host]`` and calls
+        ``connect(host)`` again, then reloads ``reapy.reascript_api`` so the
+        wrappers route to the new socket; with an explicit host configured the
+        equivalent is an explicit reconnect of that host. Nothing private is
+        touched: this is the API reapy documents for exactly this situation.
+        """
+        reapy = self._reapy()
+
+        def _reconnect() -> None:
+            reapy.reconnect()
+            if self.host:
+                reapy.connect(host=self.host)
+
+        self.call(_reconnect, timeout=self.timeout, label="reconnect")
+
+    def _handshake(self) -> None:
+        """One cheap read that proves the transport answers right now."""
+
+        def _probe() -> int:
+            R = self._api()
+            return int(R.GetNumTracks())
+
+        self.call(_probe, timeout=self.timeout, label="handshake")
+
+    @staticmethod
+    def _connection_error(exc: Exception, *, first: Exception | None) -> Exception:
+        """The typed error a failed connect/reconnect answers with."""
+        if isinstance(exc, PluginError):
+            if first is not None and first is not exc:
+                exc.detail.setdefault(
+                    "first_attempt",
+                    f"{type(first).__name__}: {first}",
+                )
+            return exc
+        return NotConnected(
+            "the host connection could not be established",
+            detail={
+                "error": f"{type(exc).__name__}: {exc}",
+                "first_attempt": None if first is None else f"{type(first).__name__}: {first}",
+            },
+        )
 
     def reconnect(self) -> None:
         self._connected = False
         self.ensure()
+
+    def call_read(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None, label: str = "host read") -> Any:
+        """A host **read** with transport-loss recovery (never a write).
+
+        A transport loss invalidates the connection and the read is retried
+        **exactly once** after a re-establishment - reads are idempotent, so a
+        retry cannot change the host. A write deliberately does **not** use this
+        path: a failed write has an *unknown* effect and retrying it blindly
+        would be the one thing the transaction engine must never do; writes call
+        :meth:`call` and leave the recovery to the next verb (the engine's
+        verification reads then reconnect transparently and measure the truth).
+        """
+        try:
+            return self.call(fn, *args, timeout=timeout, label=label)
+        except NotConnected as exc:
+            self._connected = False
+            self.ensure()
+            self.recoveries.append(
+                {
+                    "label": label,
+                    "of": "read",
+                    "observed": f"{type(exc).__name__}: {exc}",
+                    "transport": (exc.detail or {}).get("error"),
+                    "utc": utc_now_iso(),
+                }
+            )
+            return self.call(fn, *args, timeout=timeout, label=label)
 
     # -- transport chokepoint ----------------------------------------------
 
@@ -404,7 +506,13 @@ class ReaperHostBridge:
                 detail={"label": label, "timeout_s": budget},
             )
         if "error" in outcome:
-            raise self._classify(outcome["error"], label)
+            error = self._classify(outcome["error"], label)
+            if isinstance(error, NotConnected) and self._connected:
+                # a transport loss on an *established* client: the client is
+                # dead from here on, so the next verb must re-establish it
+                # (the measured defect: the flag used to stay True forever)
+                self._connected = False
+            raise error
         return outcome.get("value")
 
     @staticmethod
@@ -491,7 +599,7 @@ class ReaperHostBridge:
                 )
             return views
 
-        return self.call(_read, timeout=self.timeout, label="list_tracks")
+        return self.call_read(_read, timeout=self.timeout, label="list_tracks")
 
     def fx_facts(self, track_index: int, fx_index: int) -> FxHostFacts:
         self.ensure()
@@ -526,7 +634,7 @@ class ReaperHostBridge:
                 "session_handle": guid,
             }
 
-        data = self.call(_read, timeout=self.timeout, label="fx_facts")
+        data = self.call_read(_read, timeout=self.timeout, label="fx_facts")
         return FxHostFacts(
             track_index=track_index,
             fx_index=fx_index,
@@ -550,7 +658,7 @@ class ReaperHostBridge:
                 track = self._track(R, track_index)
                 return [self._ident(R, track, fx_index, index) for index in indices]
 
-        return self.call(_read, timeout=self.timeout, label="param_idents")
+        return self.call_read(_read, timeout=self.timeout, label="param_idents")
 
     def param_names(self, ref: PluginInstanceRef, indices: list[int]) -> list[str | None]:
         """Host-reported parameter **names** for indices; ONE batched hop.
@@ -568,7 +676,7 @@ class ReaperHostBridge:
                 track = self._track(R, track_index)
                 return [self._param_name(R, track, fx_index, index) for index in indices]
 
-        return self.call(_read, timeout=self.timeout, label="param_names")
+        return self.call_read(_read, timeout=self.timeout, label="param_names")
 
     def read_params(self, ref: PluginInstanceRef, indices: list[int]) -> list[float]:
         """ONE batched host hop for the whole index list (never per control)."""
@@ -581,7 +689,7 @@ class ReaperHostBridge:
                 track = self._track(R, track_index)
                 return [float(R.TrackFX_GetParamNormalized(track, fx_index, index)) for index in indices]
 
-        return self.call(_read, timeout=self.timeout, label="read_params")
+        return self.call_read(_read, timeout=self.timeout, label="read_params")
 
     def read_state_chunk(self, ref: PluginInstanceRef) -> str:
         self.ensure()
@@ -593,7 +701,7 @@ class ReaperHostBridge:
             raw = R.GetTrackStateChunk(track, "", _CHUNK_CAPACITY, False)
             return str(raw[2]) if isinstance(raw, (list, tuple)) and len(raw) > 2 else str(raw)
 
-        return self.call(_read, timeout=self.timeout, label="read_state_chunk")
+        return self.call_read(_read, timeout=self.timeout, label="read_state_chunk")
 
     # -- HostBridge: writes (P5; NOT live-certified until P8) ---------------
 
@@ -818,7 +926,7 @@ class ReaperHostBridge:
                 track = self._track(R, facts.track_index)
                 return self._name_ordinal(R, track, facts.fx_index, facts.fx_name)
 
-            ordinal, matching_fx_count = self.call(
+            ordinal, matching_fx_count = self.call_read(
                 _probe, timeout=self.timeout, label="locate_state_slice"
             )
         return locate_block_span(

@@ -26,7 +26,7 @@ __all__ = [
     "display_to_write_space",
 ]
 
-LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "unmeasured")
+LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured")
 
 _NUMBER_TYPES = (int, float)
 
@@ -64,6 +64,29 @@ def _range(control: dict[str, Any]) -> tuple[float | None, float | None]:
 
 def _enum_members(control: dict[str, Any]) -> list[str]:
     return [str(member.get("id")) for member in control.get("enum_values") or []]
+
+
+def _enum_positions(control: dict[str, Any]) -> list[float] | None:
+    """The **measured** normalized position of each enum member, when declared.
+
+    An enum whose bands are uniform converts with ``index / (n - 1)``; one whose
+    bands are not (the plugin measured here: switch points at 0, 11/256, 32/256,
+    54/256, ... ) needs the members' own measured positions, or the uniform
+    arithmetic lands in the neighbouring band and reports success. Present only
+    where a provider fitted the band midpoints from a measured sweep; absent for
+    every law the registry declares itself, so nothing that works today changes.
+    """
+    params = _law_params(control)
+    raw = params.get("positions")
+    members = _enum_members(control)
+    if not isinstance(raw, (list, tuple)) or len(raw) != len(members) or len(raw) < 2:
+        return None
+    positions: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, _NUMBER_TYPES):
+            return None
+        positions.append(float(item))
+    return positions
 
 
 def unit_trap(control: dict[str, Any], value: Any) -> None:
@@ -139,6 +162,9 @@ def to_normalized(control: dict[str, Any], native: Any) -> float:
     if ctype == "enum":
         members = _enum_members(control)
         index = int(native)
+        positions = _enum_positions(control)
+        if positions is not None:
+            return positions[max(0, min(index, len(positions) - 1))]
         return index / max(1, len(members) - 1)
     if ctype == "bool":
         return float(bool(native))
@@ -146,6 +172,17 @@ def to_normalized(control: dict[str, Any], native: Any) -> float:
         return 1.0 if native else 0.0
     low, high = _range(control)
     kind = law_kind(control)
+    if kind == "power":
+        base = float(_law_params(control).get("base") or 0.0)
+        exponent = float(_law_params(control).get("exponent") or 0.0)
+        offset = float(_law_params(control).get("offset") or 0.0)
+        shifted = float(native) - offset
+        if base > 0.0 and exponent > 0.0 and shifted >= 0.0:
+            return (shifted / base) ** (1.0 / exponent)
+        raise NoConversion(
+            f"control {control.get('id')!r} declares a power law without a usable base/exponent",
+            detail={"control": control.get("id"), "law": kind, "base": base, "exponent": exponent},
+        )
     if kind == "exponential" and low and high and low > 0 and high != low:
         return math.log(float(native) / low) / math.log(high / low)
     if low is not None and high is not None and high != low:
@@ -157,6 +194,10 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
     ctype = control.get("type")
     if ctype == "enum":
         members = _enum_members(control)
+        positions = _enum_positions(control)
+        if positions is not None:
+            nearest = min(range(len(positions)), key=lambda i: abs(positions[i] - float(normalized)))
+            return float(nearest)
         index = round(float(normalized) * max(1, len(members) - 1))
         return float(max(0, min(index, len(members) - 1)))
     if ctype == "bool":
@@ -165,6 +206,16 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
         return bool(normalized)
     low, high = _range(control)
     kind = law_kind(control)
+    if kind == "power":
+        base = float(_law_params(control).get("base") or 0.0)
+        exponent = float(_law_params(control).get("exponent") or 0.0)
+        offset = float(_law_params(control).get("offset") or 0.0)
+        if base > 0.0 and exponent > 0.0:
+            return offset + base * float(normalized) ** exponent
+        raise NoConversion(
+            f"control {control.get('id')!r} declares a power law without a usable base/exponent",
+            detail={"control": control.get("id"), "law": kind, "base": base, "exponent": exponent},
+        )
     if kind == "exponential" and low and high and low > 0 and high != low:
         return low * (high / low) ** float(normalized)
     if low is not None and high is not None and high != low:

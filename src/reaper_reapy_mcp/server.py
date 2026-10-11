@@ -44,6 +44,17 @@ def create_server(debug: bool = True) -> FastMCP:
     # (AUD-013). It adds the 7 `plugin_*` tools and touches nothing else: with no
     # provider configured every plugin tool answers a typed `UnsupportedProvider`.
     setup_plugin_tools(mcp)
+    # REAPER's own error boxes freeze EVERY call - a modal blocks all reapy
+    # communication (measured; T-01 in the reference troubleshooting map). The
+    # dialog guard answers the boxes this project knows (render errors, render
+    # incompletes, render script errors) and never touches a question about the
+    # user's work. Started here so every session inherits it.
+    try:
+        from reaper_dialogs import start_watcher
+
+        start_watcher()
+    except Exception:  # noqa: BLE001 - a guard that cannot start must not stop the server
+        logging.getLogger(__name__).warning("reaper dialog watcher did not start", exc_info=True)
     return mcp
 
 

@@ -175,3 +175,40 @@ Owner decisions 6a/6b ([19 §9](19-owner-decisions.md)): two fail-closed contrad
 | `plugin_instances` workflow | **unchanged for addressing**: `data.instances[]` (location + identity) is the documented way to address a mutation; the token in `meta` is for reads/diagnostics | [05 §5](05-universal-core-contract.md), [06](06-mcp-tool-contracts.md) |
 | live suite | **updated to the new policy, not run** | `test_p8_live_write.py` writes a document-only leaf now; `test_p10_acceptance.py` asserts the route refusal; both must be re-run under owner authorisation |
 | new error code | `IdentityContinuityUnprovable` added to the closed taxonomy | [05 §7](05-universal-core-contract.md), `tests/plugins/test_p0_contracts.py` |
+
+---
+
+## Addendum 4 — live write/restore smoke test (2026-10-11, one write, owner-authorised)
+
+One bounded live smoke test through the registered tools after the correction above.
+Evidence: `tests/plugins/live/evidence/p12_live_smoke__20261011T041434Z__363904d8c23c.json`
+(full record in `IMPLEMENTATION-STATUS.md` §23).
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| one parameter write + restore through `plugin_write` | **confirmed by measurement**: dry run `NO_WRITES` with **0** write-verb calls at the bridge; the committed write `ALL_VERIFIED` with exactly **1** `write_params`; read-back delta **0.0**; restore `ALL_VERIFIED` with exactly **1** `write_params`; final **2858/2858 parameters exact**, **1071/1071 writable document leaves equal**, block digest equal, outside-span intact, no routes | the probe file `tests/plugins/live/test_p12_live_smoke.py`; the pytest run itself ended red on a **probe** defect (a report key the assertion did not have) *after* the restore had completed |
+| a parameter write also moves a document leaf | **measured**: `n_mismatched: 1` of 1071 writable leaves after a parameter-only write, back at the baseline value by the end of the run | the leaf's path is not in the artifact (the probe summarised the diff and dropped the rows; fixed in the file, not re-measured) |
+| the prescribed whole-document restore | **refused by the route gate** (new limitation **L-12**): the codec's change set is "every captured writable settings leaf", which contains the route table | `DependencyViolation` / `REFUSED_BEFORE_ANY_WRITE` / `write_calls_attempted: 0`; the gate cannot tell a restore from a create → owner decision needed (a recognisable restore intent, or a change set that avoids the table) |
+| instance continuity | **still not provable** (**L-3**); the write was location-addressed and the revalidation is in-call only | `meta.identity_basis` on every response |
+
+---
+
+## Addendum 5 — P17/P18 practical acceptance (2026-10-11, live)
+
+Three new tracks, three Vital instances, three basses, renders and the mandatory
+freshness test — full record in `IMPLEMENTATION-STATUS.md` §24. Evidence:
+`p17_three_instances__20261011T100201Z__e44f0be27515.json`,
+`p17_three_instances__20261011T112833Z__9e68e0510239.json` (idempotent re-run),
+`p18_bass_acceptance__20261011T112738Z__ce39b7583497.json`,
+`p18_cache_freshness__20261011T112518Z__9c72a0fe6b03.json`, three `p18_bass_*.wav`.
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| `add_fx` answered success for a **failed** add (`False >= 0`) | **fixed**: error envelope on failure; the added FX index is re-read from the track on success; `create_track` also returns its `track_index` | `tests/plugins/test_p17_host_tool_accounting.py` (4 tests, fake-controller, real FastMCP registration) |
+| fuzzy `add_fx` names land the **VST2** build (`VSTi: Vital`), which the V3 provider does not match | **measured and handled**: the P17 probe tries the exact `VST3i: Vital (Vital Audio)` first and removes a landed non-matching FX before the next name; tracks verified to carry exactly one VST3i | `tests/plugins/live/test_p17_three_instances.py`; the accidental duplicates were removed via `remove_fx` and the chains verified |
+| corpus-truncated ranges made portamento/slope/env-times/volume silently wrong | **fixed by live measurement** (`profile_build.LIVE_MEASURED_CORRECTIONS`; `values.py` power law gained an optional `offset`): portamento_time exponential `2**-10..2**4` s (a -3.3 request had landed at 0.900531 s), slope -8..+8, env attack/decay/release `32.0003 * norm ** 4`, volume `-80 + 86.02 * norm ** 0.5`; the registry files themselves are untouched | `tests/plugins/test_p18_live_corrections.py` (real-registry anchors); `tests/plugins/test_p16_measured_laws.py` now pins that only these rows differ from their declaration; transcript `tests/plugins/live/evidence/p18_calibration__20261011T114948Z__c91845f34b01.json` |
+| dry-run plan did not expose its baseline | **fixed (additive)**: `plan.items[].from` is rendered; the freshness probe asserts it equals the externally-set value | `src/reaper_reapy_mcp/plugins/api.py`; `tests/plugins/live/test_p18_cache_freshness.py` |
+| external change (classic `set_fx_param`) vs layer caches | **proved live**: V3 read 50.0 -> external 0.5-norm write -> V3 read 72.0 -> dry-run `from` 72.0 -> restore -> 50.0. No value cache or TTL exists to mask it | the freshness evidence above |
+| `wave_frame` / spectral morph on the fresh instances | **measured inert** (single-frame Init table; two isolation renders with morph `Low Pass` @ 100 vs `None` produced identical metrics) — documented as inert, not as "supported"; both stay addressable | `IMPLEMENTATION-STATUS.md` §24.2 item 5 |
+| three basses, one batch write each | **live**: 51/49/51 controls, `ALL_VERIFIED`, all rows agree; distinct measured characters (centroid 69.6 / 248.0 / 333.6 Hz; sub 0.956 / 0.781 / 0.707); 0 clipped samples; tuning error <= 0.06 st | acceptance evidence; WAVs beside it |
+| batch-first accounting | **measured**: 13 workflow calls vs 453 naive single-control calls (x34.8); 3 host `write_params` calls for 151 controls | acceptance evidence `metrics` |

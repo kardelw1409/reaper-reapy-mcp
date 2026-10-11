@@ -31,7 +31,7 @@ __all__ = [
 PROFILE_SCHEMA_VERSION = 1
 CACHE_FORMAT_KEY = "capability-map-v1"
 
-LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "unmeasured")
+LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured")
 AUTHORITY_SPACES = ("parameter", "state")
 DEPENDENCY_KINDS = ("hard", "soft", "incompatible", "warning", "info")
 SUPPORTED_CAPTURE_CHANNELS = ("document", "routes", "parameters")

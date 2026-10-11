@@ -332,14 +332,22 @@ def test_the_keep_on_semantics_of_the_disable_set_are_not_inert():
     assert "Delay Switch" in keep
 
 
-def test_the_display_space_branch_is_reachable_for_a_provider_with_a_conversion():
-    """Defensive branch (audit finding): a subject whose control declares a real
-    law keeps its display off value instead of being refused."""
+def test_the_enum_display_branch_converts_to_the_member_index():
+    """A subject whose control declares a measured enum law converts its display
+    off value to the member index - the space the live document uses (2026-10-11).
+
+    This replaces the pre-derivation branch, which emitted the *display string*
+    as the state value: a string in a numeric leaf is the phantom-value shape the
+    DISABLE table exists to prevent, so the conversion is now required and the
+    unconvertible cases are refused (see the two probes above).
+    """
     profile = {
         "controls": [
             {
                 "id": "osc_1_distortion_type",
                 "label": "Oscillator 1 Distortion Type",
+                "type": "enum",
+                "enum_values": [{"id": "None", "label": "None"}, {"id": "Sync", "label": "Sync"}],
                 "binding": {"state_key": "osc_1_distortion_type"},
                 "law": {"kind": "enum_index", "params": {}},
             }
@@ -348,8 +356,10 @@ def test_the_display_space_branch_is_reachable_for_a_provider_with_a_conversion(
     rows = {row["candidate"]: row for row in RULES.disable_targets(profile)}
     row = rows["Oscillator 1 Distortion Type"]
     assert row["path"] == "settings.osc_1_distortion_type"
-    assert row["value"] == "None"
-    assert row["value_space"] == "display"
+    assert row["value"] == 0.0
+    assert row["value_space"] == "native"
+    assert row["value_from_display"] == "None"
+    assert isinstance(row["value"], float), "a numeric leaf must not receive a string"
 
 
 def test_the_provider_report_fallback_is_reachable():
@@ -534,24 +544,74 @@ def test_against_the_real_registry_the_disable_targets_split_honestly():
     rows = {row["candidate"]: row for row in RULES.disable_targets(profile)}
     mapped = {name: row for name, row in rows.items() if not row.get("reason")}
     refused = {name: row for name, row in rows.items() if row.get("reason")}
-    # every DISABLE candidate is bound by the profile's own declared names: 10 can
-    # be addressed with a measured numeric off value in the document's own space
+    # every DISABLE candidate is bound by the profile's own declared names: all 13
+    # can be addressed with a measured value in the document's own space
     assert set(mapped) | set(refused) == set(RULES.DISABLE_CANDIDATES)
     assert mapped["Reverb Switch"]["path"] == "settings.reverb_on"
     assert mapped["Reverb Switch"]["value"] == 0.0
     assert mapped["Reverb Switch"]["value_space"] == "native"
     assert mapped["Oscillator 1 Distortion Amount"]["path"] == "settings.osc_1_distortion_amount"
     assert mapped["Compressor Switch"]["path"] == "settings.compressor_on"
-    # the distortion *types* carry a display off value and declare no conversion
-    # (law none, no measured members), so no value in the document's own space can
-    # be justified - named, never guessed, and never silently skipped
-    assert set(refused) == {
+    # The distortion *types* are display-valued candidates. Since the measured
+    # sweep derivation (2026-10-11) each of them declares a law with measured
+    # members, so the display value "None" converts to its **member index** - the
+    # space the captured live document demonstrably uses
+    # (`osc_1_distortion_type = 0.0`, i.e. member 0 of the measured member list).
+    # Before the derivation these three were refused
+    # (`disable_value_not_measurable`), which is what made every structural change
+    # refuse (L-9).
+    assert set(refused) == set(), refused
+    for slot in ("1", "2", "3"):
+        name = f"Oscillator {slot} Distortion Type"
+        row = mapped[name]
+        assert row["value"] == 0.0
+        assert row["value_space"] == "native"
+        assert row["value_from_display"] == "None"
+        assert row["path"] == f"settings.osc_{slot}_distortion_type"
+        assert " " not in row["path"]
+
+
+def test_a_display_off_value_without_a_measurable_law_is_still_refused(monkeypatch):
+    """Non-vacuity: the refusal branch above must still be reachable.
+
+    A candidate whose off value is a display string on a control with **no** law
+    and no measured members cannot be written into the document in the document's
+    own space - it must be named, not guessed.
+    """
+    profile = real_profile()
+    controls = [item for item in profile["controls"] if item["id"] == "osc_1_distortion_type"]
+    assert controls, "the real profile must carry the measured control"
+    control = controls[0]
+    control["type"] = "number"
+    control["law"] = {"kind": "none", "params": {}}
+    monkeypatch.setitem(
+        RULES.DISABLE_CANDIDATES,
         "Oscillator 1 Distortion Type",
-        "Oscillator 2 Distortion Type",
-        "Oscillator 3 Distortion Type",
-    }
-    for name, row in refused.items():
-        assert row["reason"] == "disable_value_not_measurable", name
-        assert row["path"].startswith("settings.")
-        assert "distortion_type" in row["path"] and " " not in row["path"]
-        assert row["off"] == "None"
+        {"off": "None", "why": "synthetic probe of the refusal branch"},
+    )
+    rows = {row["candidate"]: row for row in RULES.disable_targets(profile)}
+    row = rows["Oscillator 1 Distortion Type"]
+    assert row["reason"] == "disable_value_not_measurable", row
+    assert row["path"] == "settings.osc_1_distortion_type"
+    assert row["off"] == "None"
+
+
+def test_a_display_off_value_on_a_non_enum_law_is_refused_too(monkeypatch):
+    """The second honest refusal: native space is only *measured* for enum indices.
+
+    A power-law control's display value is not the document's own space (its
+    document leaf holds the internal taper value), so the conversion must not be
+    invented - the candidate is refused with that reason.
+    """
+    profile = real_profile()
+    control = next(item for item in profile["controls"] if item["id"] == "osc_1_level")
+    assert control["law"]["kind"] == "power"
+    monkeypatch.setitem(
+        RULES.DISABLE_CANDIDATES,
+        "Oscillator 1 Level",
+        {"off": "None", "why": "synthetic probe of the non-enum display branch"},
+    )
+    rows = {row["candidate"]: row for row in RULES.disable_targets(profile)}
+    row = rows["Oscillator 1 Level"]
+    assert row["reason"] == "disable_value_not_measurable", row
+    assert "does not establish the document's own space" in row["detail"]

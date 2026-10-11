@@ -19,8 +19,10 @@ Nothing here runs at import time, and no host module is imported.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +44,7 @@ __all__ = [
     "VitalRegistry",
     "resolve_registry_dir",
     "load_registry",
+    "derive_measured_law",
     "build_profile",
 ]
 
@@ -262,8 +265,265 @@ def _law(row: dict[str, Any]) -> dict[str, Any]:
     return {"kind": "unmeasured", "params": {}}
 
 
-def _evidence(row: dict[str, Any], has_states: bool) -> dict[str, Any]:
+#: The smallest number of measured states a derivable law may be built from. The
+#: precedent (`depth.py::depth_fit`) refuses under three pairs, and the same floor
+#: is right here: two points always fit a line, so two points prove nothing.
+_MIN_DERIVATION_STATES = 3
+
+#: How many labelled members a derived enum may carry. Above this the "labels" are
+#: display text, not a member set, and the honest answer is a refusal.
+_MAX_DERIVED_ENUM_MEMBERS = 40
+
+
+def _measured_pairs(states: list[tuple[float, str]]) -> list[tuple[float, float]] | None:
+    """Every measured state as ``(normalized, numeric display)`` - or ``None``.
+
+    ``None`` means **at least one display is not a number**, which is the signal
+    that decides between the enum and the numeric path. It is deliberately
+    all-or-nothing: the POC's leading-number parser reads ``"2x Octave"`` as
+    ``2.0``, so a per-state filter would let a labelled control such as
+    `Oscillator 1 Stack Style` (13 labels, 2 of which start with a digit) into the
+    numeric path, where a free exponent fit would then be meaningless (the
+    independent audit of 2026-10-11 measured exactly that leak).
+    """
+    pairs: list[tuple[float, float]] = []
+    for norm, display in states:
+        number = depth_module.display_number(display)
+        if number is None:
+            return None
+        pairs.append((float(norm), float(number)))
+    return pairs
+
+
+def _measurement_quantum(values: list[float]) -> float:
+    """The display's own smallest strictly-positive step (measured)."""
+    distinct = sorted(set(values))
+    gaps = [b - a for a, b in zip(distinct, distinct[1:]) if b - a > 0]
+    return min(gaps) if gaps else 0.0
+
+
+def _norm_ordered_endpoints(pairs: list[tuple[float, float]]) -> tuple[float, float] | None:
+    """The display at the lowest / highest measured normalized - in that order.
+
+    Not ``(min, max)`` of the values: the range is the *conversion spine*
+    (``values.py`` maps ``low`` to normalized 0 and ``high`` to normalized 1), so
+    the endpoints must follow the measurement's direction. A descending control
+    would need an inverted range, which the Core contract does not express yet
+    (``validate`` bounds-checks ``low <= value <= high``), so descending maps are
+    refused here rather than smuggled in - see `derive_measured_law`.
+    """
+    if len(pairs) < 2:
+        return None
+    ordered = sorted(pairs, key=lambda pair: pair[0])
+    low, high = ordered[0][1], ordered[-1][1]
+    if high <= low:
+        return None
+    return low, high
+
+
+def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list[float] | None:
+    """One measured normalized position per member: the middle of its own band.
+
+    The enum conversion in Core assumes uniformly spaced members. For
+    ``Oscillator N Distortion Type`` that assumption is false and measurably so:
+    the sweep shows 11 bands whose switch points run 0, 11/256, 32/256, 54/256,
+    76/256, 98/256 ... with double-width gaps, and the uniform mapping
+    (``index / (n - 1)``) lands 5 of the 11 members in the *neighbouring* band
+    (audit of 2026-10-11, measured).
+
+    The position must be **interior** to the band, not at its switch point: the
+    sweep records change points, so a member's first sample *is* the boundary
+    where the neighbouring member ends. A band is therefore
+    ``[change_point[i], change_point[i+1])``; the last band has no recorded end,
+    and its width is mirrored from the band before it (for a two-state switch the
+    sweep has exactly two change points, so mirroring is what puts "On" at 0.75
+    instead of on the 0.5 switch point).
+    """
+    points: list[tuple[float, str]] = []
+    for norm, display in sorted(states, key=lambda pair: pair[0]):
+        label = str(display).strip()
+        if points and points[-1][1] == label:
+            continue
+        points.append((float(norm), label))
+    positions: dict[str, float] = {}
+    for index, (start, label) in enumerate(points):
+        if index + 1 < len(points):
+            end = points[index + 1][0]
+        else:
+            width = start - points[index - 1][0] if index else 1.0
+            end = min(1.0, start + width)
+        positions[label] = round((start + end) / 2.0, 6)
+    if set(positions) != set(members):
+        return None
+    return [positions[member] for member in members]
+
+
+def _members_in_norm_order(states: list[tuple[float, str]]) -> list[str] | None:
+    """The distinct labels in the order the measurement meets them."""
+    members: list[str] = []
+    for _norm, display in sorted(states, key=lambda pair: pair[0]):
+        label = str(display).strip()
+        if label and label not in members:
+            members.append(label)
+    return members or None
+
+
+def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) -> dict[str, Any] | None:
+    """A law fitted to the control's **own measured sweep**, or ``None``.
+
+    Called only for rows whose declared ``kind`` is ``none``/``unmeasured`` - i.e.
+    rows for which ``values.to_native`` refuses *every* conversion today. The
+    derivation can therefore only add capability; the rows that already declare a
+    law (`affine`/`enum_index`, 582 of them) are never touched (audit finding:
+    "strictly additive", 2026-10-11).
+
+    The measurement (`vital_scales_full.json`) is the registry's own 257-point
+    sweep of the control, recorded as ``[normalized, display-string]`` change
+    points; the fit's acceptance bound is the same one `depth.py::depth_fit` uses
+    for modulation depth - the worst residual of the fit must stay inside half of
+    the display's own smallest step - so a curve the declared vocabulary cannot
+    express is **refused**, never approximated.
+
+    Order of decision (each with its guard, all evidence from the sweep):
+
+    1. any non-numeric display -> a labelled member set (`enum_index` with the
+       measured member order and the measured band positions);
+    2. numeric and non-decreasing -> an affine fit inside the bound;
+    3. numeric, positive, non-decreasing, low > 0 -> an exponential fit;
+    4. numeric, non-negative, non-decreasing, base = max > 0, exponent > 0 with at
+       least two distinct *non-zero* points -> a **power** fit (the measured
+       taper: `Oscillator N Level` is exactly `display = normalized ** 2`, and
+       `Oscillator N Unison Detune` is `100 * normalized ** 2`);
+    5. anything else (descending, mixed labels, too few states, no fit) -> ``None``
+       (the honest refusal stays).
+    """
+    if len(states) < 2:
+        return None
+
+    pairs = _measured_pairs(states)
+    if pairs is None:
+        members = _members_in_norm_order(states)
+        if members is None or not (2 <= len(members) <= _MAX_DERIVED_ENUM_MEMBERS):
+            return None
+        positions = _band_positions(states, members)
+        if positions is None:
+            return None
+        return {
+            "kind": "enum_index",
+            "type": "enum",
+            "discrete": True,
+            "enum_values": [{"id": member, "label": member} for member in members],
+            "range": None,
+            "params": {
+                "positions": positions,
+                "positions_source": "measured band midpoints of vital_scales_full.json",
+                "n_states": len(states),
+            },
+        }
+
+    # a *numeric* law is a curve, and two points always fit one: three states is
+    # the floor `depth.py::depth_fit` already uses for the same reason
+    if len(states) < _MIN_DERIVATION_STATES:
+        return None
+
+    values = [value for _norm, value in pairs]
+    quantum = _measurement_quantum(values)
+    bound = 0.5 * quantum + 1e-9
+    ordered = sorted(pairs, key=lambda pair: pair[0])
+    if any(b[1] < a[1] for a, b in zip(ordered, ordered[1:])):
+        # descending (or non-monotone) display: the range/spine model in
+        # `values.py` cannot state that direction yet, so refuse instead of
+        # writing an inverted mapping that a round-trip would not reveal
+        return None
+    endpoints = _norm_ordered_endpoints(pairs)
+    if endpoints is None:
+        return None
+    low, high = endpoints
+
+    fit = depth_module.linear_fit(pairs)
+    if fit is not None:
+        slope, intercept, residual = fit
+        if residual <= bound:
+            return {
+                "kind": "affine",
+                "type": "number",
+                "enum_values": None,
+                "range": {"min": low, "max": high},
+                "params": {
+                    "scale": 1.0,
+                    "offset": 0.0,
+                    "measured_slope": round(float(slope), 9),
+                    "measured_intercept": round(float(intercept), 9),
+                    "fit_residual": round(float(residual), 9),
+                    "fit_bound": round(float(bound), 12),
+                    "source": "vital_scales_full.json (measured sweep fit)",
+                    "n_states": len(states),
+                },
+            }
+
+    if low > 0.0 and high > 0.0:
+        residual = max(
+            abs(value - low * (high / low) ** norm) for norm, value in pairs
+        )
+        if residual <= bound:
+            return {
+                "kind": "exponential",
+                "type": "number",
+                "enum_values": None,
+                "range": {"min": low, "max": high},
+                "params": {
+                    "scale": 1.0,
+                    "offset": 0.0,
+                    "fit_residual": round(float(residual), 9),
+                    "fit_bound": round(float(bound), 12),
+                    "source": "vital_scales_full.json (measured sweep fit)",
+                    "n_states": len(states),
+                },
+            }
+
+    base = max(values)
+    # the exponent is fitted on the strictly-interior points: norm 0 has no
+    # logarithm and norm 1 pins the base by construction (`math.log(1.0) == 0.0`
+    # is a ZeroDivisionError, measured 2026-10-11 while building this fit)
+    exponent_points = [
+        (norm, value) for norm, value in pairs if 0.0 < norm < 1.0 and value > 0.0
+    ]
+    distinct_values = sorted({value for _norm, value in exponent_points})
+    if base > 0.0 and len(exponent_points) >= 2 and len(distinct_values) >= 2:
+        exponent = sum(
+            math.log(value / base) / math.log(norm) for norm, value in exponent_points
+        ) / len(exponent_points)
+        if exponent > 0.0:
+            residual = max(abs(value - base * norm**exponent) for norm, value in pairs)
+            if residual <= bound:
+                return {
+                    "kind": "power",
+                    "type": "number",
+                    "enum_values": None,
+                    "range": {"min": low, "max": high},
+                    "params": {
+                        "base": float(base),
+                        "exponent": round(float(exponent), 9),
+                        "fit_residual": round(float(residual), 9),
+                        "fit_bound": round(float(bound), 12),
+                        "source": "vital_scales_full.json (measured sweep fit)",
+                        "n_states": len(states),
+                    },
+                }
+    return None
+
+
+def _evidence(
+    row: dict[str, Any], has_states: bool, *, measured: dict[str, Any] | None = None
+) -> dict[str, Any]:
     kind = row.get("kind")
+    if measured is not None:
+        # the law now comes from the control's own measured sweep, so the evidence
+        # is as strong as this registry gets - and names its source
+        return {
+            "strength": "strong",
+            "source": str(measured.get("params", {}).get("source") or "vital_scales_full.json"),
+        }
     if kind in ("none", "unmeasured"):
         strength = "none"
     elif row.get("how") == "rule" or not has_states:
@@ -287,6 +547,104 @@ def _range_from_row(row: dict[str, Any]) -> dict[str, float] | None:
     if isinstance(low, (int, float)) and isinstance(high, (int, float)) and high > low:
         return {"min": float(low), "max": float(high)}
     return None
+
+
+#: Where the live corrections below were measured (the artifact beside this one).
+_LIVE_CALIBRATION_SOURCE = (
+    "live REAPER formatted-display calibration 2026-10-11 "
+    "(tests/plugins/live/evidence/p18_calibration__20261011T114948Z__c91845f34b01.json)"
+)
+
+
+def _live_measured_corrections() -> dict[str, dict[str, Any]]:
+    """Rows whose registry-declared range/law a **live host measurement**
+    contradicted (2026-10-11, Vital 1.5.5, track 1 / fx 0).
+
+    The registry's ranges come from the *observed preset corpus*
+    (``phase2b_native_ranges.json``), so they truncate every parameter at the
+    largest value any preset ever used. A live calibration - writing known
+    host-normalized values through the classic ``set_fx_param`` and reading the
+    plugin's own formatted display - measured these disagreements:
+
+    * ``portamento_time`` stops at -0.476 in the registry (0.72 s) although the
+      parameter runs to +4 (16 s): measured *0.000976562 s at 0.0, 0.125 s at
+      0.5, 0.900531 s at 0.7035, 6.06286 s at 0.9 and 16 s at 1.0* - every anchor
+      is exactly ``2 ** (-10 + 14 * normalized)`` (the plugin's own kExponential
+      base-2 family). A write of -3.3 under the truncated range therefore landed
+      at 0.9005 s instead of 0.1 s: a factor of nine, and the acceptance render
+      measured the resulting slow crawl before the fix.
+    * ``portamento_slope``: measured *-4 at 0.25, +4 at 0.75, +8 at 1.0* -> the
+      range is -8..+8, not -4.5..+8.
+    * envelope attack/decay/release: measured *0.125 s at 0.25, 2.00002 s at
+      0.5, 10.1251 s at 0.75, 32.0003 s at 1.0* -> ``seconds = 32.0003 *
+      normalized ** 4`` (the plugin's kQuartic family), not the declared linear
+      0..2.378 s. A declared "0.35 s" decay actually rendered 15 ms.
+    * ``volume``: measured *-80 dB at 0.0, -36.99 dB at 0.25, -19.1747 dB at
+      0.5, -5.50449 dB at 0.75, +6.02 dB at 1.0* ->
+      ``dB = -80 + 86.02 * normalized ** 0.5`` (the plugin's kSquareRoot
+      family); the registry's 0..7399.44 range is nonsense (a corpus artifact)
+      and its linear law cannot express the curve at all. The power law
+      therefore carries an optional ``offset`` (here -80 dB).
+
+    Only measured rows are listed; every other row keeps the registry's
+    declaration (strictly additive - never a guessed mapping).
+    """
+    table: dict[str, dict[str, Any]] = {}
+    for index in range(1, 7):
+        for section in ("attack", "decay", "release"):
+            table[f"env_{index}_{section}"] = {
+                "law": {
+                    "kind": "power",
+                    "params": {
+                        "base": 32.0003,
+                        "exponent": 4.0,
+                        "source": _LIVE_CALIBRATION_SOURCE,
+                    },
+                },
+                "range": {"min": 0.0, "max": 32.0003},
+                "source": _LIVE_CALIBRATION_SOURCE,
+            }
+    table["portamento_time"] = {
+        "law": {
+            "kind": "exponential",
+            "params": {"scale": 1.0, "offset": 0.0, "source": _LIVE_CALIBRATION_SOURCE},
+        },
+        "range": {"min": 2.0**-10, "max": 2.0**4},
+        "source": _LIVE_CALIBRATION_SOURCE,
+    }
+    table["portamento_slope"] = {
+        "law": {
+            "kind": "affine",
+            "params": {
+                "scale": 1.0,
+                "offset": 0.0,
+                "native_min": -8.0,
+                "native_max": 8.0,
+                "correspondence": "display = -8 + 16 * normalized (measured: -4 at 0.25, +8 at 1.0)",
+                "source": _LIVE_CALIBRATION_SOURCE,
+            },
+        },
+        "range": {"min": -8.0, "max": 8.0},
+        "source": _LIVE_CALIBRATION_SOURCE,
+    }
+    table["volume"] = {
+        "law": {
+            "kind": "power",
+            "params": {
+                "base": 86.02,
+                "exponent": 0.5,
+                "offset": -80.0,
+                "source": _LIVE_CALIBRATION_SOURCE,
+            },
+        },
+        "range": {"min": -80.0, "max": 6.02},
+        "source": _LIVE_CALIBRATION_SOURCE,
+    }
+    return table
+
+
+#: Control id -> the correction the live calibration measured (built once).
+LIVE_MEASURED_CORRECTIONS: dict[str, dict[str, Any]] = _live_measured_corrections()
 
 
 def _enum_values(states: list[tuple[float, str]]) -> list[dict[str, str]] | None:
@@ -320,16 +678,50 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
         unit = _unit_from_states(states)
         units_by_control[state_key] = unit
         module_label = str(row.get("module") or "")
+        declared_law = _law(row)
+        declared_range = _range_from_row(row)
+        # A declared law is trusted when it can convert: `none`/`unmeasured` refuse
+        # everything, and an affine row whose declared bounds are missing or
+        # degenerate (``native_min == native_max`` - measured on the 42
+        # ``modulation_NN_power`` rows, where the registry's own evidence row says
+        # the range is -10..+10) converts as an identity, which is not a law.
+        # Both cases are answered from the sweep; a declared law with a usable
+        # range is never re-derived.
+        needs_measurement = declared_law["kind"] in ("none", "unmeasured") or (
+            declared_law["kind"] == "affine" and declared_range is None
+        )
+        measured = derive_measured_law(row, states) if needs_measurement else None
+        if measured is not None:
+            law = {"kind": str(measured["kind"]), "params": dict(measured.get("params") or {})}
+            control_type = str(measured.get("type") or _control_type(row))
+            range_spec = measured.get("range") if measured.get("range") is not None else _range_from_row(row)
+            discrete = bool(measured.get("discrete")) or bool(row.get("discrete"))
+            enum_values = measured.get("enum_values")
+        else:
+            law = declared_law
+            control_type = _control_type(row)
+            range_spec = _range_from_row(row)
+            discrete = bool(row.get("discrete"))
+            enum_values = _enum_values(states) if row.get("kind") == "enum_index" else None
+        correction = LIVE_MEASURED_CORRECTIONS.get(str(state_key))
+        if correction is None:
+            evidence = _evidence(row, bool(states), measured=measured)
+        else:
+            # a live host measurement contradicted the registry's declaration:
+            # the measurement wins (see `_live_measured_corrections`)
+            law = copy.deepcopy(correction["law"])
+            range_spec = dict(correction["range"])
+            evidence = {"strength": "strong", "source": str(correction["source"])}
         controls.append(
             {
                 "id": str(state_key),
                 "label": name,
                 "module": module_label or None,
-                "type": _control_type(row),
+                "type": control_type,
                 "unit": unit,
-                "range": _range_from_row(row),
-                "discrete": bool(row.get("discrete")),
-                "enum_values": _enum_values(states) if row.get("kind") == "enum_index" else None,
+                "range": range_spec,
+                "discrete": discrete,
+                "enum_values": enum_values,
                 "aliases": sorted({name, str(row.get("parameter") or ""), str(row.get("control") or "")} - {""} - {str(state_key)}),
                 "authority": {"read": "parameter", "write": "parameter"},
                 "binding": {
@@ -337,8 +729,8 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
                     "ident": None,  # host-provided; resolved live (P8)
                     "state_key": str(state_key),
                 },
-                "law": _law(row),
-                "evidence": _evidence(row, bool(states)),
+                "law": law,
+                "evidence": evidence,
             }
         )
     for name in module_ids:
@@ -397,7 +789,7 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
         "modules": module_descriptors,
         "controls": controls,
         "values": {
-            "kinds": ["affine", "enum_index", "exponential", "identity", "none", "unmeasured"],
+            "kinds": ["affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured"],
             "unit_traps": ["%"],
         },
         "modulation": {

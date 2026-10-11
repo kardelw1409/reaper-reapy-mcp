@@ -366,8 +366,38 @@ def disable_targets(profile: dict[str, Any]) -> list[dict[str, Any]]:
             )
             rows.append(row)
             continue
-        row["value"] = value
-        row["value_space"] = "display"
+        if str((control or {}).get("type")) == "enum":
+            # A display value on a measured enum converts to the **member index**,
+            # and the index is what the document's own space holds: the captured
+            # live document stores `osc_1_distortion_type = 0.0` and
+            # `filter_1_style = 0.0`, i.e. member 0 of each measured member list
+            # ("None" / "12dB"), for enum controls whose `range` is 0..n-1.
+            # Emitting the *display* string instead would put a string into a
+            # numeric leaf - the phantom-value shape this function exists to
+            # prevent (2026-10-11; the law that makes this decidable is the
+            # measured-sweep derivation in `profile_build.derive_measured_law`).
+            from ... import values as values_module  # noqa: PLC0415 - provider -> Core is allowed
+
+            try:
+                native = float(values_module.to_native(control, value))
+            except Exception as exc:  # noqa: BLE001 - classified as a named refusal
+                row["reason"] = "disable_value_not_measurable"
+                row["detail"] = (
+                    f"the off value {value!r} could not be converted through the control's own law: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                rows.append(row)
+                continue
+            row["value"] = native
+            row["value_space"] = "native"
+            row["value_from_display"] = value
+            rows.append(row)
+            continue
+        row["reason"] = "disable_value_not_measurable"
+        row["detail"] = (
+            f"the off value {value!r} is a display value and the control's law {law!r} does not "
+            "establish the document's own space for it (measured only for enum member indices)"
+        )
         rows.append(row)
     return rows
 

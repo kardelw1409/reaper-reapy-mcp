@@ -1477,3 +1477,333 @@ executed**: no live mutation was performed in this correction, per the owner's b
   produced by the read re-run recorded in §22.7.
 
 ---
+
+## 23. Live write/restore smoke test (2026-10-11, owner-authorised: **one** write)
+
+The owner authorised exactly one live write/restore smoke test after the safety-gate
+correction, to confirm that the current code can perform one safe Vital parameter
+write **through the registered MCP tool**, verify it by a real read, and restore the
+original state. New file: `tests/plugins/live/test_p12_live_smoke.py` (carries the
+`live_write` marker; the only live write performed in this round).
+Evidence: `tests/plugins/live/evidence/p12_live_smoke__20261011T041434Z__363904d8c23c.json`.
+
+### 23.1 What was run, and what it measured
+
+| Step | Measured result |
+| --- | --- |
+| addressing | exactly one matching instance; `plugin_instances` returned `{track_index: 0, fx_index: 0}`, identity `VST3i: Vital (Vital Audio)` / `Vital.vst3` / class `56535456…0000` / 2858 params; a read token was issued and **not** used for any mutation |
+| control re-derived (not taken from the old ident) | declared index **104**, host name at that index `Filter 1 Cutoff` (matches the declared names), ident **`104:48629`** read live (`ident_source: live_verified`), live normalized value **0.40625** (display 60.0) - the P8 value `0.4140625` was **not** current, and is recorded as a disagreement, not assumed |
+| recovery set | complete: chunk 234 741 chars, 1072 settings leaves (1071 writable + 1 declared derived `settings.sample.samples`), **2858/2858** parameters, binding 775/775, `not_captured: []` |
+| dry run (`dry_run: true`) | `ok`, verdict `NO_WRITES`, `write_calls_attempted: 0`, `would_write: true`, and the bridge-boundary counter recorded **zero** write-verb calls |
+| committed write (`dry_run: false`, addressed by location, no token) | `ok`, verdict `ALL_VERIFIED`, `final_state: committed`, `write_calls_attempted: 1`, `write_effects_verified: 1`, exactly **one** `write_params` call at the bridge boundary; channel row: ident `104:48629`, written `0.4140625`, read back `0.4140625`, display `60.0 → 61.0`, `agrees: true`, `mismatched: []`, no named gaps, rollback not attempted |
+| independent read-back | normalized `0.4140625`, delta vs expected **0.0**; `plugin_read` reported display `61.0`; the full vector shows **exactly one** ident moved (`104:48629`) |
+| pre-restore revalidation | `safe_to_restore: true`: identity identical, same session handle, same location, revision identical to the post-write revision (`1d0665cd…`), parameters unchanged since the write (2858 compared, 0 mismatched), document unchanged since the write (1071 compared, 0 mismatched) |
+| restore (`dry_run: false`) | `ok`, `ALL_VERIFIED`, exactly **one** `write_params`; final: normalized **0.40625 == baseline**, `exact_restore_of_control: true`, delta **0.0**; parameters **2858/2858 exact** (tolerance 0.0, `missing 0`, `extra 0`); document **1071/1071 writable leaves equal** (+1 derived compared, 0 mismatched); block digest equal; outside-span intact; `active_routes: []` |
+| write count | **2** committed write verbs in total (one for the write, one for the restore), both `write_params`; no state-write verb was ever reached |
+
+### 23.2 Two new measured facts (both recorded as limitations, not glossed)
+
+1. **A parameter write also moves one writable document leaf (L-12's neighbour).**
+   `after_write.document_leaves.n_mismatched = 1` of 1071 - so for Vital the
+   parameter channel is coupled to the document channel even when only a parameter
+   is written. By the end of the run every writable leaf equalled the baseline
+   again, so the coupling self-corrected (the plugin re-mirrors the value). **The
+   path of that leaf is not in this artifact**: the probe summarised the diff and
+   dropped the `mismatched` rows - a defect of *this file* (fixed in
+   `test_p12_live_smoke.py` by recording the rows; **not re-measured**, because a
+   re-run would be a second live write, which the brief forbids).
+2. **The prescribed whole-document restore is refused by the route gate (new
+   limitation L-12).** Because the write moved a document leaf, the probe applied
+   the transactional recovery policy - the codec's own change set, 1071 leaves -
+   and the call was **refused before any write**: `DependencyViolation`,
+   `REFUSED_BEFORE_ANY_WRITE`, `write_calls_attempted: 0`, no state written. The
+   cause is structural, not incidental: `VitalCodec.restore_changes` is "every
+   captured writable settings leaf", which necessarily contains the route table the
+   gate refuses (§22.1). **The gate is right** (it cannot tell a restore from a
+   create) and the refusal cost nothing here, because the state was already back to
+   the baseline by measurement - but the interaction is real and needs an owner
+   decision (recorded as **L-12** in [19 §7](docs/universal-plugin-mcp-v3/19-owner-decisions.md)).
+
+### 23.3 Two defects in the probe itself (the reason the pytest run ended red)
+
+The **plugin behaviour was correct in every assertion the run's own data supports**;
+the red status comes from this file's bookkeeping, and it is recorded rather than
+papered over:
+
+1. the assertion block read `report["control"]["target_differs_from_original"]` and
+   `["range_respected"]`, while the report dict carried `delta_in_range` → `KeyError`
+   **after** the restore had completed (the restore is in `finally`, exactly so a
+   late failure cannot skip it). Fixed by carrying all three keys.
+2. the final block labelled `text_digest(slice_final.block_text)` as the *chunk*
+   digest and compared it against the baseline *chunk* digest, so a correct restore
+   read as `chunk_matches_baseline: false`. Fixed: the whole chunk is read and hashed
+   separately from the located block.
+3. the restore verdict originally required the optional document write to succeed;
+   it now depends on the **measured** state (document leaves, exact parameter vector,
+   block digest, routes), with the document write's outcome recorded separately -
+   a refused-but-unneeded recovery must not be reported as a failed restore.
+
+### 23.4 What this run does **not** prove
+
+- **Instance continuity is not claimed and not proven** (L-3 stands): the write was
+  location-addressed, and the revalidation only shows that the instance facts,
+  handle and location were identical *inside this call*.
+- The **final revision digest was not recorded** by the probe (gap). The two inputs
+  it is derived from - the located block text and the full parameter vector - were
+  both measured equal to the baseline, so it would equal the baseline digest by
+  construction; this run does not assert it as a measurement.
+- The leaf that drifted and came back is **counted, not named** (23.2 item 1).
+- The live write suite (`P8.3`/`P8.4`/`P10`) is still **not run**: unchanged from §22.5.
+- The probe's fixed version has **not been executed** (no second live run).
+
+### 23.5 Commands and counts after the smoke test
+
+| Command | Kind | Result |
+| --- | --- | --- |
+| `py -3.11 -m pytest tests/plugins/live/test_p12_live_smoke.py -q -p no:cacheprovider -s` | live: 1 write + 1 restore | **1 failed** (76 s) - the failure is the probe's own `KeyError` (§23.3), with write and restore verified in the artifact |
+| `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live` | offline, after the offline probe fixes | **390 passed** |
+| `py -3.11 -m pytest tests/plugins/test_p12_safety_gates.py tests/plugins/test_p2_transaction.py -q -p no:cacheprovider` | gates + engine | **84 passed** |
+| `py -3.11 -m pytest tests/plugins/live --collect-only -q -p no:cacheprovider` | live suite import/collect | **5 collected** |
+
+### 23.6 Git state after the smoke test
+
+- Branch `feature/vst-bridge`, HEAD `c060def4616cead0118136d92a0dad8924f495d2`.
+  **No commit, no `git add`, no destructive git operation.** Every git command was
+  read-only.
+- **The index moved again before this round's work, and not by it:** `.git/index`
+  mtime `2026-10-11 06:03:42`, **132 staged paths**, `git status --porcelain -uall`
+  now shows `122 A ` + `10 M ` and `git diff --name-only` is **empty** (worktree ==
+  index at 06:03:42). The 10 staged modifications are `README.md`,
+  `src/reaper_reapy_mcp/server.py` and the eight planning documents
+  (`05`, `06`, `10`, `11`, `12`, `14`, `18`, `19`). Nothing in this round staged or
+  unstaged anything.
+- New **untracked** paths created by this round: `tests/plugins/live/test_p12_live_smoke.py`
+  (the probe) and `tests/plugins/live/evidence/p12_live_smoke__20261011T041434Z__363904d8c23c.json`
+  (the run's evidence). `composer_v1_2_lm_probe.md` remains present, unmodified and
+  untracked.
+
+### 23.7 Status of this round
+
+**`LIVE SMOKE TEST PASS WITH LIMITATIONS`.** One write and its restore were performed
+and are confirmed by measurement: the parameter moved exactly as intended and came
+back exactly (2858/2858 parameters, 1071/1071 writable document leaves, block digest,
+outside span, no routes), through the registered tool, with zero writes in the dry run
+and no state write ever reached. The limitations are named: the probe's own assertion
+defect made the pytest run red, the coupling between the parameter and document
+channels is now measured but the drifting leaf's path is not in the artifact, the
+prescribed whole-document restore is refused by the gate (**L-12**, needs an owner
+decision), instance continuity remains unprovable (**L-3**), and the fixed probe has
+not been re-run.
+
+---
+
+## 24. P17/P18 — three-instance practical acceptance: three basses, live-measured laws (2026-10-11)
+
+The practical-acceptance round the owner asked for: three **new** tracks with three
+independent Vital instances, three different usable basses written through
+`plugin_write` in single batches, real MIDI phrases, real renders, measured audio,
+the mandatory freshness test, and every defect that blocked the music fixed in its
+own layer. Every claim about this round's runs is backed by an artifact created in
+this session; where the old system's measured artifacts are used as corroboration
+(the single-frame wavetable proof, the Bend richness sweep) they are named as such.
+
+### 24.1 What was built (live, this session)
+
+- Tracks 1/2/3 created through the registered `create_track`, named for their roles:
+  **`V3-A Deep Glide 808`**, **`V3-B Distorted Rap 808`**, **`V3-C Dubstep Glide Bass`**.
+  Evidence: `p17_three_instances__20261011T100201Z__e44f0be27515.json`.
+- One **VST3i Vital** per role track through `add_fx` — and a measured host-tool
+  defect surfaced immediately (24.2 item 2). The fixed probe
+  (`tests/plugins/live/test_p17_three_instances.py`) is idempotent: its re-run
+  created nothing and passed in 17.9 s
+  (`p17_three_instances__20261011T112833Z__9e68e0510239.json`).
+- Three basses written as **one dry run + one applied batch per track** (51/49/51
+  controls; `ALL_VERIFIED`; every row agrees):
+  evidence `p18_bass_acceptance__20261011T112738Z__ce39b7583497.json`,
+  the patch spec is `tests/plugins/live/p18_bass_patches.json`.
+- One 4 s phrase item per track (overlapping notes for the legato slides, a gapped
+  note for the forced glide), kept on the tracks; renders:
+  `p18_bass_A__*.wav`, `p18_bass_B__*.wav`, `p18_bass_C__*.wav` in
+  `tests/plugins/live/evidence/`.
+
+### 24.2 Defects found and fixed in code
+
+1. **`add_fx` answered success for a failed add** (`mcp_tools.py`): the controller
+   answers a bool and the tool tested `fx_index >= 0` - and `False >= 0` is `True`.
+   Fixed: a failed add is an error envelope; on success the FX index is **re-read**
+   from the track. `create_track` now also returns its `track_index`. Regression:
+   `tests/plugins/test_p17_host_tool_accounting.py` (4 tests).
+2. **Fuzzy `add_fx` names resolve to the VST2 build** (measured: `"Vital"` and
+   `"Vital (Vital Audio)"` both landed `VSTi: Vital`, which the provider does not
+   match; only `"VST3i: Vital (Vital Audio)"` is the VST3i). The P17 probe now tries
+   the exact name first and removes a landed non-matching FX before trying the next.
+   The accidental duplicates were removed through `remove_fx` and each role track was
+   verified to carry exactly one VST3i at fx 0.
+3. **Truncated corpus ranges made three parameter families silently wrong** (the
+   brief's "portamento range problem"): the registry's native ranges come from the
+   observed preset corpus, so `portamento_time` stopped at -0.476 (0.72 s) while the
+   parameter runs to +4 (16 s); envelope attack/decay/release declared a linear
+   0..2.378 s while the plugin maps them **quartic to 32 s**; `portamento_slope`
+   declared -4.5..+8 vs a measured -8..+8; `volume` declared a nonsense 0..7399 dB.
+   Measured live (classic `set_fx_param` wrote known host-normalized values; REAPER's
+   own `TrackFX_GetFormattedParamValue` reported the plugin's display), then corrected
+   in the provider via `profile_build.LIVE_MEASURED_CORRECTIONS`:
+
+   | control | measured anchors | corrected law |
+   | --- | --- | --- |
+   | `portamento_time` | 0.125 s at norm 0.5; 6.06286 s at 0.9; a write of the old -3.3 landed at **0.900531 s** | exponential over `2**-10 .. 2**4` s (`t = 2**(-10 + 14*norm)`) |
+   | `portamento_slope` | -4 at 0.25; +4 at 0.75; +8 at 1.0 | affine -8..+8 |
+   | `env_{1..6}_{attack,decay,release}` | 0.125 s at 0.25; 2.00002 s at 0.5; 10.1251 s at 0.75; 32.0003 s at 1.0 | power `32.0003 * norm ** 4` |
+   | `volume` | -36.99 dB at 0.25; -19.1747 dB at 0.5; +6.02 dB at 1.0 | power `-80 + 86.02 * norm ** 0.5` (power law gained an optional `offset` in `values.py`) |
+
+   Regression: `tests/plugins/test_p18_live_corrections.py` (5 tests, real-registry
+   anchors); the P16 additivity test now pins that only these measured rows may
+   differ from their registry declaration. The registry files in `C:\REAPER` were
+   **not modified** - the correction is a provider-side projection with its evidence
+   named, so the old system keeps its data.
+4. **The dry-run plan did not expose what it plans FROM** (`api.py`): `PlanItem.from_`
+   existed but was not rendered, so "the plan is built against the live read" was not
+   checkable by a caller. `plan.items[]` now carries `from` (additive key); the
+   freshness probe asserts exactly that value.
+5. **Measured-inert controls documented, not worked around blindly**:
+   `osc_N_wave_frame` is inert on the fresh instances (single-frame "Init" table,
+   table_id `1e4f3dfee12a65b88d98`, the old system's `wavetable_proof` + `bh2_frame_probe`
+   measured the same) and the **spectral morph is inert too** on these tables: two
+   isolation renders (morph `Low Pass` @ 100 vs `None` @ 0 on the sub oscillator)
+   produced identical metrics to four significant figures (h2 -6.0, h3 -9.5,
+   sub 0.761, centroid 222.0); artifact
+   `p18_morph_inert__20261011T114948Z__3ac81047a784.json`. The basses therefore use no
+   morph as a load-bearing element; the parameter remains writable (it is addressable
+   and may be audible on multi-frame tables), and this row in the coverage matrix is
+   marked measured-inert instead of "supported".
+
+### 24.3 The three basses (final, measured)
+
+| | A `V3-A Deep Glide 808` | B `V3-B Distorted Rap 808` | C `V3-C Dubstep Glide Bass` |
+| --- | --- | --- | --- |
+| controls in the one batch | 51 | 49 | 51 |
+| source design | sine-clean sub: osc 2 (raw source) -> **Filter 2** 24 dB @ 35 st; osc 1 -> Filter 1 Analog 24 dB @ 50 st (light knock) | raw sub on **DIRECT OUT** + osc 1 through Dirty 24 dB @ 86 st with `Bend` @ 50 (measured richness sweet spot from the old corpus), post **Linear Fold** @ +18 dB / mix 0.9 | raw sub on DIRECT OUT + osc 1 (2-voice unison, detune 12) through Ladder 24 dB @ 96 st + **Formant** Filter 2 (mix 0.75) |
+| pitch bend range | `0 semitones` (all three - a stray wheel measured -2 st on fresh instances) | same | same |
+| glide time (real, now) | 0.10 s | 0.15 s | 0.20 s |
+| voice pin | `Voice Priority = Newest`, polyphony 1, legato On, force On | same | same |
+| envelope | A 4 ms / 0.8 s / 0.82 / 0.25 s | 3 ms / 0.5 s / 0.88 / 0.12 s | 5 ms / 0.7 s / 0.8 / 0.2 s |
+| loop-free level | volume -1.0 dB | -8.5 dB | -4.5 dB |
+| **centroid** | **69.6 Hz** | **248.0 Hz** | **333.6 Hz** |
+| sub / mid / high fractions | 0.956 / 0.044 / 0.0 | 0.781 / 0.142 / 0.016 | 0.707 / 0.202 / 0.037 |
+| h2 / h3 at A1 | -6.8 / -13.5 dB | +2.6 / -12.4 dB | +0.9 / -9.2 dB |
+| tuning error (per note) | 0.04-0.06 st | 0.0 st | 0.0 st |
+| attack rise | 2.9 ms | 0.0 ms | 1.5 ms |
+| glide transit frames (up1/up2/down-window) | 1 / 0 / 3 | 2 / 2 / 6 | 6 / 3 / 9 |
+| rms / peak | -12.0 / -3.0 dBFS | -11.9 / -3.8 dBFS | -12.7 / -0.5 dBFS |
+| clipping | 0 samples | 0 | 0 |
+
+The three sounds are measurably distinct in structure, not by one cutoff value: the
+centroid ordering A<B<C, the sub-share ordering A>B>C and C carrying the most
+top-band energy are asserted by the acceptance probe itself. WAVs are beside the
+evidence for listening; the probe's claims are the measured ones.
+
+### 24.4 The mandatory freshness test (brief section 6) - result
+
+`tests/plugins/live/test_p18_cache_freshness.py`, live, 43.5 s, evidence
+`p18_cache_freshness__20261011T112518Z__9c72a0fe6b03.json`:
+
+1. V3 `plugin_read` of `filter_1_cutoff` on the track-1 instance: **50.0**.
+2. Independent change through the **classic** `set_fx_param` (host normalized 0.5).
+3. V3 read again: **72.0** (= 8 + 0.5 x 128, the affine law) - the external change is
+   visible; no value cache or TTL exists to mask it.
+4. A `plugin_write` dry run of the original value: `plan.items[].from == 72.0` -
+   the plan is built against the live read inside that call.
+5. Restored the exact host-normalized value through the classic tool: V3 reads
+   **50.0** again; the host-normalized value is exactly the pre-test one.
+
+### 24.5 Batch-first metrics (brief section 8)
+
+- Workflow calls with the batch strategy: **13** - the plugin-path calls the probe
+  makes (1 discovery, 6 writes = 2 per track, 3 renders, 3 isolation reads); the
+  fixed item/MIDI/track overhead is not counted on either side, so the core
+  like-for-like number is **6 plugin-write calls vs 453** for the same 151 written
+  controls (read + apply + read-back per control) -> the batch path spends **x75**
+  fewer write-path calls, and the x34.8 headline (13 vs 453) is the conservative,
+  whole-workflow view.
+- Host writes: **3** `write_params` calls for 151 controls (one per track), all
+  `ALL_VERIFIED`, all rows agreeing; host reads per applied write: 27.
+- Timing (per track): dry run 11.0-11.7 s, applied write 21.6-22.5 s, render ~7-10 s.
+  The dry run's cost is dominated by the by-design full-vector capture (AUD-002);
+  redundant host calls inside the transaction were audited (24.8) and are recorded
+  as remaining work rather than silently optimised.
+- No repeated discovery: one `plugin_instances` call powered every target; per-track
+  reads were targeted (3 reads for the isolation proof).
+
+### 24.6 Multi-instance correctness (brief section 7)
+
+- P17 proves discovery of all three instances with distinct locations and (on its
+  re-run) that a request for an existing role track **adds nothing**.
+- The acceptance probe reads `filter_1_cutoff` back from every instance and requires
+  its own written value: **50 / 86 / 96** (fail = a crossed target or a shared
+  value/profile cache); it also requires `portamento_time` to read 0.10 < 0.15 < 0.20
+  across A/B/C - the three glide times as written to three different instances.
+- Limitation **L-3 is unchanged**: continuity of the *physical* instance between
+  calls is not claimed; the guarantees are state-based (complete capture, verified
+  write, verified read-back, location-addressed targets).
+
+### 24.7 Tests and evidence (this round)
+
+| Command | Kind | Result |
+| --- | --- | --- |
+| `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live` | offline | **424 passed** (19.1 s) |
+| `... tests/plugins/live/test_p17_three_instances.py -q -s` | live: create/find + idempotent re-run | **1 passed** (52.1 s first run, 17.9 s re-run) |
+| `... tests/plugins/live/test_p18_bass_acceptance.py -q -s` | live: 3 batches + 3 renders + measurements | **1 passed** (123.9 s) |
+| `... tests/plugins/live/test_p18_cache_freshness.py -q -s` | live: independent-change freshness | **1 passed** (43.5 s) |
+
+New evidence artifacts this round: `p17_three_instances__20261011T100201Z__e44f0be27515.json`,
+`p17_three_instances__20261011T112833Z__9e68e0510239.json`,
+`p18_bass_acceptance__20261011T112738Z__ce39b7583497.json`,
+`p18_cache_freshness__20261011T112518Z__9c72a0fe6b03.json`,
+`p18_bass_A/B/C__*.wav`; the calibration transcripts behind 24.2 item 3 are
+consolidated in `p18_calibration__20261011T114948Z__c91845f34b01.json` (all anchors,
+including the endpoint measurements 0.0 -> 0.000976562 s / 1.0 -> 16 s for the glide
+time and 0.0 -> -80 dB / 1.0 -> +6.02 dB for the volume), and the isolation renders
+behind 24.2 item 5 in `p18_morph_inert__20261011T114948Z__3ac81047a784.json`.
+
+### 24.8 Residual gaps (named, not glossed)
+
+- `env_N_hold` / `env_N_delay` still use the registry's declared linear law (the
+  quartic family was measured for attack/decay/release only); they are not used by
+  the three basses.
+- `distortion_filter_order` (enum without measured band positions) and
+  `filter_1_drive` (a 257-member dB-step enum) were **avoided** in the patches rather
+  than written through an unmeasured mapping.
+- `voice_tune` (declared 0..0.28125) and `pitch_bend_range`'s declared max (24 vs 48
+  enum members) carry suspicious metadata; not written here.
+- The transaction still performs the audited redundant host calls (duplicated
+  planned-parameter read, `fx_facts` for `_param_count`, the ordinal re-probe;
+  audit of 2026-10-11) - performance work, no safety impact, not done in this round.
+- For controls whose mapping rests on a self-consistent law (sweep-fitted P16 rows
+  and the corrected rows alike), an agreeing read-back row cannot by itself falsify
+  the mapping - the same law runs in both directions. The independent checks are the
+  live calibration artifacts (concrete host-normalized values vs the plugin's own
+  display) and the audio metrics; a per-control audio tie does not exist, and the
+  patch values whose mapping was not individually calibrated (`distortion_drive 18`,
+  `filter_2_cutoff 35`, sustain/powers) are design choices resting on the declared
+  laws, with the audio measurements as the outcome check.
+- Instance continuity (**L-3**) and the whole-document restore (**L-12**, needs the
+  owner decision) are unchanged. Modulation routes stay unavailable (**L-10**), so
+  dynamic wobble would need the route gate re-decided; the C bass is static-control
+  expressive (unison detune, filter model, glide length) within today's gate.
+- `A`'s tuning error of 0.04-0.06 st is attributed to filter phase on the
+  autocorrelation estimate (all three notes, same sign); it is ~0.3 % in frequency.
+
+### 24.9 Git state after this round
+
+Branch `feature/vst-bridge`, HEAD unchanged (no commit, no `git add`, no reset, no
+stash, no checkout; the index was not touched). Working-tree modifications from this
+round are unstaged: `src/mcp_tools.py`, `src/reaper_reapy_mcp/plugins/api.py`,
+`values.py`, `providers/vital/profile_build.py` (plus the earlier `host/reaper.py`,
+`profile.py`, `dependencies_rules.py`, `tests/plugins/test_p11_rules.py` from P16).
+New untracked files: `tests/plugins/test_p16_measured_laws.py`,
+`test_p16_transport_recovery.py`, `test_p17_host_tool_accounting.py`,
+`test_p18_live_corrections.py`, `tests/plugins/live/test_p17_three_instances.py`,
+`test_p18_bass_acceptance.py`, `test_p18_cache_freshness.py`,
+`tests/plugins/live/p18_bass_patches.json`, and the four evidence JSONs plus three
+WAVs listed in 24.7. `composer_v1_2_lm_probe.md` remains present, unmodified and
+untracked. The REAPER project was **not saved** at any point of this round.
