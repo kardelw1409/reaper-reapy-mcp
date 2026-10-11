@@ -69,8 +69,27 @@ def by_id(profile: dict, control_id: str) -> dict:
     raise AssertionError(f"control {control_id!r} is not in the profile")
 
 
+def test_voice_transpose_is_the_displayed_semitone_offset(real_profile):
+    """The measured anchors: the corpus range made the neutral read +10 st."""
+    control = by_id(real_profile, "voice_transpose")
+    assert control["range"] == {"min": -48.0, "max": 48.0}, control["range"]
+    assert control["law"]["kind"] == "affine", control["law"]
+    # the measured points, in the *corrected* space: the value is the semitones
+    assert V.to_normalized(control, 0.0) == pytest.approx(0.5, abs=1e-9)
+    assert V.to_normalized(control, 48.0) == pytest.approx(1.0, abs=1e-9)
+    assert V.to_normalized(control, -48.0) == pytest.approx(0.0, abs=1e-9)
+    assert V.to_normalized(control, -6.0) == pytest.approx(0.4375, abs=1e-9)
+    # every measured (written, displayed) pair from the probe's declared space:
+    # declared value v displayed 1.6 * v + 9.6 semitones, so in the corrected
+    # space the same normalized position must map back to that display
+    for written, displayed in ((24.0, 48.0), (0.0, 10.0), (-24.0, -29.0), (12.0, 29.0), (-12.0, -10.0)):
+        legacy_normalized = (written + 36.0) / 60.0
+        corrected_value = legacy_normalized * 96.0 - 48.0
+        assert corrected_value == pytest.approx(displayed, abs=0.5), (written, displayed, corrected_value)
+
+
 def test_the_correction_table_covers_exactly_the_measured_rows():
-    expected = {"portamento_time", "portamento_slope", "volume"}
+    expected = {"portamento_time", "portamento_slope", "volume", "voice_transpose"}
     expected |= {f"env_{i}_{section}" for i in range(1, 7) for section in ("attack", "decay", "release")}
     assert set(LIVE_MEASURED_CORRECTIONS) == expected
 

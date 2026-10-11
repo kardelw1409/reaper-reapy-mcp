@@ -190,10 +190,43 @@ def to_normalized(control: dict[str, Any], native: Any) -> float:
     return float(native)
 
 
+def _enum_switch_points(control: dict[str, Any]) -> list[float] | None:
+    """The members' measured band starts, when a provider fitted them.
+
+    The declared uniform mapping assumes equally wide bands, so a value can be
+    resolved by rounding. A **measured** band map is not equally wide, and a value
+    sitting exactly at a switch point belongs to the member that *starts* there -
+    measured on this plugin: normalized 0.0625 formats as "24dB", which begins at
+    0.0625, while the midpoint the write uses is 0.125. Inverting by nearest
+    midpoint read that value as the member *below* it (5 of 64 grid points on the
+    filter styles, found by an independent review of 2026-10-11).
+    """
+    params = _law_params(control)
+    raw = params.get("switch_points")
+    members = _enum_members(control)
+    if not isinstance(raw, (list, tuple)) or len(raw) != len(members) or len(raw) < 2:
+        return None
+    points: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, _NUMBER_TYPES):
+            return None
+        points.append(float(item))
+    if any(later < earlier for earlier, later in zip(points, points[1:])):
+        return None
+    return points
+
+
 def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
     ctype = control.get("type")
     if ctype == "enum":
         members = _enum_members(control)
+        switch_points = _enum_switch_points(control)
+        if switch_points is not None:
+            index = 0
+            for candidate, point in enumerate(switch_points):
+                if float(normalized) >= point:
+                    index = candidate
+            return float(max(0, min(index, len(members) - 1)))
         positions = _enum_positions(control)
         if positions is not None:
             nearest = min(range(len(positions)), key=lambda i: abs(positions[i] - float(normalized)))

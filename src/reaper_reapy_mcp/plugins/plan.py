@@ -139,7 +139,17 @@ def build_plan(
 
 
 def project_world(live: LiveState, resolved: ResolvedRequest) -> dict[str, Any]:
-    """Live state overlaid with the planned changes, as plain signals."""
+    """Live state overlaid with the planned changes, as plain signals.
+
+    ``live_document`` is the provider-shaped decoded document, passed through
+    **untouched**. It is the smallest honest way to let a provider rule whose
+    deciding input is a *live flag* be evaluated: Core must not interpret the
+    document to hand over a pre-digested flag (that would put provider
+    semantics in Core), and a rule that cannot see the state its plan starts
+    from can only be refused, never decided (L-10). The value is opaque data for
+    the provider's own evaluator; nothing serializes the world - findings carry
+    their own subjects.
+    """
     routes = active_route_count(live.routes)
     removed_slots = {int(spec["slot"]) for spec in resolved.routes_remove}
     for route in live.routes:
@@ -162,4 +172,6 @@ def project_world(live: LiveState, resolved: ResolvedRequest) -> dict[str, Any]:
         "controls_changed": controls_changed,
         "state_paths_changed": state_paths_changed,
         "n_slots_total": len(live.routes),
+        #: provider-shaped opaque document (see the docstring)
+        "live_document": live.document,
     }

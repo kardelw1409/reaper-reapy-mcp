@@ -602,10 +602,12 @@ def test_rules_that_the_projected_world_cannot_decide_are_declared_not_guessed()
     rows = RULES.rules_not_evaluated()
     assert {row["rule"] for row in rows} == {
         "fm_needs_modulator",
-        "route_into_off_filter",
         "wave_frame_needs_multiframe_wavetable",
     }
     assert all(row["needs"] for row in rows)
+    # `route_into_off_filter` is evaluated since 2026-10-11 (the destination->module
+    # join plus the projected on/off flag); it must not be disclosed as unchecked.
+    assert RULES.rule_evaluated("route_into_off_filter") is True
     ruleset = provider_on_fixtures_with_profile().dependencies()
     assert {rule["id"] for rule in ruleset.rules} >= {row["rule"] for row in rows}
 
@@ -621,16 +623,19 @@ def provider_on_fixtures_with_profile() -> VitalProvider:
 # ---------------------------------------------------------------------------
 
 
-def test_v3_a_route_create_is_refused_by_the_unevaluated_rule_gate():
-    """Owner safety-gate correction (2026-10-11).
+def test_v3_a_route_create_is_refused_when_the_registry_cannot_decide_the_rule():
+    """Owner safety-gate correction (2026-10-11); updated the same day.
 
     This test used to prove a successful two-route write ("one route per state
-    write"). That behaviour is no longer reachable through the engine: the rule
-    `route_into_off_filter` is declared but not evaluated, its subject (a created
-    pair) is decidable and its deciding inputs are not, so **creating a route is
-    refused before the first write** rather than applied under an unchecked rule.
-    The measured structural limit itself is still proven - one level down, on the
-    codec's own plan (see the test below), where no rule gate is involved.
+    write"). It then proved the *refusal* that followed the owner's correction.
+    Since the rule `route_into_off_filter` became **evaluated** (destination->
+    module join + the projected module on/off flag), the refusal here has a
+    narrower, honest reason: the **pinned fixture registry carries no Switch
+    rows**, so this fixture cannot decide the flag for Filter 1 - and an
+    undecidable subject still refuses, with the missing input named. The decided
+    paths (off -> violation, on -> applied) are proven against the shipping
+    registry in `test_p19_route_rule.py`; the one-route-per-write limit stays
+    proven on the codec's own plan (the test below).
     """
     host = vital_host()
     provider = provider_on_fixtures()

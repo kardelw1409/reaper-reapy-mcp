@@ -178,14 +178,16 @@ def test_the_guard_fires_on_a_control_bound_into_the_route_table():
 
 
 def test_the_rule_discloses_what_it_does_not_cover():
-    """The guard's subject list is part of the decision, so it is asserted."""
-    guard = RULES._guard_for("route_into_off_filter")
-    assert guard["decision"] == "refuse_before_any_write"
-    assert any("binding" in line for line in guard["subjects"])
-    text = " ".join(guard["not_subject"])
-    for kept in ("routes_remove", "state writes outside the route table"):
-        assert kept in text, guard["not_subject"]
-    assert guard["not_subject"], "a refusal must name what it does not cover"
+    """The rule's subject list and its uncovered cases are part of the decision."""
+    evaluation = RULES.evaluation_for("route_into_off_filter")
+    assert evaluation["decision"] == "decide_then_refuse_only_the_decided_violation"
+    assert any("binding" in line for line in evaluation["fail_closed_when"])
+    assert any("routes_create" in line for line in evaluation["subjects"])
+    text = " ".join(evaluation["not_covered"])
+    for kept in ("routes_remove", "state writes outside the route table", "Filter FX"):
+        assert kept in text, evaluation["not_covered"]
+    assert evaluation["not_covered"], "a decision must name what it does not cover"
+    assert evaluation["scope"] == list(RULES.MEASURED_FILTER_SCOPE)
 
 
 # ---------------------------------------------------------------------------

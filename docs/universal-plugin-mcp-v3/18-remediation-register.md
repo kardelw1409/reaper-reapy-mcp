@@ -212,3 +212,80 @@ freshness test — full record in `IMPLEMENTATION-STATUS.md` §24. Evidence:
 | `wave_frame` / spectral morph on the fresh instances | **measured inert** (single-frame Init table; two isolation renders with morph `Low Pass` @ 100 vs `None` produced identical metrics) — documented as inert, not as "supported"; both stay addressable | `IMPLEMENTATION-STATUS.md` §24.2 item 5 |
 | three basses, one batch write each | **live**: 51/49/51 controls, `ALL_VERIFIED`, all rows agree; distinct measured characters (centroid 69.6 / 248.0 / 333.6 Hz; sub 0.956 / 0.781 / 0.707); 0 clipped samples; tuning error <= 0.06 st | acceptance evidence; WAVs beside it |
 | batch-first accounting | **measured**: 13 workflow calls vs 453 naive single-control calls (x34.8); 3 host `write_params` calls for 151 controls | acceptance evidence `metrics` |
+
+---
+
+## Addendum 6 — P19: the 808 acceptance, and the enum-band defect it uncovered (2026-10-11, live)
+
+One Vital instance (`V3-A Deep Glide 808`, track 1, fx 0) taken from "verified
+writes that do not sound like an 808" to an accepted patch. Full record in
+`IMPLEMENTATION-STATUS.md` §25. Evidence:
+`p19_morph_audibility__20261011T131400Z__d7735b0e9fe9.json`,
+`p19_osc_transpose_travel__20261011T133849Z__e14d5ad425b9.json`,
+`p19_voice_transpose_space__20261011T134428Z__41f60fa0816b.json`,
+`p19_808_shaping__20261011T140756Z__841d432401bd.json` (+ its WAVs),
+`p19_808_shaping_reanalysis__20261011T141525Z__f3b6aa7dac07.json`,
+`p19_enum_bands_through_host__20261011T143023Z__0f6794f11257.json`,
+`p19_acceptance_808_patch__20261011T143231Z__65d79bbb3d3c.json` (+ the render),
+`p19_morph_amounts__20261011T145943Z__085f13435aae.json`,
+`p19_acceptance_detail__20261011T150230Z__55a4e96ba232.json`,
+`p19_patch_host_verification__20261011T150343Z__2a4290fee6a6.json`.
+
+An independent review of this round was run with **GLM-5.3 Flash** (the reviewer the
+brief names) before reporting. It falsified one claim of mine (the morph), found a
+real defect I had missed (the enum read leg), named the circularity of the layer's
+verification, and constructed an estimator edge case - each item is in the table
+below with what was measured afterwards.
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| route creation refused wholesale, so no pitch drop could be expressed | **fixed**: `route_into_off_filter` is now an **evaluated** rule (destination->module join derived 316/316 from the registry, module switches derived, the decoded live document carried in the projected world); only a pair into an OFF Filter 1/2 is refused, an undecidable subject still fails closed with the missing input named | `tests/plugins/test_p19_route_rule.py`; `profile_build.state.structural_ops[0]` (`route_create`) is `available: true` and names its decider |
+| a *declared* `enum_index` law is not the plugin's band map | **fixed**: `_declared_enum_positions` attaches measured band positions **only** where the uniform mapping puts a member outside its own measured band (3 controls: the filter styles, 4 of 5 members each) | live proof, same instance: `filter_1_style` "Notch Blend" @ 0.25 -> write "24dB" -> host reads **"24dB"** @ 0.125; `tests/plugins/test_p19_enum_positions.py` re-derives the corrected set from the registry sweeps |
+| the layer's own read-back cannot falsify such a mapping | **measured, and this is the generalisable half**: write and verify ran the same wrong arithmetic, so `ALL_VERIFIED` was true and useless; the **host's formatter** (an independent channel) disagreed. Every enum control in the acceptance patch is now verified through REAPER as well | `p19_enum_bands_through_host__*.json`; §25.4 |
+| an enum read back by *nearest midpoint* mis-resolves a value at a measured switch point | **fixed (found by the independent review)**: the measured band **switch points** are carried next to the midpoints and `values.normalized_to_native` resolves an enum by them; the host labels 0.0625 as "24dB" while midpoint distance called it the member below (5 of 64 grid points) | `tests/plugins/test_p19_enum_positions.py::test_the_read_leg_resolves_every_measured_grid_point_of_the_host` (all 65 host-labelled points, plus the counter-example) |
+| "the spectral morph is inert" | **corrected - the claim was too strong**, and the review falsified it from the round's own WAVs: `@25`/`@60` change the waveform (0.0595 / 0.0062 max diff) while the *metrics* stay identical at every amount (h2 -22.22, centroid 55.4 Hz, sub 0.9994). The measured facts are now: amount 100 is a no-op on this table, the render does respond to other amounts, and none of them is what separates a saw from a sub through this filter - the filter is | `p19_morph_amounts__20261011T145943Z__085f13435aae.json`; §25.1 item 3 |
+| the acceptance's numeric verification is law-derived on both legs (circular) | **answered with an independent read-only check**: the plugin's own formatted text for 11 numeric controls matches the intent in its own unit (`filter_1_cutoff` `-26.0805 semitones` = 58.0 Hz, `env_2_*` in secs, `filter_1_resonance` `4%`, ...) | `p19_patch_host_verification__20261011T150343Z__2a4290fee6a6.json` |
+| the pitch-drop *depth* is not verifiable by a windowed estimator | **stated as a bound, not as a measurement**: a true 12 st glide reads at most +7.5 st through the 2048-sample instrument; measured facts are the drop's existence at every note, its monotonicity in the requested depth, and a 0.235 s settle | `p19_acceptance_detail__20261011T150230Z__55a4e96ba232.json`; §25.5 |
+| the pitch estimator resolves an octave high on an H2-dominant signal | **accepted limitation, pinned as a test** (constructed by the review); cannot arise from these materials (sub h2 >= 16 dB down, saw h2 6.8 dB down) | `tests/plugins/test_p19_pitch_estimator.py` |
+| the filter cutoffs were written in the wrong value space | **pinned, not changed**: the profile's space is the plugin's document value (`display = document - 60`, `Hz = 261.625565 * 2 ** ((document - 60) / 12)`); the previous recipe's 50/86/96 were 147/1183/2093 Hz | `tests/plugins/test_p19_filter_units.py`; the acceptance patch's cutoff (document 33.92) reads **-26.0805 semitones -> 58.0 Hz** through the host |
+| the spectral morph the previous recipe relied on | **measured inert** on the single-frame "Init" table (Low Pass @ 100 bit-identical to None @ 0) - documented as inert, never as a mechanism | `p19_morph_audibility__*.json` |
+| `voice_transpose`'s corpus range made the documented neutral play +10 st sharp | **fixed by live measurement** (22nd corrected row: the caller's value *is* the displayed semitone offset, -48..+48) | `tests/plugins/test_p18_live_corrections.py`; probe H |
+| the codec's route `power` default came from a fixture | **fixed**: default `0.0`, recorded against the corpus (16868/17036 routes) and the live empty slot | `providers/vital/codec.py`; `provider.py` revision r6 |
+| the **probe harness** mis-measured low fundamentals (biased autocorrelation: 41.2 Hz read as 400.9 Hz) | **fixed and pinned**: bias-corrected estimator + shortest-period rule + a stated resolution limit (no 2048-sample frame below 100 Hz) + a separate short-window instrument for a fast drop (with its own bound: a window average is a lower bound) | `tests/plugins/test_p19_pitch_estimator.py` (11 tests); the P18 baseline re-reads -0.01/-0.02/-0.02 st, so no earlier conclusion depended on it |
+| `fm_needs_modulator` on the parameter channel; `plugin_modulation update` dropping `power`; probe B2's unexplained `WriteNotApplied` | **open, named** - the acceptance patch did not depend on any of them (empty route table, power on create, both channels verified) | §25.5 |
+
+## Addendum 7 — P20: the reference-guided 808, and the compressor nobody had set (2026-10-11, live)
+
+Same instance (`V3-A Deep Glide 808`, track 1, fx 0) taken from "closed sub with a
+click" to a patch fitted to a concrete audio reference
+(`Stickz FBT - 808 10 - F#.wav`) within **1.46 dB RMS** over h1..h7. Full record in
+`IMPLEMENTATION-STATUS.md` §26. Evidence: `p20_reference_analysis__20261011T152613Z__8c8da617c9bf.json`
+(+ plots, + audition WAVs), `p20_baseline_read__*`, `p20_probe_a_onset_source__*`,
+`p20_probe_b_compressor_filter__*`, `p20_probe_c_saturation__*`,
+`p20_probe_d_candidate__*`, `p20_probe_e_cutoff_sweep__*`, `p20_probe_f_combined__*`,
+`p20_probe_g_attack_options__*`, `p20_reanalysis__20261011T164622Z__188dd175360e.json`,
+`p20_final_808_patch__20261011T170029Z__288d943358cf.json` (+ the render and the
+loudness-aligned A/B copies), `p20_final_plot_*`.
+
+An independent review (GLM-5.3 Flash, read-only) re-measured the reference with its
+own instruments and **corrected one of my inferences** (the drop settles in ~45-60 ms,
+not 26 ms), reproduced the compressor finding from the arm WAVs, showed the FX
+`Distortion Type` enum is *not* affected by the P19 band defect (uniform
+`index/(n-1)` lands every member in its own measured band), and pointed at the
+corpus' own published version of the recipe.
+
+| Item | Status | Evidence / note |
+| --- | --- | --- |
+| **the click** in the failed patch | **found and removed**: the **multiband compressor FX was ON** (`mix 0.85`, low/high band +16.3 dB, band +11.7 dB) - never part of any P19 patch, it survived from the P18 bass recipe. Only `compressor_on = Off` takes the onset step from **13.6 % of peak (21x the body's slope)** to **0.55 % (0.9x)**; the arms that keep it reproduce the click bit-near-identically | probes A (`p20_probe_a_a3...wav`) and B (`p20_probe_b_b1...wav`); §26.2 |
+| **the closed sub** | **measured as missing harmonics, not a closed filter**: cutoff 58/116/232 Hz give h2 −20.2/−8.7/−7.8; saturating the *filtered* sub post-filter (Soft Clip +24 dB, **mix 0.20**, cutoff **50 Hz**) fits the reference's series to **1.46 dB RMS** | probes B/C/D/E + `p20_reanalysis__*`; the recipe is also `bass_synthesis_techniques.md` §8.6 (corpus, found by the review) |
+| the attack is *dragged* by the lowpass (no zero crossing for 18-21 ms) | **fixed by measurement**: a second route `env_2 -> filter_1_cutoff` (+12 st) opens the cutoff while the pitch is high; first half-cycle 8.7 ms, onset step 2.78 % of peak = **1.79x the body slope**, softer than the reference's own 3.3x | probe G (`g2_sweep12`); §26.3 |
+| `filter_1_keytrack = 100 %` on a bass patch | **trap measured and recorded**: the cutoff follows the *key*, so an E1 note closes the filter (h1 −47 dB, the sub dies). Keytrack is not a pitch-tracking mechanism | probe G (`g1_keytrack`) |
+| `routes_update` with a semantic `depth` (documented in 06 §8/§9) | **fixed (defect D1)**: only `routes_create` converted a depth, so the update arrived at the codec with a field it does not own and was refused as *"an update names no field to change"*. The provider now converts it; an update naming only a depth is refused with `detail.reason = "depth_without_destination"`; amount+depth keeps the amount. **The final patch writes its 18 st depth semantically** | `tests/plugins/test_p20_routes_update_depth.py` (8 tests); contract §8 updated |
+| the arm tables were measured with a body window that contained the **next note** | **instrument defect found and fixed**: `[onset+0.30, onset+0.80]` overlaps the phrase's second note (starts 0.7 s in) and lifted h2 by up to 4.6 dB; default is now `[onset+0.25, onset+0.55]` and **every arm was re-derived from the same WAVs** | `p20_reanalysis__20261011T164622Z__188dd175360e.json` |
+| a ±3 % harmonic band can contain **no FFT bin** on a short window | **instrument defect found and fixed**: the band is never narrower than 1.5 bins, and a fundamental with no bin refuses with the resolution named instead of returning zeros | `probe_p20_sample.py` (`_band_mask`); §26.4 |
+| "the filter's slope is ~11 dB/oct, so the `24dB` style may be inert" | **refuted by the corrected removal of the compressor confound**: the slope is ~20 dB/oct and the `12dB` arm measures h2 −13.4 vs −20.2 at the same cutoff - the style is effective | probes B/C (`c6_style_12db`); §26.2 |
+| the reference's drop settles in ~26 ms | **corrected by the independent review**: ~45-60 ms (my 26 ms came from a 5-frame rule over a 46 ms instrument, i.e. two cycles); the cycle-based start (+18.2 st) stands | review §1(b); §26.1 |
+| the drop's **depth** in the final patch | **still a bound**: the same instrument reads the reference at 7.68 st and the final render at 9.91 st; both average a <60 ms flight. Cycle-based facts: the reference +18.2 st, the arms monotone in the requested depth | §26.7 |
+| h3 is 3 dB strong in the final fit (−16.5 vs −19.6) | **accepted**: it is the largest single deviation of a ≤1.5 dB fit; the neighbours (drive, mix) trade h5/h7 for it | §26.7 |
+| loudness: the reference is a normalised sample (0 dBFS, −7.1 RMS) | **stated, not matched**: the patch is left at −3 dB (peak −7.8 dBFS); the A/B copies in the evidence are loudness-aligned instead | `p20_ab_final_*` |
+| `fm_needs_modulator` on the parameter channel; `power` dropped by `plugin_modulation update`; probe-B2 `WriteNotApplied` | **still open, unchanged by this round** | §25.5, §26.7 |

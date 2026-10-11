@@ -274,6 +274,12 @@ _MIN_DERIVATION_STATES = 3
 #: display text, not a member set, and the honest answer is a refusal.
 _MAX_DERIVED_ENUM_MEMBERS = 40
 
+#: The rounding the registry's sweep carries (change points stored to about seven
+#: decimals). A band boundary comparison must allow for it, or a *correct* mapping
+#: is reported as wrong: measured on the 257-member dB-step enums, where the sweep
+#: stores 0.0117188 for 3/256 and the uniform arithmetic asks for 0.01171875.
+_SWEEP_NORMALIZED_TOLERANCE = 1e-5
+
 
 def _measured_pairs(states: list[tuple[float, str]]) -> list[tuple[float, float]] | None:
     """Every measured state as ``(normalized, numeric display)`` - or ``None``.
@@ -321,6 +327,38 @@ def _norm_ordered_endpoints(pairs: list[tuple[float, float]]) -> tuple[float, fl
     return low, high
 
 
+def _band_spans(states: list[tuple[float, str]]) -> list[tuple[str, float, float]] | None:
+    """Each measured member's own band, in the order the measurement meets it.
+
+    The sweep records **change points**, so a member's first sample *is* the
+    boundary where the neighbouring member ends: a band is
+    ``[change_point[i], change_point[i+1])``. The last band has no recorded end,
+    and its width is mirrored from the band before it (for a two-state switch the
+    sweep has exactly two change points, so mirroring is what puts "On" at
+    ``[0.5, 1.0]`` rather than ending it at the 0.5 switch point).
+
+    Returns ``None`` for a sweep that carries fewer than two distinct labels (no
+    band structure to read).
+    """
+    points: list[tuple[float, str]] = []
+    for norm, display in sorted(states, key=lambda pair: pair[0]):
+        label = str(display).strip()
+        if points and points[-1][1] == label:
+            continue
+        points.append((float(norm), label))
+    if len(points) < 2:
+        return None
+    spans: list[tuple[str, float, float]] = []
+    for index, (start, label) in enumerate(points):
+        if index + 1 < len(points):
+            end = points[index + 1][0]
+        else:
+            width = start - points[index - 1][0] if index else 1.0
+            end = min(1.0, start + width)
+        spans.append((label, start, end))
+    return spans
+
+
 def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list[float] | None:
     """One measured normalized position per member: the middle of its own band.
 
@@ -331,31 +369,96 @@ def _band_positions(states: list[tuple[float, str]], members: list[str]) -> list
     (``index / (n - 1)``) lands 5 of the 11 members in the *neighbouring* band
     (audit of 2026-10-11, measured).
 
-    The position must be **interior** to the band, not at its switch point: the
-    sweep records change points, so a member's first sample *is* the boundary
-    where the neighbouring member ends. A band is therefore
-    ``[change_point[i], change_point[i+1])``; the last band has no recorded end,
-    and its width is mirrored from the band before it (for a two-state switch the
-    sweep has exactly two change points, so mirroring is what puts "On" at 0.75
-    instead of on the 0.5 switch point).
+    The position must be **interior** to the band, not at its switch point
+    (``_band_spans`` explains why the last band is mirrored).
     """
-    points: list[tuple[float, str]] = []
-    for norm, display in sorted(states, key=lambda pair: pair[0]):
-        label = str(display).strip()
-        if points and points[-1][1] == label:
-            continue
-        points.append((float(norm), label))
-    positions: dict[str, float] = {}
-    for index, (start, label) in enumerate(points):
-        if index + 1 < len(points):
-            end = points[index + 1][0]
-        else:
-            width = start - points[index - 1][0] if index else 1.0
-            end = min(1.0, start + width)
-        positions[label] = round((start + end) / 2.0, 6)
+    spans = _band_spans(states)
+    if spans is None:
+        return None
+    # the derived path feeds these positions to the *same* enum conversion, so it
+    # needs the same guard the declared path has: one band per member, in order.
+    # Without it a sweep whose label repeats in two non-adjacent bands (A, B, A)
+    # would collapse in the mapping below and borrow the last A's midpoint for the
+    # first (a value no band of the member owns).
+    if [label for label, _start, _end in spans] != list(members):
+        return None
+    positions = {label: round((start + end) / 2.0, 6) for label, start, end in spans}
     if set(positions) != set(members):
         return None
     return [positions[member] for member in members]
+
+
+def _declared_enum_positions(
+    members: list[str], states: list[tuple[float, str]]
+) -> dict[str, Any] | None:
+    """The measured band positions for a **declared** ``enum_index`` row, when the
+    measurement contradicts the uniform assumption - or ``None`` when it does not.
+
+    **Why this exists (measured 2026-10-11, live).** The profile trusted the
+    registry's `enum_index` declaration, whose mapping is ``index / (n - 1)``:
+    uniform bands. The plugin's own sweeps say the bands are anything but uniform -
+    `Filter 1 Style`'s "24dB" occupies ``[0.0625, 0.1875)`` while the uniform
+    mapping puts it at **0.25**, inside "Notch Blend"'s band. The consequence was
+    the defect this session had to chase by hand: writing ``filter_1_style =
+    "24dB"`` *landed in "Notch Blend"* and the layer's own read-back agreed
+    ("24dB!", because the same wrong law ran in both directions) - only the host's
+    formatted value, an independent channel, disagreed.
+
+    The correction is **additive and fail-closed**: it is attached only when the
+    derivation produces exactly one position per declared member and at least one
+    member's uniform position falls *outside* that member's own measured band. A
+    uniform enum whose mapping is already right (the two-state switches, whose
+    uniform 0.0/1.0 sits in ``[0, 0.5)``/``[0.5, 1.0]``) is left byte-identical -
+    so nothing that works today can change.
+
+    The count of members that *would* be mis-selected by the uniform mapping is
+    carried in the profile as evidence: it is the size of the defect being fixed.
+    """
+    if len(members) < 2:
+        return None
+    raw_spans = _band_spans(states)
+    if raw_spans is None:
+        return None
+    # A sweep can end with an *unlabelled* tail (measured: `Filter 1 Style`'s
+    # sixth state, at 0.5625, has an empty display string). That region names no
+    # member, so it is not a write target - but it is recorded, not hidden: the
+    # labelled spans are what the positions come from, and the gap is reported.
+    spans = [span for span in raw_spans if span[0]]
+    unlabelled_tail = len(raw_spans) - len(spans)
+    if len(spans) != len(members) or [label for label, _s, _e in spans] != list(members):
+        return None
+    positions = [round((start + end) / 2.0, 6) for _label, start, end in spans]
+    n = len(members)
+    uniform = [index / (n - 1) for index in range(n)]
+    # The sweep stores change points rounded to about seven decimals, so a uniform
+    # position can sit on a boundary by a *rounding* artefact (measured: the
+    # 257-member dB-step enums where ``3/256`` differs from the stored boundary by
+    # 5e-8). A member counts as outside only when it is outside beyond that
+    # artefact - otherwise a correct mapping would be "corrected" for nothing.
+    outside: list[str] = []
+    for index, (label, start, end) in enumerate(spans):
+        value = uniform[index]
+        if not (start - _SWEEP_NORMALIZED_TOLERANCE <= value <= end + _SWEEP_NORMALIZED_TOLERANCE):
+            outside.append(f"{label}@{value:g} outside [{start:g}, {end:g})")
+    if not outside:
+        return None
+    return {
+        "positions": positions,
+        #: The members' own band starts, for the *read* inversion. The host labels a
+        #: value exactly at a switch point as the member that starts there (measured:
+        #: normalized 0.0625 formats as "24dB", not as the member below it), so the
+        #: read path must use these boundaries, not the distance to a midpoint.
+        "switch_points": [round(start, 9) for _label, start, _end in spans],
+        "positions_source": (
+            "measured band midpoints of vital_scales_full.json: the declared enum_index law is "
+            "uniform (index / (n - 1)) and the measurement is not"
+        ),
+        "n_states": len(states),
+        "declared_mapping": "uniform index / (n - 1)",
+        "members_the_declared_mapping_puts_outside_their_band": len(outside),
+        "first_outside": outside[:3],
+        "unlabelled_spans_in_the_sweep": unlabelled_tail,
+    }
 
 
 def _members_in_norm_order(states: list[tuple[float, str]]) -> list[str] | None:
@@ -555,6 +658,14 @@ _LIVE_CALIBRATION_SOURCE = (
     "(tests/plugins/live/evidence/p18_calibration__20261011T114948Z__c91845f34b01.json)"
 )
 
+#: The `voice_transpose` measurement lives in its own run: it needed a written
+#: value *and* a render to see the +10 semitones the declared range produced.
+_VOICE_TRANSPOSE_SOURCE = (
+    "live voice_transpose calibration 2026-10-11 "
+    "(tests/plugins/live/evidence/p19_voice_transpose_space__20261011T134428Z__41f60fa0816b.json: "
+    "written 24/0/-24/12/-12/-6 -> the plugin displayed +48/+10/-29/+29/-10/0)"
+)
+
 
 def _live_measured_corrections() -> dict[str, dict[str, Any]]:
     """Rows whose registry-declared range/law a **live host measurement**
@@ -585,6 +696,17 @@ def _live_measured_corrections() -> dict[str, dict[str, Any]]:
       family); the registry's 0..7399.44 range is nonsense (a corpus artifact)
       and its linear law cannot express the curve at all. The power law
       therefore carries an optional ``offset`` (here -80 dB).
+    * ``voice_transpose``: the registry declares the **corpus** range -36..24,
+      so the profile maps a caller's value into normalized ``(value + 36) / 60``
+      and the corpus's neutral is nowhere near the parameter's. Measured on the
+      live instance (2026-10-11, `p19_voice_transpose_space__*`): writing 24, 0,
+      -24, 12, -12, -6 read the plugin's own display **+48, +10, -29, +29, -10,
+      0 semitones** - i.e. ``display = 1.6 * value + 9.6``, the display's own
+      ±48 with its zero at value -6. The declared range therefore made every
+      restore that wrote the documented neutral ``0.0`` play **+10 semitones
+      sharp** (measured: a route-free table, in tune at 0.04-0.06 st before the
+      write). Corrected to the plugin's own space: the caller's value **is** the
+      displayed semitone offset, ``range -48..+48`` (zero at normalized 0.5).
 
     Only measured rows are listed; every other row keeps the registry's
     declaration (strictly additive - never a guessed mapping).
@@ -640,6 +762,25 @@ def _live_measured_corrections() -> dict[str, dict[str, Any]]:
         "range": {"min": -80.0, "max": 6.02},
         "source": _LIVE_CALIBRATION_SOURCE,
     }
+    table["voice_transpose"] = {
+        "law": {
+            "kind": "affine",
+            "params": {
+                "scale": 1.0,
+                "offset": 0.0,
+                "native_min": -48.0,
+                "native_max": 48.0,
+                "correspondence": (
+                    "the caller's value IS the displayed semitone offset: measured +48 at "
+                    "normalized 1.0, 0 at 0.5, -29 at 0.2 (and the declared-space values 24/0/"
+                    "-24/12/-12/-6 read +48/+10/-29/+29/-10/0)"
+                ),
+                "source": _VOICE_TRANSPOSE_SOURCE,
+            },
+        },
+        "range": {"min": -48.0, "max": 48.0},
+        "source": _VOICE_TRANSPOSE_SOURCE,
+    }
     return table
 
 
@@ -691,6 +832,9 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             declared_law["kind"] == "affine" and declared_range is None
         )
         measured = derive_measured_law(row, states) if needs_measurement else None
+        #: set only for a declared `enum_index` row whose *measured* bands are not
+        #: uniform (see `_declared_enum_positions`); carried into the evidence
+        positions_correction: dict[str, Any] | None = None
         if measured is not None:
             law = {"kind": str(measured["kind"]), "params": dict(measured.get("params") or {})}
             control_type = str(measured.get("type") or _control_type(row))
@@ -703,9 +847,28 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             range_spec = _range_from_row(row)
             discrete = bool(row.get("discrete"))
             enum_values = _enum_values(states) if row.get("kind") == "enum_index" else None
+            # A declared `enum_index` law is uniform by construction; where the
+            # measurement shows the plugin's bands are not, the measured positions
+            # replace the arithmetic (and *only* the positions: the declared kind
+            # and the member list stay). Without this, a write lands in the
+            # neighbouring band and the read-back agrees with it, because the same
+            # arithmetic runs in both directions (measured: `filter_1_style` "24dB"
+            # -> "Notch Blend", 2026-10-11).
+            positions_correction = None
+            if law["kind"] == "enum_index" and enum_values:
+                positions_correction = _declared_enum_positions(
+                    [str(member["id"]) for member in enum_values], states
+                )
+                if positions_correction is not None:
+                    law = {
+                        "kind": str(law["kind"]),
+                        "params": {**dict(law.get("params") or {}), **positions_correction},
+                    }
         correction = LIVE_MEASURED_CORRECTIONS.get(str(state_key))
         if correction is None:
             evidence = _evidence(row, bool(states), measured=measured)
+            if positions_correction is not None:
+                evidence = {**evidence, "positions_correction": dict(positions_correction)}
         else:
             # a live host measurement contradicted the registry's declaration:
             # the measurement wins (see `_live_measured_corrections`)
@@ -758,6 +921,32 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             accepted[destination] = fit.native_per_unit
         else:
             refused[destination] = fit.why
+
+    # The two joins `route_into_off_filter` needs to be *decided* rather than
+    # refused (2026-10-11). Both come from the registry the profile is built
+    # from, never from a typed list:
+    #
+    # - ``destination_modules``: every vocabulary destination joined to the
+    #   correspondence row that carries its ``state_key`` (measured on this
+    #   registry: 316 of 316 destinations resolve - the coverage is recorded so a
+    #   destination the join misses makes the evaluator fail closed instead of
+    #   silently passing);
+    # - ``module_switches``: per module, the state key of the row the registry
+    #   itself calls a ``Switch`` (15 modules today, e.g. Filter 1 -> filter_1_on).
+    module_by_key = {
+        str(row.get("state_key")): str(row.get("module"))
+        for row in rows
+        if row.get("state_key") and row.get("module")
+    }
+    destination_modules = {dest: module_by_key[dest] for dest in destinations if dest in module_by_key}
+    unmapped_destinations = sorted(dest for dest in destinations if dest not in destination_modules)
+    module_switches = {
+        str(row.get("module")): str(row.get("state_key"))
+        for row in rows
+        if row.get("state_key")
+        and row.get("module")
+        and str(row.get("control") or "").strip().lower() == "switch"
+    }
 
     version = registry.version or SUPPORTED_VERSIONS[0]
     compatible = sorted({version, *SUPPORTED_VERSIONS})
@@ -818,6 +1007,14 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             "fields": ["amount", "bipolar", "stereo", "power", "bypass", "line_mapping"],
             "line_mapping_write_supported": False,
             "structural_limits": {"one_route_per_state_write": True},
+            "destination_modules": destination_modules,
+            "destination_module_coverage": {
+                "mapped": len(destination_modules),
+                "total": len(destinations),
+                "unmapped": unmapped_destinations[:20],
+                "source": "vital_correspondence.json rows joined on state_key (measured for this build)",
+            },
+            "module_switches": module_switches,
         },
         "state": {
             "supported": True,
@@ -836,15 +1033,16 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
                     "id": "route_create",
                     "target": codec_module.ROUTE_TABLE_KEY,
                     #: The codec can express it and the host can perform it (P8 measured a
-                    #: route write live), but the layer *refuses* it today because the rule
-                    #: that governs it cannot be evaluated. A capability description that
-                    #: said `verified: true` without saying that was a claim the gate
-                    #: contradicts (independent audit, 2026-10-11).
+                    #: route write live). It **became available** on 2026-10-11 when the
+                    #: rule that governs it stopped being a refusal: the destination->module
+                    #: join and the projected filter on/off flag are now inputs, so the rule
+                    #: is decided (see `dependencies_rules._evaluate_route_pairs`) and only a
+                    #: decided violation refuses.
                     "verified": True,
-                    "available": False,
-                    "available_reason": "route_into_off_filter is declared but not evaluated; "
-                    "the layer refuses a created pair before any write",
-                    "decided_by": "dependencies_rules._guard_route_pair",
+                    "available": True,
+                    "available_reason": None,
+                    "decided_by": "dependencies_rules._evaluate_route_pairs",
+                    "evidence": "P8.4 state-write live evidence + the 2026-10-11 evaluation (destination-module join 316/316; switches from the registry's own Switch rows)",
                     "limits": ["one route per state write"],
                 }
             ],
@@ -864,7 +1062,11 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
                 "informational": bool(rule.get("informational", False)),
                 "message": rule["message"],
                 "evidence": rule.get("evidence"),
-                "evaluated": not rule.get("needs_live_flags", False),
+                #: one source of truth: the provider's own EVALUATION table, the same
+                #: one its evaluator reads. `needs_live_flags` remains on the measured
+                #: rows as data; whether the rule is *decided* is a property of the
+                #: evaluator, not of the rule's physics.
+                "evaluated": rules_module.rule_evaluated(str(rule["id"])),
             }
             for rule in rules_module.RULES
         ],
@@ -884,10 +1086,10 @@ def build_profile(registry: VitalRegistry, identity: Mapping[str, Any]) -> dict[
             "the plugin re-serializes its own sample blob (settings.sample.samples): that leaf "
             "is declared plugin-derived, is never written, and is excluded from a document "
             "restore with a named gap",
-            "the rule table's live-flag rules are declared but not evaluated (see the P7 status note)",
-            "creating a modulation route is refused: the rule route_into_off_filter cannot be "
-            "evaluated (no measured destination families, and the filter on/off flag is live "
-            "state), so a plan that creates a (source, destination) pair refuses before any write",
+            "the rule table's live-flag rules `fm_needs_modulator` and "
+            "`wave_frame_needs_multiframe_wavetable` are declared but not evaluated (see the P7 "
+            "status note); `route_into_off_filter` is evaluated since 2026-10-11 (destination->module "
+            "join + the projected module on/off flag), and every undecidable subject still refuses",
         ],
         "x_provider": {
             "registry_dir": registry.directory,

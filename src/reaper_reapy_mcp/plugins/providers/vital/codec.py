@@ -522,13 +522,22 @@ def make_routing(
     slot: int | None = None,
     bipolar: float = 0.0,
     stereo: float = 0.0,
-    power: float = 1.0,
+    power: float = 0.0,
     bypass: float = 0.0,
 ) -> dict[str, Any]:
     """Port of `_b4_lib.make_routing` (AV-13 line 431).
 
     One route per call - the declared structural limit (`one_route_per_state_write`)
     is expressed by the planner, not here.
+
+    ``power`` defaults to **0.0**, measured twice on 2026-10-11 rather than
+    inherited: a whole-corpus walk (`tests/plugins/live/probe_p19_corpus_pitch.py`,
+    2226 presets, 17036 routes) stores ``power = 0.0`` in **16868** of them, and
+    every empty slot of the live 1.5.5 instance stores 0.0 while its "Modulation N
+    Power" parameter displays "0" at host-normalized 0.5 - i.e. 0.0 is the value
+    the document and the plugin both treat as neutral. An earlier default of 1.0
+    would have stamped a nonzero curve on every created route (this file learned
+    it from the codec fixture, which is not evidence about the plugin).
     """
     settings = _settings(doc)
     mods = _modulations(settings)

@@ -65,7 +65,13 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: r5 (2026-10-11): route creation is refused before the first write because
 #: `route_into_off_filter` cannot be evaluated (the guard is a behaviour change:
 #: a route create that used to be applied is now a typed refusal).
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r5"
+#: r6 (2026-10-11): `route_into_off_filter` is **evaluated** - the destination
+#: ->module join is derived from the registry (316/316 destinations) and the
+#: module's on/off flag comes from the live document the projected world now
+#: carries - so route creation is available and only a decided violation (a pair
+#: into an OFF Filter 1/Filter 2) refuses. Undecidable subjects still refuse with
+#: the missing input named.
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r6"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -316,7 +322,43 @@ class VitalProvider:
                         }
                     )
                     continue
-                target.append({k: v for k, v in spec.items() if v is not None})
+                entry = {k: v for k, v in spec.items() if v is not None}
+                if key == "routes_update" and entry.get("depth") is not None:
+                    # Measured defect D1 (2026-10-11, P20): only `routes_create` converted a
+                    # semantic depth, so the documented update example
+                    # (`{"slot": 3, "depth": -6}`, 06 §8/§9) reached the codec with a field it
+                    # does not know and was refused there as "an update names no field to
+                    # change" - a misleading error for a well-formed request. The conversion
+                    # itself is the same one create uses; it needs the **destination**, which
+                    # for an existing route lives in the live table (not readable here, this
+                    # method does no host access), so a caller that does not name it gets a
+                    # refusal that says exactly that instead of a later, confusing one.
+                    if entry.get("amount") is not None:
+                        # an explicit native amount wins; `depth` is never carried into the write
+                        entry.pop("depth")
+                    elif not entry.get("destination"):
+                        resolved.problems.append(
+                            {
+                                "route": dict(spec),
+                                "code": "InvalidValue",
+                                "message": (
+                                    "a semantic `depth` on an existing route needs the destination to convert "
+                                    "it: pass `destination` (from `plugin_modulation(op='list')`) or pass the "
+                                    "native `amount`"
+                                ),
+                                "detail": {"reason": "depth_without_destination", "slot": entry.get("slot")},
+                            }
+                        )
+                        continue
+                    else:
+                        try:
+                            entry["amount"] = self.convert_depth(profile, str(entry["destination"]), entry.pop("depth"))
+                        except (NoConversion, InvalidValue) as exc:
+                            resolved.problems.append(
+                                {"route": dict(spec), "code": exc.code, "message": exc.message, "detail": exc.detail}
+                            )
+                            continue
+                target.append(entry)
 
         for path, value in dict(request.get("state") or {}).items():
             if not str(path).startswith(f"{_STATE_ROOT}."):

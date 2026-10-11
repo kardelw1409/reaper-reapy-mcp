@@ -50,7 +50,6 @@ def test_the_unevaluated_rules_are_declared_with_evaluated_false():
     rows = RULES.rules_not_evaluated()
     assert {row["rule"] for row in rows} == {
         "fm_needs_modulator",
-        "route_into_off_filter",
         "wave_frame_needs_multiframe_wavetable",
     }
     for row in rows:
@@ -61,34 +60,45 @@ def test_the_unevaluated_rules_are_declared_with_evaluated_false():
     by_rule = {row["rule"]: row for row in rows}
     # the measured table's own kind/informational flags decide "blocking"
     assert by_rule["fm_needs_modulator"]["blocking"] is True
-    assert by_rule["route_into_off_filter"]["blocking"] is True
     assert by_rule["wave_frame_needs_multiframe_wavetable"]["blocking"] is False
+    # `route_into_off_filter` left this list because it is now **evaluated**
+    # (destination->module join + the projected module on/off flag, 2026-10-11);
+    # a rule cannot be "evaluated" in the evaluator and "not evaluated" here.
+    assert "route_into_off_filter" not in by_rule
+    assert RULES.rule_evaluated("route_into_off_filter") is True
 
 
-def test_two_rules_have_an_enforceable_guard_and_the_rest_is_honest():
-    """Both blocking rules whose subject is decidable are guarded.
+def test_the_route_rule_is_evaluated_and_only_fm_keeps_a_guard():
+    """The route rule is decided now; the FM rule keeps its fail-closed guard.
 
-    `fm_needs_modulator`'s subject is a setting the profile binds; the route
-    rule's subject is a created `(source, destination)` pair. The wavetable rule
-    stays unguarded because the measured table itself declares it informational -
-    refusing on it would harden the provider's own declaration (Decision 1).
+    `fm_needs_modulator`'s subject is a setting the profile binds, and its
+    deciding input (the other oscillator's level) is not in the world - so its
+    subject guard refuses rather than claiming the rule was satisfied. The route
+    rule's deciding inputs (the destination's module and the filter's projected
+    on/off flag) are in the world, so it is *evaluated* and is no longer in the
+    unevaluated list at all. The wavetable rule stays unguarded because the
+    measured table itself declares it informational - refusing on it would
+    harden the provider's own declaration (Decision 1).
     """
     by_rule = {row["rule"]: row for row in RULES.rules_not_evaluated()}
+    assert set(by_rule) == {"fm_needs_modulator", "wave_frame_needs_multiframe_wavetable"}
     assert by_rule["fm_needs_modulator"]["guard_enforceable"] is True
     assert by_rule["fm_needs_modulator"]["guard"]["kind"] == "subject_path_changed"
     assert by_rule["fm_needs_modulator"]["guard"]["decision"] == "refuse_before_any_write"
     assert by_rule["fm_needs_modulator"]["why_not_enforced"] is None
 
-    assert by_rule["route_into_off_filter"]["guard_enforceable"] is True
-    assert by_rule["route_into_off_filter"]["guard"]["kind"] == "route_pair_created"
-    assert by_rule["route_into_off_filter"]["guard"]["decision"] == "refuse_before_any_write"
-    assert by_rule["route_into_off_filter"]["why_not_enforced"] is None
-    assert by_rule["route_into_off_filter"]["blocking"] is True
-
     rule = "wave_frame_needs_multiframe_wavetable"
     assert by_rule[rule]["guard_enforceable"] is False
     assert by_rule[rule]["guard"] is None
     assert by_rule[rule]["why_not_enforced"]
+
+    route = RULES.evaluation_for("route_into_off_filter")
+    assert route["evaluated"] is True
+    assert route["decision"] == "decide_then_refuse_only_the_decided_violation"
+    assert route["declared_blocking"] is True
+    assert route["subjects"] and route["fail_closed_when"] and route["not_covered"]
+    assert route["scope"] == list(RULES.MEASURED_FILTER_SCOPE)
+    assert RULES._guard_for("route_into_off_filter") is None
 
 
 def test_the_guard_subjects_are_derived_from_the_measured_table():
@@ -102,14 +112,18 @@ def test_the_guard_subjects_are_derived_from_the_measured_table():
     assert all(name in RULES.DISABLE_CANDIDATES for name in subjects)
 
 
-def test_the_rule_rows_in_the_profile_stay_evaluated_false():
+def test_the_rule_rows_in_the_profile_match_the_evaluator():
     provider = T.provider_on_fixtures()
     profile = provider.build_profile(dict(T.IDENTITY))
     rows = {row["id"]: row for row in profile["dependencies"]}
     assert rows["fm_needs_modulator"]["evaluated"] is False
-    assert rows["route_into_off_filter"]["evaluated"] is False
+    assert rows["route_into_off_filter"]["evaluated"] is True
     assert rows["wave_frame_needs_multiframe_wavetable"]["evaluated"] is False
     assert rows["direct_out_bypasses_filters"]["evaluated"] is True
+    assert rows["percentage_units_are_not_one_space"]["evaluated"] is True
+    # one source of truth: the profile row and the evaluator's own table agree
+    for rule_id, row in rows.items():
+        assert row["evaluated"] is RULES.rule_evaluated(rule_id), rule_id
     assert any("not evaluated" in line for line in profile["limits"])
 
 
@@ -258,10 +272,10 @@ def test_an_unrelated_write_still_works_and_discloses_what_was_not_checked():
     disclosed = {row["rule"]: row for row in result.data["dependency_rules_not_evaluated"]}
     assert disclosed["fm_needs_modulator"]["evaluated"] is False
     assert disclosed["fm_needs_modulator"]["guard_enforceable"] is True
-    assert disclosed["route_into_off_filter"]["guard_enforceable"] is True
-    assert disclosed["route_into_off_filter"]["guard"]["kind"] == "route_pair_created"
     assert disclosed["wave_frame_needs_multiframe_wavetable"]["guard_enforceable"] is False
     assert disclosed["wave_frame_needs_multiframe_wavetable"]["why_not_enforced"]
+    # the route rule is evaluated now and must not be disclosed as unchecked
+    assert "route_into_off_filter" not in disclosed
 
 
 def test_the_disclosure_survives_a_refusal_too():
@@ -288,7 +302,6 @@ def test_the_disclosure_survives_a_refusal_too():
     rows = result.data["dependency_rules_not_evaluated"]
     assert {row["rule"] for row in rows} == {
         "fm_needs_modulator",
-        "route_into_off_filter",
         "wave_frame_needs_multiframe_wavetable",
     }
 
@@ -423,7 +436,7 @@ def test_a_committed_write_discloses_the_unevaluated_rules_too():
     rows = {row["rule"]: row for row in result.data["dependency_rules_not_evaluated"]}
     assert rows["fm_needs_modulator"]["evaluated"] is False
     assert rows["fm_needs_modulator"]["blocking"] is True
-    assert rows["route_into_off_filter"]["guard_enforceable"] is True
+    assert set(rows) == {"fm_needs_modulator", "wave_frame_needs_multiframe_wavetable"}
 
 
 def test_the_mutation_surface_in_the_core_carries_the_disclosure():

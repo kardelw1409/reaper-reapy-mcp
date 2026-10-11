@@ -8,16 +8,19 @@ state in the module rather than in a commit message:
 1. **Rules are data.** The table below is the same measured table (id, kind,
    meaning, evidence). Core decides what a `hard` finding does; this module only
    produces findings.
-2. **What the V3 evaluator can decide from the projected world, and what it
-   cannot.** The POC predicates read the *live document's flags* (an oscillator's
-   destination switch, a filter's on/off state). Core's projected world carries
-   the plan's changes and the route counts, not the untouched live flags
-   (`plan.project_world`). So the ported evaluator decides exactly the rules whose
-   inputs are in the world and leaves the rest **unfired rather than guessed**,
-   with `rules_not_evaluated()` naming them and the signal each would need. Making
-   the flag-reading rules live requires the dependency hook to receive the live
-   document - a Core change that reopens [05]/[08], which P7's scope explicitly
-   excludes. This is recorded as an open item, not smoothed over.
+2. **What the V3 evaluator can decide from the projected world.** The POC
+   predicates read the *live document's flags* (a filter's on/off state, an
+   oscillator's level). Core's projected world carries the plan's changes, the
+   route specs **and the decoded live document** (`plan.project_world`), so
+   `route_into_off_filter` is now **evaluated**: the destination->module join
+   comes from the registry (316/316 destinations, measured 2026-10-11), the
+   module's on/off flag comes from the live document overlaid with the plan's own
+   writes, and only a pair the rule actually forbids refuses. What remains
+   undecidable is refused **per subject** with the missing input named
+   (`_evaluate_route_pairs`). The rules that stay unevaluated
+   (`fm_needs_modulator`, `wave_frame_needs_multiframe_wavetable`) are named by
+   `rules_not_evaluated()` with the signal each would need; the evaluated/not
+   split has one source of truth in :data:`EVALUATION`.
 """
 
 from __future__ import annotations
@@ -31,14 +34,18 @@ from . import codec as codec_module
 __all__ = [
     "DISABLE_CANDIDATES",
     "DIRECT_OUT",
+    "EVALUATION",
     "FM_TYPES",
+    "MEASURED_FILTER_SCOPE",
     "PERCENTAGE_CONTROLS",
     "RULES",
     "addresses_route_table",
     "disable_set",
     "disable_targets",
     "distortion_type_subjects",
+    "evaluation_for",
     "percentage_controls_for",
+    "rule_evaluated",
     "rules_not_evaluated",
     "dependencies",
 ]
@@ -131,6 +138,110 @@ RULES: list[dict[str, Any]] = [
 ]
 
 
+#: The rule's **measured scope**: the POC's predicate is
+#: ``destination.startswith(f"filter_{f}_") for f in (1, 2)``
+#: (``adapter/dependencies.py``, `route_to_an_off_filter`), i.e. the rule spoken
+#: about Filter 1 and Filter 2 only. Expressed here as the *destination-name
+#: prefixes the measurement names*, resolved to module labels through the
+#: registry's own destination->module join at evaluation time - never typed as
+#: module labels, so a destination whose module is Filter 1 stays covered even
+#: if the registry ever relabels it. `Filter FX` is deliberately **not** in the
+#: measured scope, and that is disclosed by :func:`evaluation_for` rather than
+#: silently included or silently dropped.
+MEASURED_FILTER_SCOPE = ("filter_1", "filter_2")
+
+#: Which of the measured rules this evaluator **decides**, from which projected
+#: inputs. One source of truth for the evaluator, `rules_not_evaluated()` and the
+#: profile's `dependencies[].evaluated` rows (the three drifting apart is how a
+#: rule becomes "declared but nobody notices").
+EVALUATION: dict[str, dict[str, Any]] = {
+    "direct_out_bypasses_filters": {
+        "evaluated": True,
+        "inputs": ["state_paths_changed", "profile controls"],
+    },
+    "fm_needs_modulator": {
+        "evaluated": False,
+        "inputs": ["state_paths_changed", "profile controls"],
+        "inputs_missing": "the other oscillator's level from the live document (untouched state)",
+    },
+    "route_into_off_filter": {
+        "evaluated": True,
+        "inputs": [
+            "routes_create_specs / routes_update_specs / state_paths_changed (the created pairs)",
+            "profile.modulation.destination_modules (registry join: 316/316 destinations)",
+            "profile.modulation.module_switches (registry rows whose control is a Switch)",
+            "live_document.settings flags, projected through state_paths_changed",
+        ],
+        "scope": list(MEASURED_FILTER_SCOPE),
+    },
+    "wave_frame_needs_multiframe_wavetable": {
+        "evaluated": False,
+        "inputs": ["routes_create_specs"],
+        "inputs_missing": "the wavetable's frame count from the live document (settings.wavetables)",
+    },
+    "percentage_units_are_not_one_space": {
+        "evaluated": True,
+        "inputs": ["controls_changed", "profile controls"],
+    },
+}
+
+
+def rule_evaluated(rule_id: str) -> bool:
+    """Whether the evaluator decides ``rule_id`` (default: no)."""
+    return bool((EVALUATION.get(str(rule_id)) or {}).get("evaluated"))
+
+
+def evaluation_for(rule_id: str) -> dict[str, Any] | None:
+    """How a rule is decided, in the same shape for every rule.
+
+    ``evaluated`` is the decision itself; because only provider data may say so,
+    the disclosure is derived from :data:`EVALUATION` and the rule row rather
+    than re-typed per rule. For the rules that are *not* decided, the missing
+    input is named here and in ``rules_not_evaluated()``.
+    """
+    rule = next((row for row in RULES if str(row["id"]) == str(rule_id)), None)
+    declared = dict(EVALUATION.get(str(rule_id)) or {})
+    if rule is None or not declared:
+        return None
+    out: dict[str, Any] = {
+        "rule": str(rule_id),
+        "kind": rule.get("kind"),
+        "declared_blocking": bool(rule.get("kind") == "hard" and not rule.get("informational")),
+        "evaluated": bool(declared.get("evaluated")),
+        "inputs": list(declared.get("inputs") or []),
+        "inputs_missing": declared.get("inputs_missing"),
+        "scope": list(declared.get("scope") or []),
+        "evidence": rule.get("evidence"),
+    }
+    if str(rule_id) == "route_into_off_filter":
+        out.update(
+            {
+                "decision": "decide_then_refuse_only_the_decided_violation",
+                "subjects": [
+                    "routes_create[*]",
+                    "routes_update[*] naming a non-empty destination",
+                    "routes_update[*] naming only a source (the slot's live destination decides)",
+                    f"a state write of a non-empty `<root>.{codec_module.ROUTE_TABLE_KEY}.<slot>.destination|.source`",
+                ],
+                "fail_closed_when": [
+                    "the destination is not in the registry's destination->module join",
+                    "the slot of a source-only update has no live destination in the document",
+                    "the projected on/off flag of the destination's module is not in the document",
+                    "a write addresses the route table as a table/whole slot (no pair shape to decide)",
+                    "a count arrives without its specs",
+                    "a control's declared binding addresses the route table (the parameter batch is invisible to the state scan)",
+                ],
+                "not_covered": [
+                    "Filter FX: the measured predicate names Filter 1 and Filter 2 only",
+                    "routes_remove[*] and amount-only updates: no pair is created",
+                    "a state write that clears a pair field (an empty value removes a pair)",
+                    "state writes outside the route table (e.g. the per-slot amount field)",
+                ],
+            }
+        )
+    return out
+
+
 def percentage_controls_for(scales: dict[str, Any]) -> set[str]:
     """The controls whose measured display ends in ``%`` (derived, not typed)."""
     from .depth import percent_controls
@@ -156,13 +267,25 @@ def disable_set(planned_names: Iterable[str]) -> dict[str, Any]:
     return out
 
 
+#: Why a not-yet-evaluated rule has no enforceable subject guard. Kept next to
+#: the rule data rather than inside the loop so it cannot drift per call.
+UNGUARDED_REASONS: dict[str, str] = {
+    "wave_frame_needs_multiframe_wavetable": (
+        "the measured table declares this rule informational, so a violation can only ever be an "
+        "advisory: refusing on it would harden the provider's own declaration"
+    ),
+}
+
+
 def rules_not_evaluated() -> list[dict[str, Any]]:
     """The rules this evaluator cannot decide, with an honest status each.
 
     Three things are reported per rule and they are deliberately separate:
 
     - ``evaluated: false`` - the rule is **not** decided. It is never presented
-      as checked.
+      as checked. The split comes from :data:`EVALUATION`, the same table the
+      evaluator itself reads, so a rule cannot be "evaluated" in one place and
+      "not evaluated" in another.
     - ``blocking`` - whether the measured table itself declares the rule a
       blocker (`kind: hard` and not `informational`). The layer does not soften
       or harden the provider's own declaration.
@@ -171,43 +294,30 @@ def rules_not_evaluated() -> list[dict[str, Any]]:
       registry actually carries; a hand-typed list would be the guess this
       module refuses to make).
     """
-    needs: dict[str, str] = {
-        "fm_needs_modulator": "the other oscillator's level from the live document (untouched state)",
-        "route_into_off_filter": "the created routes' (source, destination) pairs AND the filter on/off flags",
-        "wave_frame_needs_multiframe_wavetable": "the created routes' destination pairs and the wavetable frame count",
-    }
-    unguarded: dict[str, str] = {
-        "wave_frame_needs_multiframe_wavetable": (
-            "the measured table declares this rule informational, so a violation can only ever be an "
-            "advisory: refusing on it would harden the provider's own declaration"
-        ),
-    }
     rows: list[dict[str, Any]] = []
     for rule in RULES:
-        if not rule.get("needs_live_flags"):
-            continue
         rid = str(rule["id"])
+        detail = evaluation_for(rid)
+        if detail is None or detail["evaluated"]:
+            continue
         guard = _guard_for(rid)
         rows.append(
             {
                 "rule": rid,
                 "evaluated": False,
                 "blocking": bool(rule.get("kind") == "hard" and not rule.get("informational")),
-                "needs": needs.get(rid, "an input the projected world does not carry"),
+                "needs": str(detail.get("inputs_missing") or "an input the projected world does not carry"),
                 "guard": guard,
                 "guard_enforceable": bool(guard and guard.get("enforceable")),
-                "why_not_enforced": None if guard and guard.get("enforceable") else unguarded.get(rid, guard_reason(rid)),
+                "why_not_enforced": (
+                    None if guard and guard.get("enforceable") else UNGUARDED_REASONS.get(rid, guard_reason(rid))
+                ),
                 "why_recorded": (
-                    "the route specs now ride in the projected world (`routes_create_specs` / "
-                    "`routes_update_specs`, added 2026-10-11), so this rule's SUBJECT is decidable; "
-                    "what is still missing is the deciding input named above (the destination's kind "
-                    "and the filter's on/off flag), which live in the registry and the live document"
-                    if rule.get("id") == "route_into_off_filter"
-                    else (
-                        "Core's plan.project_world carries the plan's changed paths/controls and route "
-                        "counts, not the route specs or the live flags; passing them is a Core change "
-                        "(reopens [05]/[08])"
-                    )
+                    "Core's plan.project_world now carries the decoded live document "
+                    "(2026-10-11), so a rule whose deciding input is a live flag *can* be "
+                    "evaluated; this rule's remaining input is the one named above"
+                    if rule.get("id") == "fm_needs_modulator"
+                    else "the missing input is named above; nothing about this rule is decided"
                 ),
             }
         )
@@ -243,12 +353,11 @@ def _guard_for(rule_id: str) -> dict[str, Any] | None:
     instead of claiming the rule was satisfied - and it refuses the *subject*,
     not everything, so unrelated operations stay available.
 
-    ``route_into_off_filter`` has the same shape since the owner's safety-gate
-    correction (2026-10-11): its subject - a **created** ``(source, destination)``
-    pair - is decidable from the plan, while the deciding inputs (whether the
-    destination is a filter input and whether that filter is on) are not. A plan
-    that creates a pair cannot be shown to satisfy the rule, so it is refused;
-    operations that create no pair are untouched.
+    ``route_into_off_filter`` is no longer a guard case (2026-10-11): its
+    deciding inputs - the destination->module join and the filter's projected
+    on/off flag - are now in the world, so the rule is **evaluated** by
+    `_evaluate_route_pairs` and only a decided violation refuses. Its disclosure
+    lives in :func:`evaluation_for`.
     """
     if rule_id == "fm_needs_modulator":
         return {
@@ -259,31 +368,6 @@ def _guard_for(rule_id: str) -> dict[str, Any] | None:
                 "the rule is a blocking rule whose subject is decidable and whose deciding input is not; "
                 "a plan that changes the subject cannot be shown to satisfy it"
             ),
-            "decision": "refuse_before_any_write",
-        }
-    if rule_id == "route_into_off_filter":
-        return {
-            "enforceable": True,
-            "kind": "route_pair_created",
-            "subjects": [
-                "routes_create[*]",
-                "routes_update[*] naming source/destination",
-                f"any state write under {_STATE_ROOT}.{codec_module.ROUTE_TABLE_KEY} that does not clear a pair field",
-                "a control whose declared binding addresses the route table (it would create a pair "
-                "through the parameter batch, which the state scan cannot see)",
-            ],
-            "why": (
-                "the rule is a blocking rule whose subject is decidable (a created pair) and whose "
-                "deciding inputs are not (the registry carries no destination families, and the "
-                "filter on/off flag lives in the live document); a plan that creates a pair cannot "
-                "be shown to satisfy it"
-            ),
-            "not_subject": [
-                "routes_remove[*]",
-                "routes_update[*] that carries no source/destination",
-                "a state write that clears a pair field (an empty value removes a pair)",
-                "state writes outside the route table (e.g. the per-slot amount field)",
-            ],
             "decision": "refuse_before_any_write",
         }
     return None
@@ -464,69 +548,192 @@ def _guard_fm_subject(
     return out
 
 
-def _guard_route_pair(
+def _destination_modules(profile: dict[str, Any]) -> dict[str, str]:
+    """``destination -> module label`` from the profile's registry join."""
+    declared = ((profile.get("modulation") or {}).get("destination_modules") or {})
+    return {str(key): str(value) for key, value in declared.items() if value}
+
+
+def _module_switches(profile: dict[str, Any]) -> dict[str, str]:
+    """``module label -> on/off flag state key`` from the profile's join."""
+    declared = ((profile.get("modulation") or {}).get("module_switches") or {})
+    return {str(key): str(value) for key, value in declared.items() if value}
+
+
+def _scope_modules(destination_modules: dict[str, str]) -> set[str]:
+    """The module labels the rule's measured predicate covers.
+
+    Derived from the measured destination *prefixes* through the registry's own
+    join, so the scope cannot drift into a hand-typed module list.
+    """
+    return {
+        module
+        for destination, module in destination_modules.items()
+        if any(destination.startswith(prefix + "_") for prefix in MEASURED_FILTER_SCOPE)
+    }
+
+
+def _flag_off(value: Any) -> bool | None:
+    """``True`` = the switch is OFF, ``False`` = ON, ``None`` = not decidable."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return float(value) == 0.0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("0", "off", "false"):
+            return True
+        if text in ("1", "on", "true"):
+            return False
+    return None
+
+
+def _projected_flag(world: dict[str, Any], switch_key: str) -> tuple[Any, str]:
+    """The projected value of a module switch and where it came from.
+
+    The plan's own write to the switch wins (a plan that turns the filter ON in
+    the same transaction must not be judged against the state it starts from);
+    otherwise the live document the world carries; otherwise nothing.
+    """
+    path = f"{codec_module.MUTABLE_ROOT}.{switch_key}"
+    changed = dict(world.get("state_paths_changed") or {})
+    if path in changed:
+        return changed[path], "planned"
+    document = world.get("live_document")
+    settings = document.get("settings") if isinstance(document, dict) else None
+    if isinstance(settings, dict) and switch_key in settings:
+        return settings.get(switch_key), "live_document"
+    return None, "missing"
+
+
+def _slot_destination(world: dict[str, Any], slot: Any) -> str | None:
+    """The live destination of a route slot, from the document in the world."""
+    try:
+        number = int(slot)
+    except (TypeError, ValueError):
+        return None
+    document = world.get("live_document")
+    settings = document.get("settings") if isinstance(document, dict) else None
+    mods = settings.get(codec_module.ROUTE_TABLE_KEY) if isinstance(settings, dict) else None
+    if isinstance(mods, list) and 1 <= number <= len(mods) and isinstance(mods[number - 1], dict):
+        return str(mods[number - 1].get("destination") or "")
+    return None
+
+
+def _evaluate_route_pairs(
     world: dict[str, Any], changed: dict[str, Any], rule: dict[str, Any], profile: dict[str, Any]
 ) -> list[Finding]:
-    """Refuse a plan that **creates** a ``(source, destination)`` pair.
+    """Decide ``route_into_off_filter`` for every pair the plan creates.
 
-    Owner decision (2026-10-11, safety-gate correction): route changes were
-    allowed while this rule was declared but not evaluated, which is the exact
-    contradiction a fail-closed layer must not have. The subject is decidable
-    from the plan - and it must be read from **every** way a pair can be created,
-    not only the route operations, because the state channel can write the same
-    two fields directly:
+    The rule (``adapter/dependencies.py``, measured): *a source routed to a
+    filter that is OFF is silent* - it fires only when a route into
+    ``filter_{1,2}_*`` exists **and** that filter is off in the projected state.
+    The two deciding inputs now exist in the world: the destination->module join
+    derived from the registry (316/316 destinations, measured 2026-10-11) and the
+    module's on/off flag in the live document, overlaid with the plan's own
+    writes. So this rule is **evaluated**, not guarded: a pair into an ON filter
+    (or into a non-filter destination) passes, and only a pair the rule actually
+    forbids refuses.
 
-    - ``routes_create`` - every entry creates a pair;
-    - ``routes_update`` that names a non-empty ``source``/``destination``;
-    - a state write of a non-empty value to ``<root>.modulations.<slot>.source``
-      or ``.destination`` (the codec's own representation, parsed by the codec),
-      or to the table / a whole slot, which can create pairs too;
-    - a ``routes_create``/``routes_update`` count whose specs the world does not
-      carry (not decidable);
-    - a **control** whose declared binding addresses the route table (it would
-      create a pair through the parameter batch, which the state scan cannot see).
+    What remains fail-closed is named per finding (``missing_input``): an
+    undecidable destination, a source-only update whose slot has no live
+    destination, a switch whose projected value is absent, a write that addresses
+    the table as a table (no pair shape to decide), a count without its specs, or
+    a control bound into the table (the parameter batch is invisible to the
+    state scan). The subject scan itself is unchanged from the owner's
+    safety-gate correction (2026-10-11) - every representation a pair can be
+    created through is still read.
 
     Operations that create no pair - a removal, an amount/power-only update, a
-    write that clears a pair field, every read - are deliberately **not** refused:
-    the rule's subject is untouched, so their safety provably does not depend on
-    it, and the layer does not block for the appearance of completeness.
+    write that clears a pair field, every read - are deliberately not refused:
+    the rule's subject is untouched.
     """
     out: list[Finding] = []
-    #: Bound once and never rebound: an earlier version reused this name for an
-    #: integer inside the loop below, which silently replaced the explanation with
-    #: a number in every later finding (found by an independent audit, 2026-10-11).
-    missing_input = (
-        "whether the destination is a filter input (the registry carries no destination "
-        "families) and whether that filter is on (the flag lives in the live document)"
-    )
+    destination_modules = _destination_modules(profile)
+    module_switches = _module_switches(profile)
+    scope = _scope_modules(destination_modules)
 
-    def emit(subject: dict[str, Any], why: str) -> None:
+    def undecided(subject: dict[str, Any], observed: str, missing: str) -> None:
         out.append(
             Finding(
                 kind="hard",
                 rule=str(rule["id"]),
                 subject=subject,
                 message=(
-                    f"this plan creates a modulation pair, and the rule {rule['id']!r} is declared "
-                    "but NOT evaluated; the layer refuses instead of claiming it was satisfied"
+                    f"this plan creates a modulation pair and the rule {rule['id']!r} cannot be "
+                    "decided for it; the layer refuses instead of claiming it was satisfied"
                 ),
                 detail={
                     "evaluated": False,
                     "reason": "rule_not_evaluated",
-                    "missing_input": missing_input,
+                    "missing_input": missing,
                     "guard": "route_pair_created",
-                    "observed": why,
+                    "observed": observed,
                 },
                 informational=False,
             )
         )
 
+    def violation(subject: dict[str, Any], destination: str, module: str, switch: str, value: Any, source: str) -> None:
+        out.append(
+            Finding(
+                kind="hard",
+                rule=str(rule["id"]),
+                subject=subject,
+                message=f"{rule['message']}: {destination!r} targets {module}, which is OFF",
+                detail={
+                    "evaluated": True,
+                    "reason": "route_into_off_filter",
+                    "destination": destination,
+                    "module": module,
+                    "switch": switch,
+                    "switch_value": value,
+                    "value_source": source,
+                    "evidence": rule.get("evidence"),
+                },
+                informational=False,
+            )
+        )
+
+    def decide(subject: dict[str, Any], destination: str) -> None:
+        module = destination_modules.get(destination)
+        if module is None:
+            undecided(
+                subject,
+                f"destination {destination!r} is not in the registry's destination->module join",
+                "the destination's module (the registry's destination->module join does not cover it)",
+            )
+            return
+        if module not in scope:
+            return  # decided: the rule's measured subject (Filter 1 / Filter 2) is not entered
+        switch = module_switches.get(module)
+        if not switch:
+            undecided(
+                subject,
+                f"module {module!r} has no measured on/off switch row",
+                f"an on/off flag for module {module!r}",
+            )
+            return
+        value, source = _projected_flag(world, switch)
+        off = _flag_off(value)
+        if off is None:
+            undecided(
+                subject,
+                f"the projected value of {switch!r} is {value!r} (source: {source})",
+                f"the value of {switch!r} in the live document or the plan",
+            )
+            return
+        if off:
+            violation(subject, destination, module, switch, value, source)
+
     for spec in world.get("routes_create_specs") or []:
         spec = dict(spec or {})
-        emit(
-            {"route_create": spec},
-            f"create {spec.get('source')!r} -> {spec.get('destination')!r}",
-        )
+        subject = {"route_create": spec}
+        destination = str(spec.get("destination") or "")
+        if not destination:
+            undecided(subject, f"create names no destination: {spec!r}", "the destination of the created pair")
+            continue
+        decide(subject, destination)
     # Fail closed on a **count without its subject**: a plan that creates pairs
     # whose specs the world does not carry is not decidable either, and a guard
     # that silently skipped it would be bypassable by any caller that reaches the
@@ -534,23 +741,33 @@ def _guard_route_pair(
     for specs_key, count_key in (("routes_create_specs", "routes_create"), ("routes_update_specs", "routes_update")):
         shortfall = int(world.get(count_key) or 0) - len(list(world.get(specs_key) or []))
         if shortfall > 0:
-            emit(
+            undecided(
                 {
                     "world": count_key,
                     "counted": int(world.get(count_key) or 0),
                     "carried": len(list(world.get(specs_key) or [])),
                 },
                 f"the projected world counts {count_key} without carrying the specs ({shortfall} missing)",
+                "the created pairs' (source, destination) specs",
             )
     for spec in world.get("routes_update_specs") or []:
         spec = dict(spec or {})
-        touched = {
-            field: spec[field]
-            for field in ("source", "destination")
-            if spec.get(field) not in (None, "")
-        }
-        if touched:
-            emit({"route_update": spec, "fields": sorted(touched)}, f"update names {sorted(touched)}")
+        subject = {"route_update": spec}
+        destination = spec.get("destination")
+        if destination not in (None, ""):
+            decide(subject, str(destination))
+            continue
+        if spec.get("source") in (None, ""):
+            continue  # no pair field is touched
+        live_destination = _slot_destination(world, spec.get("slot"))
+        if live_destination:
+            decide(subject, live_destination)
+        else:
+            undecided(
+                subject,
+                f"update names a source for slot {spec.get('slot')!r}, whose live destination is unknown",
+                f"the live destination of slot {spec.get('slot')!r} (settings.{codec_module.ROUTE_TABLE_KEY})",
+            )
 
     for path, value in sorted(changed.items()):
         if not addresses_route_table(path):
@@ -560,16 +777,33 @@ def _guard_route_pair(
             # clearing a pair field *removes* a pairing - the rule's subject is a
             # created pair, so this is deliberately not refused
             continue
-        emit(
-            {"state_path": str(path), "slot": pair.index if pair else None, "field": pair.field if pair else None},
-            f"state write of {str(path)} = {value!r}",
-        )
+        subject = {"state_path": str(path), "slot": pair.index if pair else None, "field": pair.field if pair else None}
+        if pair is None:
+            undecided(
+                subject,
+                f"state write of {str(path)} = {value!r} addresses the route table without a pair field",
+                "a single pair field write whose destination can be decided",
+            )
+            continue
+        if pair.field == "destination":
+            decide(subject, str(value))
+            continue
+        live_destination = _slot_destination(world, pair.index)
+        if live_destination:
+            decide(subject, live_destination)
+        else:
+            undecided(
+                subject,
+                f"state write of {str(path)} = {value!r}: slot {pair.index} has no live destination",
+                f"the live destination of slot {pair.index} (settings.{codec_module.ROUTE_TABLE_KEY})",
+            )
 
     # A control write does not go through the state channel, so a control whose
     # declaration binds it into the route table would create a pair through the
     # parameter batch. No Vital control does today, but the guard must be decided
     # from the profile rather than from the assumption that none ever will:
-    # a binding that addresses the table is the same subject.
+    # a binding that addresses the table is the same subject - and it carries no
+    # pair shape, so it stays fail-closed.
     for control_id in sorted(world.get("controls_changed") or {}):
         control = _control_by_id(profile, control_id)
         if control is None:
@@ -582,9 +816,10 @@ def _guard_route_pair(
                 continue
             spellings = (str(candidate), f"{codec_module.MUTABLE_ROOT}.{candidate}")
             if any(addresses_route_table(spelling) for spelling in spellings):
-                emit(
+                undecided(
                     {"control": str(control_id), "binding": str(candidate)},
                     f"control {control_id!r} is bound into the route table ({candidate})",
+                    "a pair shape in the parameter channel (it is invisible to the state scan)",
                 )
                 break
     return out
@@ -654,7 +889,7 @@ def _evaluate(world: dict[str, Any], rules: Sequence[dict[str, Any]], profile: d
         elif rid == "fm_needs_modulator":
             findings.extend(_guard_fm_subject(changed, profile, rule))
         elif rid == "route_into_off_filter":
-            findings.extend(_guard_route_pair(world, changed, rule, profile))
+            findings.extend(_evaluate_route_pairs(world, changed, rule, profile))
         elif rid == "percentage_units_are_not_one_space":
             for control_id, native in controls_changed.items():
                 for control in profile.get("controls") or []:

@@ -179,12 +179,22 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
     "controls": { "filter_1_cutoff": 24, "filter_1_switch": "On" },
     "structural": false,
     "routes_create": [ {"source":"lfo_1","destination":"filter_1_cutoff","depth":12} ],
-    "routes_update": [ {"slot": 3, "depth": -6} ],
+    "routes_update": [ {"slot": 3, "destination": "filter_1_cutoff", "depth": -6} ],
     "routes_remove": [ {"slot": 7} ],
     "state": { "some.provider.path": value }        // provider-declared state fields only
   },
   "dry_run": true }
 ```
+> **Note (2026-10-11, P20 defect D1).** A semantic `depth` on a `routes_update` **needs the
+> destination**: the conversion hook is per-destination, and for an existing route the destination
+> lives in the live table (request normalization performs no host access). Until this round only
+> `routes_create` converted a depth at all, so `{"slot": 3, "depth": -6}` reached the state codec
+> carrying a field it does not own and was refused there as *"an update names no field to change"* -
+> a misleading error for a well-formed request. The depth is now converted by the provider (the same
+> hook create uses), an update that names only a depth is refused with
+> `detail.reason = "depth_without_destination"` and the slot, and a spec carrying both an `amount` and
+> a `depth` keeps the amount and drops the depth
+> (`tests/plugins/test_p20_routes_update_depth.py`).
 > **Note (2026-10-11, owner safety-gate correction).** `routes_create` (and a `routes_update` that
 > names a source/destination) is **refused** for a provider whose `route_into_off_filter` rule cannot
 > be evaluated - Vital in V1 - with `DependencyViolation` / `detail.unevaluable`, identically for

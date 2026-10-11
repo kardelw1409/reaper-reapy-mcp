@@ -367,9 +367,21 @@ def test_declared_laws_are_not_re_derived(real_profile):
     Since P18 (2026-10-11) there is a second, narrower exception: a row whose
     declaration was **contradicted by a live host measurement** may be replaced
     by that measurement, and only such a row - the table is
-    ``LIVE_MEASURED_CORRECTIONS`` (portamento time/slope and the envelope times),
-    each pinned in ``test_p18_live_corrections.py``. Everything else here is
-    unchanged: the sweep may fill a missing law, never overrule a working one.
+    ``LIVE_MEASURED_CORRECTIONS`` (portamento time/slope, the envelope times,
+    ``volume`` and - P19 - ``voice_transpose``, whose corpus range made the
+    documented neutral write +10 semitones), each pinned in
+    ``test_p18_live_corrections.py``. Everything else here is unchanged: the
+    sweep may fill a missing law, never overrule a working one.
+
+    Since P19 (2026-10-11) there is a third, narrower exception of the same kind:
+    a declared ``enum_index`` law whose **measured** bands are not uniform gets the
+    measured positions attached (``_declared_enum_positions``), and only such a
+    row. It keeps the declared *kind* and the member list - only where each member
+    sits in the host's 0..1 space changes - because the uniform arithmetic landed
+    members in the *neighbouring* band while the layer's own read-back agreed.
+    The derivation is re-computed from the registry's sweeps in
+    ``test_p19_enum_positions.py`` (this test only requires that each such row
+    carries its own measurement, and that no other row does).
     """
     from reaper_reapy_mcp.plugins.providers.vital.profile_build import LIVE_MEASURED_CORRECTIONS
 
@@ -377,6 +389,7 @@ def test_declared_laws_are_not_re_derived(real_profile):
     derived_markers = {"measured_slope", "measured_intercept", "fit_residual", "positions_source"}
     re_derived: set[str] = set()
     corrected: set[str] = set()
+    positions_corrected: set[str] = set()
     for row in registry.rows():
         control_id = row.get("state_key")
         if not control_id or row.get("kind") not in ("affine", "enum_index"):
@@ -388,6 +401,14 @@ def test_declared_laws_are_not_re_derived(real_profile):
             )
             corrected.add(str(control_id))
             continue
+        note = (control.get("evidence") or {}).get("positions_correction")
+        if note:
+            assert control["law"]["kind"] == row["kind"] == "enum_index", control_id
+            assert int(note["members_the_declared_mapping_puts_outside_their_band"]) >= 1, control_id
+            assert "vital_scales_full.json" in str(note["positions_source"]), control_id
+            assert (control["law"]["params"] or {}).get("positions"), control_id
+            positions_corrected.add(str(control_id))
+            continue
         assert control["law"]["kind"] == row["kind"], control_id
         if derived_markers & set(control["law"]["params"]):
             assert control["range"] is not None, control_id
@@ -395,6 +416,9 @@ def test_declared_laws_are_not_re_derived(real_profile):
         else:
             assert control["range"] == _declared_range(row), control_id
     assert corrected == set(LIVE_MEASURED_CORRECTIONS), sorted(corrected ^ set(LIVE_MEASURED_CORRECTIONS))
+    assert positions_corrected == {"filter_1_style", "filter_2_style", "filter_fx_style"}, sorted(
+        positions_corrected
+    )
     expected_re_derived = {
         str(row["state_key"])
         for row in registry.rows()
@@ -411,7 +435,14 @@ def test_declared_laws_are_not_re_derived(real_profile):
     style = by_id(real_profile, "filter_1_style")
     assert style["type"] == "enum" and style["discrete"] is True
     assert style["law"]["kind"] == "enum_index", style["law"]
-    assert "positions" not in style["law"]["params"], "a declared enum keeps the uniform law"
+    # the declared *kind* and member list survive; only the measured positions are
+    # attached, and only because the declared uniform mapping was measurably wrong
+    note = style["evidence"]["positions_correction"]
+    assert note["declared_mapping"] == "uniform index / (n - 1)"
+    assert note["members_the_declared_mapping_puts_outside_their_band"] == 4, note
+    assert style["law"]["params"]["positions"] == [0.03125, 0.125, 0.25, 0.375, 0.5], style["law"]["params"]
+    switch = by_id(real_profile, "filter_1_on")
+    assert "positions" not in (switch["law"]["params"] or {}), "a switch keeps the uniform law"
 
 
 def _declared_range(row: dict) -> dict | None:
