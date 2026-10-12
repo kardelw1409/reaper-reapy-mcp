@@ -64,7 +64,16 @@ _CHUNK_CAPACITY = 20_000_000
 _STRING_CAPACITY = 512
 _CLASS_RE = re.compile(r"\b([0-9A-Fa-f]{32})\b")
 _QUOTED_RE = re.compile(r'"([^"]*)"')
-_MODULE_RE = re.compile(r'"[^"]*"\s+(\S+)')
+#: The module token after the quoted FX name. REAPER quotes a token that
+#: contains a space (`"Surge XT.vst3"`), and a bare `(\S+)` capture truncates it
+#: at the first space (`"Surge`), so a quoted token is read as a whole (measured
+#: live 2026-10-12 on a VST3 synth whose module filename contains a space; a
+#: space-free module name is parsed correctly and hid the defect).
+_MODULE_RE = re.compile(r'"[^"]*"\s+(?:"([^"]*)"|(\S+))')
+
+#: Metadata channels the batched metadata verb attempts (P26). `sections` is
+#: probed separately because it depends on the *host build*, not on the plugin.
+_METADATA_CHANNELS: tuple[str, ...] = ("name", "ident", "value", "steps", "formatted", "named")
 
 
 def field_string(raw: Any, index: int) -> str | None:
@@ -126,12 +135,19 @@ def parse_blocks(chunk: str) -> list[dict[str, Any]]:
             class_match = _CLASS_RE.search(header)
             quoted = _QUOTED_RE.search(header)
             module_match = _MODULE_RE.search(header)
+            module: str | None = None
+            if module_match:
+                module = (
+                    module_match.group(1)
+                    if module_match.group(1) is not None
+                    else module_match.group(2)
+                ) or None  # a quoted-empty module is "no evidence", not the token `""`
             blocks.append(
                 {
                     "header": header.rstrip("\r"),
                     "class_hex": class_match.group(1).upper() if class_match else None,
                     "name": quoted.group(1) if quoted else None,
-                    "module": module_match.group(1) if module_match else None,
+                    "module": module,
                     "line_start": index,
                     "line_end": end,
                     "block_text": "\n".join(line.rstrip("\r") for line in lines[index : end + 1]),
@@ -936,6 +952,242 @@ class ReaperHostBridge:
             ordinal=ordinal,
             matching_fx_count=matching_fx_count,
         )
+
+    # -- read-only metadata channels (P26) ---------------------------------
+
+    def param_metadata(
+        self,
+        ref: PluginInstanceRef,
+        indices: list[int],
+        *,
+        include: tuple[str, ...] = _METADATA_CHANNELS,
+    ) -> dict[str, Any]:
+        """Batched read-only metadata for a list of parameter indices.
+
+        One host hop for the whole list. Every channel is optional and its
+        *absence* is reported per parameter and per channel, because "this plugin
+        has no default value" and "this host build has no such function" are
+        different facts that must not collapse into an empty string.
+
+        The read-only property of the formatter call is not assumed: it formats a
+        value the caller passes and stores nothing (measured in P22 and re-proved
+        in this round's live check).
+        """
+        self.ensure()
+        R = self._api()
+        wanted = tuple(dict.fromkeys(str(name) for name in include))
+        track_index, fx_index = _location(ref)
+        calls = 0
+
+        def _read() -> dict[str, Any]:
+            nonlocal calls
+            track = self._track(R, track_index)
+            rows: list[dict[str, Any]] = []
+            channels: dict[str, str] = {}
+            # The held context is what makes a batched read cheap: measured live
+            # (P8) an unheld loop costs ~30 ms per call and the same loop held ~1 ms,
+            # which is the difference between a 60 s timeout and a 3 s read for one
+            # instance's whole parameter table (re-measured in P26: an unheld
+            # 2858-parameter metadata read wedged at 60 s).
+            with self._hold():
+                for index in indices:
+                    row: dict[str, Any] = {"index": int(index)}
+                    if "name" in wanted:
+                        row["name"] = self._param_name(R, track, fx_index, int(index))
+                        calls += 1
+                    if "ident" in wanted:
+                        row["ident"] = self._ident(R, track, fx_index, int(index))
+                        calls += 1
+                    if "value" in wanted:
+                        try:
+                            row["value"] = float(R.TrackFX_GetParamNormalized(track, fx_index, int(index)))
+                        except Exception:  # noqa: BLE001 - a missing value is a row, not a failure
+                            row["value"] = None
+                        calls += 1
+                    if "steps" in wanted:
+                        row["steps"] = self._step_sizes(R, track, fx_index, int(index))
+                        calls += 1
+                    if "formatted" in wanted:
+                        row["formatted"] = self._formatted(R, track, fx_index, int(index))
+                        calls += 1
+                    if "named" in wanted or "named_full" in wanted:
+                        named = self._named_config(
+                            R, track, fx_index, int(index), full=("named_full" in wanted)
+                        )
+                        row["named_config"] = named
+                        calls += 1 + len(named.get("probed") or [])
+                    rows.append(row)
+                if "sections" in wanted:
+                    sections = self._param_sections(R, track, fx_index, indices)
+                    channels["sections"] = sections["status"]
+                    if sections["status"] == "ok":
+                        by_index = {int(item["index"]): item.get("section") for item in sections["rows"]}
+                        for row in rows:
+                            row["section"] = by_index.get(int(row["index"]))
+                    else:
+                        channels["sections_reason"] = sections.get("reason") or ""
+            return {"rows": rows, "channels": channels, "calls": calls, "include": list(wanted)}
+
+        return self.call_read(_read, timeout=self.timeout, label="param_metadata")
+
+    def param_sections(self, ref: PluginInstanceRef, indices: list[int]) -> dict[str, Any]:
+        """The host's parameter-section (VST3 unit / CLAP module) names, if it has any.
+
+        Section names are read from the *state block header* the host already
+        reports for the instance rather than from a per-parameter call, so this
+        verb answers even on a build without ``TrackFX_GetParamSectionName``. A
+        build that has neither answers ``unsupported`` with the reason - never an
+        empty map that would read as "no sections exist".
+        """
+        self.ensure()
+        R = self._api()
+        track_index, fx_index = _location(ref)
+        function = getattr(R, "TrackFX_GetParamSectionName", None)
+
+        def _read() -> dict[str, Any]:
+            if callable(function):
+                track = self._track(R, track_index)
+                rows = []
+                with self._hold():
+                    for index in indices:
+                        raw = list(function(track, fx_index, int(index), "", 512))
+                        text = field_string(raw, 4) if len(raw) > 4 else None
+                        rows.append({"index": int(index), "section": text or None})
+                return {"status": "ok", "rows": rows, "source": "TrackFX_GetParamSectionName"}
+            return {
+                "status": "unsupported",
+                "rows": [],
+                "source": None,
+                "reason": (
+                    "this host build exposes no parameter-section read "
+                    "(TrackFX_GetParamSectionName arrives in REAPER 7.82; the installed build is older)"
+                ),
+            }
+
+        return self.call_read(_read, timeout=self.timeout, label="param_sections")
+
+    def format_params_normalized(
+        self, ref: PluginInstanceRef, pairs: list[tuple[int, float]]
+    ) -> dict[str, Any]:
+        """Format caller-supplied normalized values - one host hop, read-only.
+
+        This is the display channel every discovery analysis reads. It never
+        stores the value it formats, so a sweep cannot change the plugin state;
+        the *engine* treats the returned text as the plugin's own statement about
+        a value it would show.
+        """
+        self.ensure()
+        R = self._api()
+        track_index, fx_index = _location(ref)
+        calls = 0
+
+        def _read() -> dict[str, Any]:
+            nonlocal calls
+            track = self._track(R, track_index)
+            texts: list[str | None] = []
+            with self._hold():
+                for index, value in pairs:
+                    raw = list(
+                        R.TrackFX_FormatParamValueNormalized(track, fx_index, int(index), float(value), "", 512)
+                    )
+                    calls += 1
+                    texts.append(str(raw[5]) if len(raw) > 5 else None)
+            return {"texts": texts, "calls": calls, "call": "TrackFX_FormatParamValueNormalized"}
+
+        return self.call_read(_read, timeout=self.timeout, label="format_params_normalized")
+
+    def _step_sizes(self, R: Any, track: Any, fx_index: int, index: int) -> dict[str, Any]:
+        """``TrackFX_GetParameterStepSizes`` parsed into named fields."""
+        function = getattr(R, "TrackFX_GetParameterStepSizes", None)
+        if not callable(function):
+            return {"status": "unsupported", "reported": False, "note": "the host has no step-size read"}
+        try:
+            raw = list(function(track, fx_index, index, 0.0, 0.0, 0.0, False))
+        except Exception as exc:  # noqa: BLE001 - a refused probe is a row
+            return {"status": "error", "reported": False, "note": f"{type(exc).__name__}: {exc}"}
+        if len(raw) < 8:
+            return {"status": "error", "reported": False, "note": "the host returned an unexpected tuple"}
+        reported = bool(raw[0])
+        return {
+            "status": "ok" if (reported or bool(raw[7])) else "absent",
+            "reported": reported,
+            "step": float(raw[4]),
+            "small": float(raw[5]),
+            "large": float(raw[6]),
+            "is_toggle": bool(raw[7]),
+            "note": None if reported or bool(raw[7]) else "the host reports no step for this parameter",
+        }
+
+    def _formatted(self, R: Any, track: Any, fx_index: int, index: int) -> str | None:
+        """``TrackFX_GetFormattedParamValue`` - the display text of the *current* value."""
+        function = getattr(R, "TrackFX_GetFormattedParamValue", None)
+        if not callable(function):
+            return None
+        try:
+            raw = list(function(track, fx_index, index, "", _STRING_CAPACITY))
+        except Exception:  # noqa: BLE001 - a missing display is a row
+            return None
+        return field_string(raw, 4) if len(raw) > 4 else None
+
+    def _named_config(
+        self, R: Any, track: Any, fx_index: int, index: int, *, full: bool = False
+    ) -> dict[str, Any]:
+        """Probe the documented per-parameter named-config keys.
+
+        A key the plugin does not implement makes the host answer ``retval 0``; that
+        is recorded as a *probed* key with no value, which is how "the plugin has
+        no default" stays distinguishable from "nobody asked". Only the one key that
+        can carry a value is probed by default: each probe is a host call, and the
+        probe cost was measured (one unheld call ~30 ms) before this was narrowed.
+        """
+        function = getattr(R, "TrackFX_GetNamedConfigParm", None)
+        result: dict[str, Any] = {"status": "unsupported", "entries": {}, "probed": []}
+        if not callable(function):
+            return result
+        entries: dict[str, Any] = {}
+        probed: list[str] = []
+        keys = (
+            ("default_value", "default_value"),
+            ("min", "min"),
+            ("max", "max"),
+            ("units", "units"),
+        ) if full else (("default_value", "default_value"),)
+        for suffix, field_name in keys:
+            key = f"param.{index}.{suffix}"
+            probed.append(key)
+            try:
+                raw = list(function(track, fx_index, key, "", 256))
+            except Exception:  # noqa: BLE001 - a refused key is a row
+                continue
+            if raw and bool(raw[0]):
+                text = field_string(raw, 4) if len(raw) > 4 else None
+                if text not in (None, ""):
+                    entries[field_name] = text
+        result.update(
+            status="ok" if entries else "absent",
+            entries=entries,
+            probed=probed,
+            note=None if entries else "the plugin answered none of the probed named-config keys",
+        )
+        return result
+
+    def _param_sections(self, R: Any, track: Any, fx_index: int, indices: list[int]) -> dict[str, Any]:
+        function = getattr(R, "TrackFX_GetParamSectionName", None)
+        if not callable(function):
+            return {
+                "status": "unsupported",
+                "rows": [],
+                "reason": "this host build exposes no parameter-section read",
+            }
+        rows = []
+        for index in indices:
+            try:
+                raw = list(function(track, fx_index, int(index), "", 512))
+            except Exception:  # noqa: BLE001
+                continue
+            text = field_string(raw, 4) if len(raw) > 4 else None
+            rows.append({"index": int(index), "section": text or None})
+        return {"status": "ok", "rows": rows}
 
 
 def _location(ref: PluginInstanceRef) -> tuple[int, int]:

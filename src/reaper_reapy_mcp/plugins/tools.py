@@ -1,4 +1,4 @@
-"""The 7 `plugin_*` tools: tables, envelope and registration (contract 06).
+"""The `plugin_*` tools: tables, envelope and registration (contract 06).
 
 `TOOL_NAMES` / `SPEC` / `DISPATCH` tables, the schema-2 envelope builders,
 synthesized docstrings and the registration closure. The bodies themselves live
@@ -36,7 +36,9 @@ __all__ = [
 #: Envelope schema version (06 §2; the POC envelope was schema 1).
 SCHEMA_VERSION = 2
 
-#: The seven V1 tool names; disjoint from the existing host tools by prefix.
+#: The V1 tool names; disjoint from the existing host tools by prefix.
+#: ``plugin_prepare`` (P26) is the universal discovery path: it addresses any FX
+#: slot the host reports, with or without a configured provider, and is read-only.
 TOOL_NAMES: tuple[str, ...] = (
     "plugin_instances",
     "plugin_describe",
@@ -45,6 +47,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "plugin_write",
     "plugin_state",
     "plugin_modulation",
+    "plugin_prepare",
 )
 
 #: Tool-layer fault classification for an unexpected internal exception. This
@@ -154,6 +157,45 @@ SPEC: dict[str, dict[str, Any]] = {
         "destructive": True,
         "mutating_ops": ("create", "update", "remove"),
         "returns": "routes[] | per-route outcome | depth result; outcome for mutations",
+    },
+    "plugin_prepare": {
+        "purpose": (
+            "Inventory and prepare any FX instance for discovery: read-only host metadata plus a "
+            "budgeted display sweep, stored as a reusable prepared artifact."
+        ),
+        "args": {
+            "instance": {"type": "object", "required": True, "default": None},
+            "mode": {
+                "type": "string",
+                "required": False,
+                "default": "reuse",
+                "note": (
+                    "reuse serves a stored prepared artifact (and measures the metadata only if "
+                    "none exists); inventory reads metadata only; prepare adds the display sweep; "
+                    "deep adds adaptive refinement of disputed boundaries. A stored artifact "
+                    "answers only a request whose mode it matches or outranks; a stronger "
+                    "request re-measures and reports the replaced artifact"
+                ),
+            },
+            "sample_indices": {"type": "array", "required": False, "default": None},
+            "max_controls": {"type": "integer", "required": False, "default": None},
+            "grid_points": {"type": "integer", "required": False, "default": 17},
+            "refine_budget": {"type": "integer", "required": False, "default": None},
+            "force": {
+                "type": "boolean",
+                "required": False,
+                "default": False,
+                "note": "ignore a stored artifact and measure again",
+            },
+            "include_controls": {"type": "boolean", "required": False, "default": False},
+        },
+        "required": ("instance",),
+        "destructive": False,
+        "mutating_ops": (),
+        "returns": (
+            "identity, prepared{status,path,mode,...}, modules[], module_signals[], classes{}, "
+            "counts{}, unknown_by_reason{}, cost{}, warnings[]"
+        ),
     },
 }
 

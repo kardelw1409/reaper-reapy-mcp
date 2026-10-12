@@ -926,6 +926,7 @@ def test_all_seven_tools_register_and_answer_envelopes():
             "plugin_write": {"instance": {}, "request": {}},
             "plugin_state": {"instance": {}},
             "plugin_modulation": {"instance": {}, "op": "list"},
+            "plugin_prepare": {"instance": {}},
         }
         for name, kwargs in minimal.items():
             envelope = mcp.tools[name](**kwargs)

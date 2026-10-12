@@ -59,6 +59,37 @@ class HostBridge(Protocol):
         """Normalized parameter values; ONE batched host hop per call."""
         ...
 
+    # -- read-only metadata channels (P26; additive) ------------------------
+
+    def param_metadata(
+        self, ref: PluginInstanceRef, indices: list[int], *, include: tuple[str, ...] = ...
+    ) -> dict[str, Any]:
+        """Batched read-only metadata: name, ident, current value, step sizes,
+        current formatted text, named-config entries.
+
+        One host hop for the whole list. Each channel is optional and its
+        absence is reported **per channel and per parameter** (``status``
+        ``ok``/``absent``/``unsupported``/``error``): a plugin with no default
+        value and a host with no such function are different facts.
+        """
+        ...
+
+    def param_sections(self, ref: PluginInstanceRef, indices: list[int]) -> dict[str, Any]:
+        """Parameter section (VST3 unit / CLAP module) names when the host build
+        exposes a channel for them; otherwise ``unsupported`` with the reason."""
+        ...
+
+    def format_params_normalized(
+        self, ref: PluginInstanceRef, pairs: list[tuple[int, float]]
+    ) -> dict[str, Any]:
+        """The host's display text for caller-supplied normalized values.
+
+        Read-only by construction: the host formats a value the caller passes and
+        stores nothing (measured in P22/P23 and re-proved by this round's live
+        check). This is the channel every display-space analysis reads.
+        """
+        ...
+
     def read_state_chunk(self, ref: PluginInstanceRef) -> str:
         """The host's state transport payload for the addressed track."""
         ...

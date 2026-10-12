@@ -79,6 +79,39 @@ class MockFxSlot:
             }
         self.missing_idents: set[str] = set()
         self.block = block or F.make_block_text(F.demo_document(), name=name, module=module, class_hex=class_id)
+        #: P26 metadata channels. A slot that answers none of them models a plugin
+        #: with no step sizes, no defaults and no section names - which is the
+        #: common case and must be distinguishable from "nobody asked".
+        self.step_sizes: dict[int, dict[str, Any]] = {}
+        self.named_config: dict[int, dict[str, Any]] = {}
+        self.sections: dict[int, str] | None = None
+        self.display_fn: Callable[[int, float], str] | None = None
+        self.display_calls = 0
+
+    def display(self, index: int, normalized: float) -> str:
+        """The slot's own display text for a value the *caller* passes.
+
+        The default mirrors a plugin that prints the raw normalized value with
+        three decimals, so a test's expectations do not depend on a fixture's
+        formatting choices.
+        """
+        self.display_calls += 1
+        if self.display_fn is not None:
+            return str(self.display_fn(int(index), float(normalized)))
+        return f"{float(normalized):.3f}"
+
+    def step_sizes_for(self, index: int) -> dict[str, Any]:
+        entry = dict(self.step_sizes.get(int(index)) or {})
+        reported = bool(entry.get("reported"))
+        return {
+            "status": "ok" if reported or entry.get("is_toggle") else "absent",
+            "reported": reported,
+            "step": float(entry.get("step") or 0.0),
+            "small": float(entry.get("small") or 0.0),
+            "large": float(entry.get("large") or 0.0),
+            "is_toggle": bool(entry.get("is_toggle")),
+            "note": None if reported or entry.get("is_toggle") else "the host reports no step for this parameter",
+        }
 
     @property
     def ident_by_index(self) -> dict[int, str]:
@@ -343,6 +376,87 @@ class MockHostBridge:
                 values.append(float(slot.params[ident]))
         return values
 
+    # -- P26 read-only metadata channels ------------------------------------
+
+    def param_metadata(
+        self,
+        ref: PluginInstanceRef,
+        indices: list[int],
+        *,
+        include: tuple[str, ...] = ("name", "ident", "value", "steps", "formatted", "named"),
+    ) -> dict[str, Any]:
+        """Batched metadata: one log entry for the whole list (like the real verb)."""
+        mode = self._next_mode("param_metadata")
+        slot = self._slot_for(ref)
+        self._record("param_metadata", n=len(indices), channels=list(include))
+        if mode == "store-nothing":
+            return {"rows": [], "channels": {name: "absent" for name in include}, "calls": 0}
+        wanted = set(str(name) for name in include)
+        nametable = slot.index_by_ident
+        idents = {index: ident for ident, index in nametable.items()}
+        rows: list[dict[str, Any]] = []
+        for index in indices:
+            row: dict[str, Any] = {"index": int(index)}
+            if "name" in wanted:
+                row["name"] = slot.param_names.get(int(index))
+            if "ident" in wanted:
+                row["ident"] = None if slot.missing_idents else idents.get(int(index))
+                if slot.missing_idents and idents.get(int(index)) in slot.missing_idents:
+                    row["ident"] = None
+            if "value" in wanted:
+                ident = idents.get(int(index))
+                row["value"] = float(slot.params[ident]) if ident is not None else None
+            if "steps" in wanted:
+                row["steps"] = slot.step_sizes_for(int(index))
+            if "formatted" in wanted:
+                ident = idents.get(int(index))
+                row["formatted"] = (
+                    slot.display(int(index), float(slot.params[ident])) if ident is not None else None
+                )
+            if "named" in wanted:
+                entries = dict(slot.named_config.get(int(index)) or {})
+                row["named_config"] = {
+                    "status": "ok" if entries else "absent",
+                    "entries": entries,
+                    "probed": sorted(entries),
+                }
+            if slot.sections is not None and "section" in wanted:
+                row["section"] = slot.sections.get(int(index))
+            rows.append(row)
+        channels = {name: "ok" for name in include}
+        return {"rows": rows, "channels": channels, "calls": len(rows)}
+
+    def param_sections(self, ref: PluginInstanceRef, indices: list[int]) -> dict[str, Any]:
+        mode = self._next_mode("param_sections")
+        slot = self._slot_for(ref)
+        self._record("param_sections", n=len(indices))
+        if mode == "store-nothing" or slot.sections is None:
+            return {
+                "status": "unsupported",
+                "rows": [],
+                "source": None,
+                "reason": "the mock slot declares no parameter sections",
+            }
+        return {
+            "status": "ok",
+            "rows": [{"index": int(index), "section": slot.sections.get(int(index))} for index in indices],
+            "source": "TrackFX_GetParamSectionName",
+        }
+
+    def format_params_normalized(
+        self, ref: PluginInstanceRef, pairs: list[tuple[int, float]]
+    ) -> dict[str, Any]:
+        mode = self._next_mode("format_params_normalized")
+        slot = self._slot_for(ref)
+        self._record("format_params_normalized", n=len(pairs))
+        if mode == "store-nothing":
+            return {"texts": [], "calls": 0, "call": "TrackFX_FormatParamValueNormalized"}
+        return {
+            "texts": [slot.display(int(index), float(value)) for index, value in pairs],
+            "calls": len(pairs),
+            "call": "TrackFX_FormatParamValueNormalized",
+        }
+
     def read_state_chunk(self, ref: PluginInstanceRef) -> str:
         mode = self._next_mode("read_state_chunk")
         track = self.track(int(ref.location.get("track_index", 0)))
@@ -491,7 +605,7 @@ class MockHostBridge:
 
 _CLASS_RE = re.compile(r"\b([0-9A-Fa-f]{32})\b")
 _QUOTED_RE = re.compile(r'"([^"]*)"')
-_MODULE_RE = re.compile(r'"[^"]*"\s+(\S+)')
+_MODULE_RE = re.compile(r'"[^"]*"\s+(?:"([^"]*)"|(\S+))')
 
 
 def parse_blocks(chunk: str) -> list[dict[str, Any]]:
@@ -511,12 +625,19 @@ def parse_blocks(chunk: str) -> list[dict[str, Any]]:
             class_match = _CLASS_RE.search(header)
             quoted = _QUOTED_RE.search(header)
             module_match = _MODULE_RE.search(header)
+            module: str | None = None
+            if module_match:
+                module = (
+                    module_match.group(1)
+                    if module_match.group(1) is not None
+                    else module_match.group(2)
+                ) or None
             blocks.append(
                 {
                     "header": header.rstrip("\r"),
                     "class_hex": class_match.group(1).upper() if class_match else None,
                     "name": quoted.group(1) if quoted else None,
-                    "module": module_match.group(1) if module_match else None,
+                    "module": module,
                     "line_start": index,
                     "line_end": end,
                     "block_text": "\n".join(line.rstrip("\r") for line in lines[index : end + 1]),

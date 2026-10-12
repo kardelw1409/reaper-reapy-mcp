@@ -31,11 +31,14 @@ from . import values as V
 from .binding import declared_names, indexed_controls, normalise_name
 from .cache import ProfileCache
 from .errors import (
+    AmbiguousInstance,
     IdentityContinuityUnprovable,
+    InstanceNotFound,
     InvalidValue,
     NotConnected,
     PluginError,
     SnapshotUnavailable,
+    StaleInstance,
     TargetChanged,
     UnsupportedOverride,
     UnsupportedProvider,
@@ -57,6 +60,7 @@ __all__ = [
     "plugin_write",
     "plugin_state",
     "plugin_modulation",
+    "plugin_prepare",
     "register_production_bodies",
     "session_bridge",
     "session_registry",
@@ -66,6 +70,13 @@ __all__ = [
 #: Unset or empty means **zero providers** (13 §4): every plugin tool then answers
 #: a typed `UnsupportedProvider`, which is the documented inert-but-visible state.
 PROVIDERS_ENV = "REAPER_MCP_PLUGIN_PROVIDERS"
+
+#: The strength order of the prepare modes (P27). A stored artifact answers a
+#: request only when its own mode is at least as strong; a request that outranks
+#: it is measured instead (measured live 2026-10-12: `mode="prepare"` on a
+#: stored `inventory` artifact served it with zero host calls and no display
+#: sweep, against the declared "prepare adds the display sweep").
+_MODE_RANK: dict[str, int] = {"inventory": 1, "prepare": 2, "deep": 3}
 
 _BRIDGE: ReaperHostBridge | None = None
 _REGISTRY: TargetTokenRegistry | None = None
@@ -966,6 +977,297 @@ def plugin_modulation(
     return envelope
 
 
+# ---------------------------------------------------------------------------
+# plugin_prepare (P26): the universal, provider-free discovery path
+# ---------------------------------------------------------------------------
+
+
+class _HostScopeProvider:
+    """A provider-shaped scope that claims **every** FX slot.
+
+    `plugin_prepare` has to address a plugin no configured provider knows, so it
+    needs the host enumeration and the selector logic without any plugin
+    knowledge. This scope supplies `matches`/`identify` and nothing else: it
+    declares no capability, builds no profile and is never registered as a
+    provider, so it cannot be reached by the profile path.
+    """
+
+    id = "host-scope"
+
+    def matches(self, facts: Any) -> bool:
+        return True
+
+    def identify(self, facts: Any) -> dict[str, Any]:
+        return {
+            "fx_name": facts.fx_name,
+            "class_id": facts.class_id,
+            "module": facts.module,
+            "param_count": facts.param_count,
+        }
+
+
+def plugin_prepare(
+    *,
+    config: Any = None,
+    instance: Any = None,
+    mode: str = "reuse",
+    sample_indices: Any = None,
+    max_controls: Any = None,
+    grid_points: Any = None,
+    refine_budget: Any = None,
+    force: bool = False,
+    include_controls: bool = False,
+    **_: Any,
+) -> dict[str, Any]:
+    """Inventory and prepare an FX instance for discovery (read-only).
+
+    Four modes, one of which is a pure lookup: ``reuse`` serves a stored prepared
+    artifact when one exists (and otherwise runs the cheapest useful pass,
+    ``inventory``), ``inventory`` reads host metadata only, ``prepare`` adds the
+    display sweep, and ``deep`` adds adaptive refinement of the disputed
+    boundaries. ``force`` ignores a stored artifact and measures again. A stored
+    artifact answers a request only when its own mode is at least as strong as
+    the requested one - a ``prepare``/``deep`` request that outranks the stored
+    artifact re-measures and reports the replaced artifact as
+    ``prepared.previous_artifact`` (rule ``mode_strength``). A **limited** run
+    (``sample_indices``/``max_controls``) is returned in full but is never stored
+    over a broader artifact for the identity (``store_refusal`` says so) - not even
+    with ``force``: the broader artifact may be the only copy of measurements that
+    cost many host calls.
+
+    The host is only **read**: values, names, idents, step sizes, named-config
+    entries and the display text of caller-supplied values. Nothing is written to
+    the plugin, no preset is applied and no REAPER project is saved; the artifact
+    this tool stores is local discovery data, not plugin state.
+    """
+    from .discovery import report as DISCOVERY_REPORT
+    from .discovery.pipeline import DiscoveryEngine, EngineConfig
+    from .discovery.store import PreparedStore
+    from .tools import ok_envelope
+
+    resolved_config = _config(config)
+    bridge = session_bridge(resolved_config)
+    selector, expected_identity, token_id = _instance_claims(instance)
+    found = RS.iter_instances(bridge, _HostScopeProvider(), selector=selector)
+    if not found:
+        raise InstanceNotFound(
+            "no FX slot matches the selector",
+            detail={"selector": dict(selector or {}), "scope": "host"},
+        )
+    if len(found) > 1:
+        raise AmbiguousInstance(
+            "more than one FX slot matches; address one with track_index/fx_index",
+            detail={"selector": dict(selector or {}), "matches": len(found)},
+        )
+    facts, _track_name = found[0]
+    identity = _HostScopeProvider().identify(facts)
+    if expected_identity:
+        disagreements = [
+            name
+            for name in ("class_id", "fx_name", "module", "param_count")
+            if name in expected_identity
+            and expected_identity.get(name) is not None
+            and str(expected_identity.get(name)) != str(identity.get(name))
+        ]
+        if disagreements:
+            raise StaleInstance(
+                "the addressed instance no longer matches the identity the caller supplied",
+                detail={"fields": disagreements, "live": identity, "claimed": dict(expected_identity)},
+            )
+    ref = PluginInstanceRef(
+        host="reaper",
+        location=RS.facts_location(facts),
+        provider=_HostScopeProvider.id,
+        identity=identity,
+        display=f"{facts.fx_name} @ track {facts.track_index + 1} fx {facts.fx_index + 1}",
+    )
+
+    requested_mode = str(mode or "reuse").strip().lower()
+    if requested_mode not in ("reuse", "inventory", "prepare", "deep"):
+        raise InvalidValue(
+            f"unknown prepare mode {mode!r}",
+            detail={"accepted": ["reuse", "inventory", "prepare", "deep"]},
+        )
+    store = PreparedStore()
+    artifact = None
+    stored_candidate: Any = None
+    refused_before: dict[str, Any] | None = None
+    build_mode = "inventory" if requested_mode == "reuse" else requested_mode
+    # The store is read even under `force`: its state is what the limited-run guard
+    # below has to see (a force-run must not silently replace a broader artifact
+    # with a narrower measurement - found by the P27 independent review, F-C4).
+    candidate = store.load(identity)
+    stored_candidate = candidate
+    if not force:
+        if candidate.ok:
+            stored_mode = str(candidate.document.get("mode") or "inventory")
+            if _MODE_RANK.get(requested_mode, 0) > _MODE_RANK.get(stored_mode, 0):
+                # A weaker artifact is not an answer to a stronger request: the
+                # declared semantics rank the modes, so `prepare` must include the
+                # display sweep and `deep` the refinement. The artifact is replaced
+                # by the requested measurement, and the replacement is reported.
+                refused_before = {
+                    "status": "not_used",
+                    "rule": "mode_strength",
+                    "reason": (
+                        f"the stored artifact was measured in mode {stored_mode!r}, weaker than "
+                        f"the requested {requested_mode!r}; it is replaced by the requested measurement"
+                    ),
+                    "path": candidate.path,
+                }
+            else:
+                artifact = candidate
+        elif candidate.rule is not None:
+            # A stored artifact that cannot be used is reported with the new run,
+            # never quietly replaced: a caller has to be able to see that the
+            # measurement it is about to trust is not the one that was stored.
+            refused_before = {
+                "status": candidate.status,
+                "rule": candidate.rule,
+                "reason": candidate.reason,
+                "path": candidate.path,
+            }
+    if artifact is not None:
+        payload = artifact.payload()
+        data = _discovery_view(payload, include_controls=bool(include_controls))
+        data["prepared"] = {
+            **artifact.meta(),
+            "status": "served",
+            "requested_mode": requested_mode,
+            "note": "served from the prepared artifact: no host call, no measurement",
+        }
+        meta = {"host_calls": 0, "cache": "not_used", "instance": _ref_dict(ref)}
+        if token_id:
+            meta["target_token"] = str(token_id)
+        return ok_envelope("plugin_prepare", data, meta=meta)
+
+    engine_config = EngineConfig(
+        mode=build_mode,
+        grid_points=int(grid_points) if grid_points is not None else 17,
+        refine_budget=int(refine_budget) if refine_budget is not None else 0,
+        max_controls=int(max_controls) if max_controls is not None else None,
+        sample_indices=list(sample_indices) if sample_indices else None,
+    ).resolved()
+    result = DiscoveryEngine(bridge=bridge).run(ref, facts, config=engine_config)
+    # P27: a *limited* run (`sample_indices` / `max_controls`) covers part of the
+    # identity, and the artifact it would write sits at the identity's path. It must
+    # not replace a broader stored artifact: that file may be the only copy of
+    # measurements that cost many host calls (the P26 lesson: a run that overwrote
+    # the way back destroyed the record of the state it measured). The measurement
+    # is still returned in full - only the *store* refuses - and the refusal is
+    # reported, never silent.
+    limited_run = bool(engine_config.sample_indices) or engine_config.max_controls is not None
+    broader_stored = bool(stored_candidate is not None and stored_candidate.ok) and not _run_was_limited(
+        stored_candidate.document
+    )
+    store_refusal: dict[str, Any] | None = None
+    if limited_run and broader_stored:
+        store_refusal = {
+            "status": "not_stored",
+            "rule": "limited_run_would_replace_a_broader_artifact",
+            "reason": (
+                "this run is limited (sample_indices/max_controls) while the stored artifact for "
+                "this identity is a full measurement; the broader measurement was left in place"
+            ),
+            "path": str(store.path_for(identity)),
+        }
+        saved: dict[str, Any] = {}
+    else:
+        saved = store.save(result, identity=identity)
+    payload = result.to_dict(with_observations=False, with_inventory=True)
+    data = _discovery_view(payload, include_controls=bool(include_controls))
+    data["prepared"] = {
+        "status": "measured",
+        "requested_mode": requested_mode,
+        "mode": build_mode,
+        "engine_version": result.engine_version,
+        "identity_key": saved.get("identity_key"),
+        "path": saved.get("path"),
+        "size": saved.get("size"),
+        "sha256_matches_disk": saved.get("sha256_matches_disk"),
+        "observations": saved.get("observations"),
+        "stored": store_refusal is None,
+        "note": (
+            "measured now and stored as a prepared artifact; a later call with mode='reuse' serves it"
+            if store_refusal is None
+            else "measured now; NOT stored - the broader stored artifact for this identity was kept"
+        ),
+    }
+    if store_refusal is not None:
+        data["prepared"]["store_refusal"] = store_refusal
+    if refused_before is not None:
+        data["prepared"]["previous_artifact"] = refused_before
+    meta = {
+        "host_calls": result.cost.total_calls,
+        "cache": "not_used",
+        "instance": _ref_dict(ref),
+        "engine_version": result.engine_version,
+        "mode": build_mode,
+        "limits_hit": list(result.cost.limits_hit),
+    }
+    if token_id:
+        meta["target_token"] = str(token_id)
+    return ok_envelope("plugin_prepare", data, meta=meta)
+
+
+def _run_was_limited(document: Mapping[str, Any]) -> bool:
+    """Whether the stored artifact was produced by a limited run (P27).
+
+    A limited run (``sample_indices`` / ``max_controls``) covers part of the
+    identity's parameters; the budget the engine recorded is what says so.
+    """
+    budgets = document.get("payload") or {}
+    budgets = budgets.get("cost") or {}
+    budgets = budgets.get("budgets") or {}
+    engine = budgets.get("engine") or {}
+    return bool(engine.get("sample_indices")) or engine.get("max_controls") is not None
+
+
+def _discovery_view(payload: Mapping[str, Any], *, include_controls: bool) -> dict[str, Any]:
+    """The compact view an agent reads first: modules, then counts, then cost.
+
+    The brief's requirement is that a caller can see the probable structure of a
+    plugin *without* loading thousands of controls, so the module list is always
+    present and the control list only on request.
+    """
+    modules = [
+        {
+            "id": node.get("id"),
+            "label": node.get("label"),
+            "kind": node.get("kind"),
+            "status": node.get("status"),
+            "confidence": node.get("confidence"),
+            "parent": node.get("parent"),
+            "n_controls": len(node.get("controls") or []),
+            "signals": list(node.get("signals") or []),
+        }
+        for node in ((payload.get("modules") or {}).get("nodes") or [])
+    ]
+    controls = list(payload.get("controls") or [])
+    classes: dict[str, int] = {}
+    unknown_by_reason: dict[str, int] = {}
+    for control in controls:
+        kind = str((control.get("classification") or {}).get("kind"))
+        classes[kind] = classes.get(kind, 0) + 1
+        for row in control.get("unknown") or []:
+            reason = str(row.get("reason"))
+            unknown_by_reason[reason] = unknown_by_reason.get(reason, 0) + 1
+    view: dict[str, Any] = {
+        "identity": dict(payload.get("identity") or {}),
+        "modules": modules,
+        "module_signals": list((payload.get("modules") or {}).get("signals_used") or []),
+        "classes": classes,
+        "unknown_by_reason": unknown_by_reason,
+        "counts": dict(payload.get("counts") or {}),
+        "cost": dict(payload.get("cost") or {}),
+        "formats": list(payload.get("formats") or []),
+        "warnings": list(payload.get("warnings") or []),
+    }
+    if include_controls:
+        view["controls"] = controls
+    return view
+
+
 #: tool name -> production body. Registration is unconditional (AUD-013): the
 #: table is attached by `setup_plugin_tools`, and a call with no provider
 #: configured answers a typed `UnsupportedProvider` instead of being absent.
@@ -977,6 +1279,7 @@ BODIES: dict[str, Any] = {
     "plugin_write": plugin_write,
     "plugin_state": plugin_state,
     "plugin_modulation": plugin_modulation,
+    "plugin_prepare": plugin_prepare,
 }
 
 

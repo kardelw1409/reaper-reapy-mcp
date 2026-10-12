@@ -1,0 +1,210 @@
+"""Offline double for the P26 discovery channels (test support).
+
+The discovery engine's only host-facing seam is the bridge, so a test can drive
+the *whole* pipeline - inventory, sweep, analyzers, classification, module
+inference, artifact write - without REAPER by implementing three verbs. This
+double implements exactly those three and counts every call, which is what makes
+"the second call measured nothing" a measurable property instead of a promise.
+
+It is deliberately *not* a mock of `MockHostBridge`: the real bridge is covered by
+its own conformance suite, and a double that reimplemented it would hide a change
+in the channel shapes. This one speaks only the P26 metadata shapes.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from reaper_reapy_mcp.plugins.model import FxHostFacts
+
+#: A display function: ``(index, normalized) -> text``.
+DisplayFn = Callable[[int, float], str]
+
+
+def _numeric_display(scale: float, offset: float, unit: str = "", decimals: int = 2) -> DisplayFn:
+    def display(index: int, normalized: float) -> str:
+        value = offset + scale * float(normalized)
+        return f"{value:.{decimals}f}{unit}"
+
+    return display
+
+
+def linear_display(low: float, high: float, unit: str = "", decimals: int = 2) -> DisplayFn:
+    return _numeric_display(high - low, low, unit, decimals)
+
+
+def power_display(scale: float, exponent: float, unit: str = "", decimals: int = 4) -> DisplayFn:
+    def display(index: int, normalized: float) -> str:
+        return f"{scale * float(normalized) ** exponent:.{decimals}f}{unit}"
+
+    return display
+
+
+def labels_display(labels: Sequence[str]) -> DisplayFn:
+    """A banded display: member ``k`` occupies ``[k/n, (k+1)/n)``."""
+
+    def display(index: int, normalized: float) -> str:
+        count = max(1, len(labels))
+        ordinal = min(count - 1, int(float(normalized) * count))
+        return labels[ordinal]
+
+    return display
+
+
+def stepper_display(step: float, low: float = 0.0, unit: str = "") -> DisplayFn:
+    """An integer-stepping display (the ladder / index pattern)."""
+
+    def display(index: int, normalized: float) -> str:
+        value = low + step * round(float(normalized) * 20.0)
+        return f"{value:g}{unit}"
+
+    return display
+
+
+class FakeControl:
+    """One fake parameter: identity, display and the host's declared metadata."""
+
+    def __init__(
+        self,
+        index: int,
+        name: str,
+        *,
+        display: DisplayFn | None = None,
+        ident: str | None = None,
+        step: float = 0.0,
+        is_toggle: bool = False,
+        named: Mapping[str, Any] | None = None,
+        section: str | None = None,
+    ) -> None:
+        self.index = int(index)
+        self.name = name
+        self.ident = ident if ident is not None else f"0:{index}"
+        self.display = display or linear_display(0.0, 1.0, decimals=3)
+        self.step = float(step)
+        self.is_toggle = bool(is_toggle)
+        self.named = dict(named or {})
+        self.section = section
+
+
+class FakeDiscoveryBridge:
+    """Three P26 verbs over a list of fake controls, with a call census."""
+
+    def __init__(self, controls: Iterable[FakeControl], *, fail_format: bool = False) -> None:
+        self.controls = {control.index: control for control in controls}
+        self.calls: dict[str, int] = {"param_metadata": 0, "format_params_normalized": 0, "param_sections": 0}
+        self.values: dict[int, float] = {index: 0.0 for index in self.controls}
+        self.fail_format = bool(fail_format)
+        self.metadata_calls: list[int] = []
+        self.format_batches: list[int] = []
+        self.track_name = "Track 1"
+
+    # -- host-level reads the tool layer needs to address a slot -----------
+
+    def list_tracks(self) -> list[Any]:
+        from reaper_reapy_mcp.plugins.model import TrackView
+
+        return [TrackView(track_index=0, name=self.track_name, n_fx=1)]
+
+    def fx_facts(self, track_index: int, fx_index: int) -> Any:
+        return facts_for(param_count=len(self.controls))
+
+    # -- the P26 contract --------------------------------------------------
+
+    def param_metadata(self, ref: Any, indices: Sequence[int], *, include: tuple[str, ...] = ()) -> dict[str, Any]:
+        wanted = list(indices)
+        self.calls["param_metadata"] += 1
+        self.metadata_calls.append(len(wanted))
+        rows = []
+        for index in wanted:
+            control = self.controls.get(int(index))
+            if control is None:
+                continue
+            rows.append(
+                {
+                    "index": int(index),
+                    "name": control.name,
+                    "ident": control.ident,
+                    "value": self.values.get(int(index)),
+                    "steps": {
+                        "status": "ok" if control.step or control.is_toggle else "absent",
+                        "reported": bool(control.step),
+                        "step": control.step,
+                        "small": control.step,
+                        "large": control.step,
+                        "is_toggle": control.is_toggle,
+                    },
+                    "formatted": control.display(int(index), float(self.values.get(int(index), 0.0))),
+                    "named_config": {
+                        "status": "ok" if control.named else "absent",
+                        "entries": dict(control.named),
+                        "probed": sorted(control.named),
+                    },
+                    "section": control.section,
+                }
+            )
+        return {"rows": rows, "channels": {}, "calls": len(rows)}
+
+    def param_sections(self, ref: Any, indices: Sequence[int]) -> dict[str, Any]:
+        self.calls["param_sections"] += 1
+        if not any(control.section for control in self.controls.values()):
+            return {"status": "unsupported", "rows": [], "reason": "the double declares no parameter sections"}
+        rows = [
+            {"index": int(index), "section": self.controls[int(index)].section}
+            for index in indices
+            if int(index) in self.controls
+        ]
+        return {"status": "ok", "rows": rows, "source": "TrackFX_GetParamSectionName"}
+
+    def format_params_normalized(self, ref: Any, pairs: Sequence[tuple[int, float]]) -> dict[str, Any]:
+        self.calls["format_params_normalized"] += 1
+        self.format_batches.append(len(pairs))
+        if self.fail_format:
+            return {"texts": [], "calls": 0, "note": "the double was told to fail this channel"}
+        texts: list[str | None] = []
+        for index, value in pairs:
+            control = self.controls.get(int(index))
+            texts.append(None if control is None else control.display(int(index), float(value)))
+        return {"texts": texts, "calls": len(pairs), "call": "TrackFX_FormatParamValueNormalized"}
+
+
+def facts_for(
+    *,
+    fx_name: str = "Fake Synth",
+    class_id: str = "0" * 31 + "1",
+    module: str = "fake.vst3",
+    param_count: int | None = None,
+    track_index: int = 0,
+    fx_index: int = 0,
+) -> FxHostFacts:
+    return FxHostFacts(
+        track_index=track_index,
+        fx_index=fx_index,
+        fx_name=fx_name,
+        class_id=class_id,
+        module=module,
+        param_count=param_count,
+        version="1.0.0",
+    )
+
+
+_BANNED = ("vital", "osc_", "filter_1")
+
+
+def assert_no_provider_tokens(text: str, *, source: str = "") -> None:
+    """The L0 boundary rule, reusable by the P26 independence tests."""
+    lowered = text.lower()
+    for token in _BANNED:
+        assert token not in lowered, f"{source}: contains provider identifier {token!r}"
+
+
+def tokenize_free_names(prefix: str, count: int, *, suffix: str = "control") -> list[str]:
+    """Neutral parameter names for grouping tests (no plugin vocabulary)."""
+    return [f"{prefix}{index}_{suffix}" for index in range(1, count + 1)]
+
+
+_NUMBERISH = re.compile(r"^\d+(?:\.\d+)?$")
+
+
+def is_numberish(text: str) -> bool:
+    return bool(_NUMBERISH.match(text.strip()))

@@ -84,6 +84,60 @@ def test_read_conformance_against_the_real_bridge_when_reachable():
     _read_suite(bridge, counts_exposed=False)
 
 
+# ---------------------------------------------------------------------------
+# Chunk header parsing: the module token (P27)
+# ---------------------------------------------------------------------------
+
+
+def _chunk_with_header(header: str) -> str:
+    return "\n".join(["<TRACK", "  NAME t", header, "  >", ">"])
+
+
+def test_a_quoted_module_token_is_parsed_whole():
+    """REAPER quotes a module token that contains a space.
+
+    Measured live 2026-10-12: VST3 Surge XT's header carries
+    ``"Surge XT.vst3"`` and a bare ``(\\S+)`` capture truncated it to ``"Surge``;
+    Vital's space-free ``Vital.vst3`` parsed correctly and hid the defect. The
+    module string is load-bearing identity evidence (it is what distinguishes two
+    builds that share a class id), so a truncated token is a wrong answer.
+    """
+    header = (
+        '<VST "VST3i: Surge XT (Surge Synth Team) (2->6ch)" "Surge XT.vst3" 0 "" '
+        '661331015{ABCDEF019182FAEB566D624153675854} ""'
+    )
+    chunk = _chunk_with_header(header)
+    for parser in (R.parse_blocks, MH.parse_blocks):
+        blocks = parser(chunk)
+        assert len(blocks) == 1, parser.__module__
+        block = blocks[0]
+        assert block["name"] == "VST3i: Surge XT (Surge Synth Team) (2->6ch)"
+        assert block["module"] == "Surge XT.vst3"
+        assert block["class_hex"] == "ABCDEF019182FAEB566D624153675854"
+
+
+def test_a_bare_module_token_is_unchanged():
+    """The space-free form (what Vital writes) keeps parsing exactly as before."""
+    header = (
+        '<VST "VST3i: Vital (Vital Audio)" Vital.vst3 0 "" '
+        '1854596000{56535456697461766974616C00000000} ""'
+    )
+    chunk = _chunk_with_header(header)
+    for parser in (R.parse_blocks, MH.parse_blocks):
+        block = parser(chunk)[0]
+        assert block["name"] == "VST3i: Vital (Vital Audio)"
+        assert block["module"] == "Vital.vst3"
+        assert block["class_hex"] == "56535456697461766974616C00000000"
+
+
+def test_a_quoted_empty_module_is_no_evidence_not_a_literal():
+    header = '<VST "VST3i: Some Plugin" "" 0 "" 1234{ABCDEF019182FAEB566D624153675854} ""'
+    chunk = _chunk_with_header(header)
+    for parser in (R.parse_blocks, MH.parse_blocks):
+        block = parser(chunk)[0]
+        assert block["module"] is None
+
+
 def test_wedge_chokepoint_never_hangs():
     """A host call that never returns is classified, not waited on."""
     import threading

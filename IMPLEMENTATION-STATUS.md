@@ -3434,3 +3434,332 @@ functions; nothing new runs at preload or on a cache hit (the P21/P23 tests that
   was **not saved** and **no parameter was written**: every probe call this round formats
   a double the caller passes, and each capture proves the watched values and the state
   chunk digest identical before and after.
+
+## 32. P26 - the universal discovery engine, its offline replay, and what a sampled grid can prove (2026-10-12)
+
+The brief for this round was not another provider feature: it was to make the plugin layer
+able to **explore a plugin it has never seen** - inventory every parameter the host exposes,
+recover ranges and conversion shapes *from measurements*, classify the controls, infer a
+module tree, keep the provenance of every field, and store the result as a reusable artifact.
+The round's rule, taken from the brief: if the host exposes it, survey it with every safe
+programmatic means; if a property cannot be read directly, try to recover it by measurement
+and by independent sources; if it still cannot be established, record the **exact reason**
+instead of a guess.
+
+### 32.1 What was already there, and what is new
+
+Everything the round could reuse was reused rather than replaced: the host bridge (read verbs,
+timeout chokepoint, transport recovery), the profile schema and validator, the cache, the
+resolution and token path, the tool envelope, the provider protocol. The new subsystem is
+`src/reaper_reapy_mcp/plugins/discovery/` (16 modules: `evidence`, `text`, `types`,
+`inventory`, `formats`, `observe`, `mapping`, `discrete`, `classify`, `modules`, `pipeline`,
+`report`, `store`, `replay`), three new read-only bridge verbs, and one new tool.
+
+- `host/reaper.py` gains `param_metadata` (batched: name, ident, current value, step sizes,
+  current formatted text, named-config entries - one hop per *window*, per-channel status per
+  parameter), `param_sections` (the VST3-unit/CLAP-module channel, probed rather than assumed)
+  and `format_params_normalized` (the display text of values **the caller passes**). The two
+  loops run inside a **held REAPER context**, which is what makes them cheap: measured this
+  round, an unheld 2858-parameter metadata read **wedged at the 60 s timeout**, and the same
+  read held took **12.2 s**.
+- `plugin_prepare` is the eighth tool and the universal entry point: it addresses any FX slot
+  straight from the host (no provider required), and takes `mode` = `reuse` (serve the stored
+  artifact), `inventory` (metadata only), `prepare` (adds the display sweep) or `deep` (adds
+  adaptive refinement of disputed boundaries), plus `force`. It is read-only, and the answer
+  leads with the compact module map so a caller never has to load thousands of controls.
+- Prepared artifacts live in `%LOCALAPPDATA%\reaper_reapy_mcp\discovery\` (override
+  `REAPER_MCP_PLUGIN_DISCOVERY`) - **not** in the disposable profile cache, and they are
+  portable: `export`/`import_file` re-validate identity, engine generation and content hash on
+  the way in, so a file that travelled between machines is not trusted more than a local one.
+
+### 32.2 The offline replay, which is the round's main proof
+
+`tests/plugins/probe_p26_generic_discovery.py` replays the **recorded** P22 calibration
+(775 controls x 17 formatted samples + the host's step sizes) through the generic pipeline and
+compares it with a **fresh** offline provider build (revision r12):
+
+| comparison | result |
+| --- | --- |
+| class verdicts | 132 `agree`, 642 `agree_with_caveat`, 1 `disagreement_explained`, **0 unexplained** |
+| the one explained case | `pitch_bend_range`: the reference enumerates 49 members whose ids are a monotone numeric series - a ladder written as an enumeration |
+| law family | 362 `same_kind`, 91 `different_kind`, 322 not comparable (one side has no numeric law) |
+| ranges | 380 `equal`, 46 reference-inside, 39 disjoint/overlapping, 3 **constant-offset candidates**, 307 not comparable |
+| units | 182 equal, 3 one-side-absent, 590 both absent |
+| module partition (pairwise) | precision 0.906, recall 0.995, **F1 0.948** over 299,925 pairs |
+| band counts vs the measured boundaries | 317 agree, 3 differ, 23 no-band-structure |
+| measured switch points inside the replay's **narrow** bracket | **772 of 772**, with the reference's member labels agreeing on every checked transition |
+
+The 3 band-count differences are not failures: `filter_{1,2,fx}_style` have a sixth band whose
+text is **empty** in the built plugin - the unnamed tail P25 measured from the source - and the
+replay finds it because the host prints nothing there.
+
+The reference is *fresh* on purpose: the newest cache entry on this machine was produced by
+provider revision r10, which predates the P23-P25 corrections, and comparing against it would
+have produced **49** class disagreements, 29 of them on the controls those rounds fixed. That
+is itself the finding: a stale reference measures the reference, not the new code.
+
+### 32.3 The live check (read-only)
+
+`tests/plugins/live/probe_p26_live_inventory.py`, REAPER 7.53, Vital VST3:
+
+- **2858 of 2858** parameters inventoried in **12.2 s**: 2858 named, 2858 identified,
+  2858 current values, 2858 formatted, 346 with a reported step, 248 toggles, 0 native
+  defaults, and the section channel `unsupported` with its reason (the read arrives in 7.82).
+  The 346/248 figures reproduce P22's measured counts exactly, which is the cross-check
+  between the new channel and the recorded artifact.
+- a limited sweep (24 controls x 17 points, 409 calls, 0.85 s) matched the recording on
+  **408 of 408** values - the offline replay was reading the same instrument as the live host.
+- read-only proof: the track state chunk digest and 31 watched normalized values are identical
+  before and after; no setter was called, no preset applied, the project was not saved.
+
+### 32.4 Defects found and fixed while building (each now pinned by a test)
+
+1. the observation cache keyed positions on a **12-decimal rounding**, so a bisection probe one
+   ulp below a sampled position was answered with the other text and the search stopped ~9000
+   ulps early while reporting `exact` (the key is the exact double now);
+2. `(left + right) / 2` **stalls** tens of ulps early near 1.0 and was reported as an exact
+   adjacent-double bracket (now `left + (right - left) / 2`, and a stall is `bracketed`);
+3. the host's normalized 0..1 space competed as a **range claim** and silently suppressed every
+   measured display range (735 controls had no range; 460 have one now);
+4. `integer_ladder` was published from "the samples print integers" - the exact reading P24
+   warned about - which cost 29 wrong classifications against the reference;
+5. a numeric small-integer display was read as an **enumeration index** (`delay_tempo`);
+6. a **ratio display** (`1/4`, `2/1`, `1/64`) was parsed as "the number 1, unit /64", turning a
+   tempo-sync ramp into nine labels;
+7. nonlinear shape parameters were only identified to the 1.18 grid ratio, so a clean power law
+   **lost to a lookup table**; a ternary refinement inside the winning bracket fixed it;
+8. the containment check compared a measured switch point against a bracket **a whole band
+   wide** - it passed 772 of 772 vacuously; the band's own sampled bracket plus a **member-label
+   agreement** gate make it a check.
+
+### 32.5 Independent review
+
+`GLM-5.3 Flash` (customendpoint) was reached only for short requests this session: a
+medium-sized prompt answered correctly, every full audit prompt failed with *"Response
+contained no choices"*, so the planned four-pass audit could not be run and no summary of it
+is reported here. The short questions that did run produced **four real findings**, all
+reproduced by the primary agent before being fixed:
+
+- `parse_display("0,500")` returned **500.0** (a comma-decimal locale prints one half that way;
+  no real thousands format has a zero leading group) - the ambiguous string is refused now;
+- a **two-sample** labelled display was published as `boolean` with no `enum` alternative - a
+  two-state control and the first two members of an enumeration are indistinguishable there;
+- `delay_l_time` / `delay_r_time` / `delay_mix` was grouped into **three** modules because every
+  token of three characters or fewer counted as a discriminator - only numbers and one/two
+  character tokens do now;
+- the verdict taxonomy could absorb a real disagreement as `agree_with_caveat` when the two
+  documents happened to have the **same member count**; that is now its own verdict
+  (`naming_difference`), counted separately.
+
+### 32.6 Tests, state and honesty boundary
+
+Offline suite: **779 passed, 1 skipped** (672 before the round; +107 new across
+`test_p26_core.py`, `test_p26_analysis.py`, `test_p26_modules_and_replay.py`,
+`test_p26_prepare_tool.py`). Two pre-existing pins moved deliberately and are documented where
+they live: `TOOL_NAMES` 7 -> 8 and the workspace tool total 64 -> 65 (the surface is a
+measurement, and it changed because `plugin_prepare` was added).
+
+What is **implemented and tested**: inventory, the display channel, the model library with
+held-out scoring, range resolution with precedence, the discrete families, the classifier, the
+module inference, the artifact store, the replay and the comparison.
+
+What is **confirmed on a real REAPER**: the metadata channels, the formatter, the full 2858
+parameter inventory, the limited sweep, and the read-only property.
+
+What is **only confirmed on recorded data**: every classification, range and module verdict -
+the replay is a replay.
+
+What remains **unproven by design**: whether the plugin *stores* a value it accepts (a setter
+experiment), the native ranges of controls whose host API exposes none (`TrackFX_GetParamEx`
+answers 0/1/0.5 for all 2858 here), parameter defaults (the plugin answers none), and the
+section/unit channel on this host build. The engine reports each of these with a typed reason
+rather than a value, and the artifact carries the observation set the verdicts came from.
+
+---
+
+## 33. P27 - verification round: the live MCP, the storage boundaries, a second and third FX, a limited live pass, and an 808 built through the MCP
+
+The brief was verification and practical use, not a new subsystem: confirm `plugin_prepare`
+through the **running** editor MCP after a VS Code restart; establish how the disposable profile
+cache, the prepared discovery artifacts and the live parameter values interact (including an
+isolated cold-cache experiment that must not touch the originals); prove generic discovery on a
+**second real FX** with no provider; do a **limited** read-only live pass over the first
+provider's plugin; and build a test 808 bass through the MCP. The register rows for this round
+are **Addendum 13**; the evidence files are named in §33.6.
+
+### 33.1 The live MCP (Stage A)
+
+- The workspace's MCP server (`mcp.config.ws0.reaper`, "Reaper Control") runs **this repository**
+  - `cwd` and the `sys.path` insert come from `.vscode/mcp.json` - and reports
+  **65 tools = 57 classic + 8 `plugin_*`**. That is the number pinned in `test_p0_contracts.py`
+  (`len(TOOL_NAMES) == 8`, `57 + 8 == 65`), read here from the editor's own tool cache
+  (`state.vscdb` -> `mcpToolCache`) **and** from the server's `tools/list`.
+- The live input schema of `plugin_prepare` equals the `SPEC` table in `plugins/tools.py`
+  (instance, mode, sample_indices, max_controls, grid_points, refine_budget, force,
+  include_controls). A real call answered a typed `AmbiguousInstance` envelope (4 matching
+  slots), which is the live dispatch working, not a fixture.
+- The chat session's tool picker had `plugin_instances`/`plugin_find`/`plugin_write`, `add_fx`,
+  `create_track`, `get_fx_list` **disabled**. All further MCP work in this round therefore drove
+  the **same server process over its own stdio JSON-RPC protocol** from a terminal client
+  (`initialize` -> `tools/call`); the writes in §33.5/§33.6 are real MCP calls by the server,
+  with a different client. The four Vital slots visible to the tools are all the same VST3 build
+  (class id `5653...`, 2858 params), so every call that addresses one names `track_index`/`fx_index`.
+
+### 33.2 The three data classes, measured (Stage B)
+
+- **(A) disposable profile cache** `%LOCALAPPDATA%\reaper_reapy_mcp\cache\plugins\`
+  (`REAPER_MCP_PLUGIN_CACHE`), key = provider id + fingerprint + provider revision + provider
+  artifact digest + source digest + schema/format keys; quarantined by atomic rename; never
+  load-bearing for prepared data. **(B) prepared discovery artifacts**
+  `%LOCALAPPDATA%\reaper_reapy_mcp\discovery\` (`REAPER_MCP_PLUGIN_DISCOVERY`), key = identity
+  (class id, fx name, module, param count) + engine version; consumed **only** by
+  `plugin_prepare`. **(C) live values** - `plugin_read`/`plugin_write` always read the host.
+- Startup preload over the **real** directory: 15 entries scanned, **0 prepared, 15
+  `preload.superseded`** (every stored profile declares an older provider revision than the live
+  r12), 0 parses, 0.34 s - so the first warm call in the current server builds once (~2 s) and
+  writes the r12 entry; the old files stay untouched.
+- **Isolated cold-cache experiment** (`REAPER_MCP_PLUGIN_CACHE` -> temp dir; the original
+  directory verified byte- and mtime-identical afterwards):
+  - cold `plugin_describe`: **1 build, 2.021 s, 6 host calls** (connect + handshake +
+    list_tracks + fx_facts), `source=built`, writes the entry;
+  - same-process second call: **0 builds, 1 disk read (2.5 MB profile), 0.769 s**,
+    `source=cache`;
+  - a **restart** with the entry present: preload prepared 1 entry (0.093 s), calls **0 builds,
+    0 disk reads, `prepared=true`** - the in-memory index answers;
+  - `plugin_prepare(mode=reuse)` served the stored artifact with **0 reads/writes of the cache
+    directory** and `meta.cache: "not_used"` - clearing (A) cannot cost (B);
+  - `plugin_read` normalized values equal raw `TrackFX_GetParamNormalized` reads **bit-exactly**
+    (delta 0.0 on three controls) - (C) is live, never from the profile.
+- What survives deleting the cache: everything in (B), the provider's registry, the calibration
+  and enum-boundary artifacts; what is lost: only rebuildable profiles. What is still missing
+  for cross-machine moves: a discovery-artifact **transport story** (export/import exist and
+  re-validate, but nothing drives them from the tool surface).
+
+### 33.3 A second (and third) real FX with no provider (Stage C)
+
+- **Surge XT VST3** (added on a new track via `add_fx`; class id `ABCDEF019182FAEB...`):
+  **2858 host parameters** - a coincidence with the first plugin's total, verified against the
+  raw host API (same total, completely different names). Inventory 12 calls; **full `prepare`:
+  48,598 calls, 96.4 s, 28.2 MB artifact**; classes ramp_like 2263 / enum 161 / boolean 70 /
+  continuous 30 / stepped 23 / **unknown 311**; 117 module nodes including the real
+  "A Osc 1..3"/"B Osc 1..3" families; `reuse` served with **0 host calls**. No provider was
+  configured for it (host-scope only).
+- The P27 independent review's strongest objection ("n=2, both synths, heuristics tuned on the
+  first plugin") was answered with a **third subject of a different topology**: **ReaEQ VST2**,
+  19 parameters, an *effect*. 324 calls, **0 class-unknowns**, and **19/19** name-based ground
+  truth expectations met: `Freq-*` continuous/Hz with a **table** fit (the control is
+  logarithmic), `Gain-*` continuous/dB with the measured -150..+12 range, `BW-*` affine 0..4,
+  `Wet` a `%` ramp 0..100, `Bypass`/`Delta` boolean.
+
+### 33.4 A limited live pass over the first plugin (Stage D)
+
+`tests/plugins/live/probe_p27_vital_limited_pass.py` measures **28 controls of seven kinds**
+(the previous round's live sweep covered only `params[:24]`), 17 grid points, **477 host calls
+in 0.964 s**, read-only, no store contact. Against both the stored artifact and the P22
+calibration recording: **28/28 class agreement**, **476/476 display texts identical**, 28/28
+ranges equal; 22/28 module ids equal (the six differences are the partial 28-control inventory
+plus host-vs-registry naming). The engine's live names come from the host ("Filter 1 Cutoff"),
+the recorded artifact's names from the registry ("filter_1_cutoff") - comparisons must be
+index-based, and the artifacts keep both facts.
+
+### 33.5 Defects found by this round, fixed, and pinned
+
+1. **F-C2 - a quoted module token was truncated** (`host/reaper.py`): `parse_blocks` captured
+   `"Surge` for `"Surge XT.vst3"` because the module capture was a bare `(\S+)` after the quoted
+   FX name; a space-free module name parsed correctly and hid it. The module string is
+   load-bearing identity evidence (it discriminates builds that share a class id).
+   **Fix**: quoted-or-bare capture, quoted-empty = no evidence; the same fix in the mock parser;
+   3 tests in `test_p3_conformance.py`. Live re-verified: the identity now reads `Surge XT.vst3`.
+2. **F-C1 - `mode="prepare"` served a stored `inventory` artifact** with zero host calls and no
+   display sweep, against the declared semantics. **Fix**: the modes are ranked
+   (`inventory < prepare < deep`); a request that outranks the stored artifact re-measures and
+   reports `previous_artifact` (rule `mode_strength`). Live-verified: the same call now measures
+   (48,598 calls) and says what it replaced.
+3. **F-C3 - a limited run could replace a broader artifact** (`sample_indices`/`max_controls`
+   write to the identity's path). **Fix**: the measurement is returned in full but not stored
+   over a broader artifact (`stored: false` + `store_refusal`).
+4. **F-C4 - found by the independent review**: the F-C3 guard did not run under `force` (the
+   stored candidate was only loaded when `not force`), so `force` + limits silently destroyed a
+   full measurement while reporting `stored: true`. **Fix**: the store is read for the guard
+   regardless of `force`; the force path can no longer replace a broader artifact with a
+   narrower one. Two tests (`test_p26_prepare_tool.py`), plus a cache-separation test
+   ("prepare never creates or reads the disposable cache directory").
+
+Suite after the round: **787 passed / 1 skipped** offline
+(`py -3.11 -m pytest -q -p no:cacheprovider tests/plugins --ignore=tests/plugins/live`; the live
+tests are host-mutating by design and are **excluded**, see §33.8), plus 2 repo regressions.
+779 -> 787 = the eight new tests.
+
+### 33.6 The 808 bass through the MCP (Stage E)
+
+A new track ("V3-E 808 Bass") with a **fresh VST3 instance** (`add_fx "Vital"` first resolved to
+the VST2 build - `VSTi:`/`Vital.dll`, 778 params, a *different identity* - and was replaced with
+the explicit `VST3i: Vital (Vital Audio)`). The dry run previewed every conversion before the
+first write (18 plan items; the pitch route's 24 st depth -> native amount 0.249467886 at
+96.19 st/unit; write order `state -> parameters -> verify`). Six write steps followed, each a
+`plugin_write` over the **real MCP transport** with explicit `dry_run=False` and a
+**`plugin_read` read-back compared against the request**:
+
+| step | controls (display-space values) | read-back |
+| --- | --- | --- |
+| tone | `osc_1_transpose` -24 st, `osc_1_level` 0.75 | exact (delta 0 within float32) |
+| amp envelope | `env_1_attack` 0.005 s, `decay` 1.8 s, `sustain` 0.4, `release` 0.5 s | exact |
+| filter | `filter_1_on` On, `filter_1_style` "24dB", `filter_1_cutoff` 34 (~58 Hz) | exact |
+| saturation | `distortion_on` On, `distortion_type` "Soft Clip", `drive` +24 dB, `mix` 0.2 | exact (`type` already at target) |
+| pitch drop | `env_2` 2 ms/70 ms/0/50 ms + route `env_2 -> osc_1_transpose` **+24 st** | route committed, `ALL_VERIFIED` |
+| onset | route `env_2 -> filter_1_cutoff` **+12 st** (the measured P20 recipe: the lowpass otherwise drags the first half-cycle) | route committed, `ALL_VERIFIED` |
+
+All 17 controls verified by read-back; the two routes are live (slots 1 and 3); the REAPER
+project was **not saved**. A re-run of the probe duplicated the pitch route (route creation is
+additive and the probe was not idempotent); the duplicate was removed and the probe now skips
+`(source, destination)` pairs that already exist. **No audio audition was performed** - the patch
+is configured and read-back-verified, not heard.
+
+### 33.7 Independent review (GLM-5.3 Flash, four short audits)
+
+Reachable for short prompts this session. Outcomes: **F-C4** (real, fixed + tested, see §33.5);
+a methods critique that produced the **third subject** of §33.3; a module-grouping critique
+(§33.8, recorded as a limitation); and a sound-design check that corrected `env_1_sustain`
+0.1 -> 0.4 and pointed at the missing filter-opening route (both applied and verified).
+
+### 33.8 Residual gaps, named
+
+- **No audio audition** of the 808 (or of any patch): all sonic claims are configuration +
+  read-back claims.
+- The prepared artifact stored by the P26 **offline replay probe** still sits in the real
+  discovery directory under `mode: "prepare"` with a "used recorded observations" warning and
+  `cost.total_calls: 0` - visible provenance, but the `prepared` block does not promote an
+  explicit `origin` field; a future round should decide whether replay-derived artifacts may be
+  stored in the production directory at all.
+- Module roots may carry **prefix fragments** (e.g. `a` beside `a osc 1`, `midi cc 0..15` for one
+  flat CC family): a grouping-report improvement (flag a root whose key is a strict prefix of
+  another root's key) that was deliberately **not** applied in this round because it changes a
+  pinned P26 output shape.
+- The F-C2 identity fix re-keys the Surge artifact: the two artifacts measured before the fix
+  (11.9 MB inventory + 28.2 MB prepare) remain on disk as history under the old key; the fixed
+  key carries the corrected full prepare.
+- **This round's own incident, recorded and repaired**: the first full-suite command
+  (`pytest tests/plugins`, without `--ignore=tests/plugins/live`) collected the **live**
+  P7/P17/P18/P19 suites, which carry the `live_write` marker (the conftest refusal is lifted
+  for them) while REAPER had the project open. The run was killed mid-flight. Full assessment:
+  `p7_vital_read` is read-only; `p17_three_instances` found its four instances and created
+  nothing (its `final` lists exactly [0,0]..[3,0], and the live layout is still 6 tracks with
+  one FX each on 1-3); `p18_cache_freshness` wrote only `filter_1_cutoff` on track 1 and
+  **self-restored** it (72.0 -> 50.0, its own host read after restore); the P19 probes left
+  three controls of track 1 at a probe arm (`env_2_attack` 0.0, `env_2_release` 0.1,
+  `osc_2_level` 0.0) while route tables were already restored (the P19 tests restore routes by
+  design). The three controls were restored from the recorded pre-suite baseline via a verified
+  MCP write (`p27_track1_repair__20261012T182809Z__b9d8cfc64377.json`), and the closing read
+  shows `filter_1_cutoff` 50.0, `env_2_attack` 0.000499534, `env_2_release` 0.0899194,
+  `osc_2_level` 0.95 - track 1 at its pre-suite baseline. The project was never saved. The
+  offline suite is `--ignore=tests/plugins/live` from now on; the live directory must never be
+  collected in an ordinary suite run.
+
+### 33.9 Evidence
+
+`p27_vital_limited_pass__20261012T174506Z__4f4923d7e0a0.json`,
+`p27_808_bass__20261012T175611Z__209c75fd945d.json` (interim) and
+`p27_808_bass__20261012T181515Z__b25eec3d21d2.json` (final),
+`p27_reeq_third_subject__20261012T181932Z__84bd3d01cb23.json`,
+`p27_track1_repair__20261012T182809Z__b9d8cfc64377.json`; the storage experiment and the
+MCP-transport transcripts are in the round's terminal log (summarised in §33.2/§33.6).

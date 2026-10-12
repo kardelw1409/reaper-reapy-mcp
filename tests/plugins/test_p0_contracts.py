@@ -180,7 +180,10 @@ def test_every_error_serializes_code_message_detail():
 
 def test_spec_declares_exactly_the_seven_tools():
     assert set(SPEC) == set(TOOL_NAMES)
-    assert len(TOOL_NAMES) == 7
+    # 8 since P26 added `plugin_prepare`, the universal (provider-free) discovery
+    # path. The pin moves with the round, deliberately: the count is a measurement
+    # of the surface, and the surface is what the workspace's tool cache reports.
+    assert len(TOOL_NAMES) == 8
     assert all(name.startswith("plugin_") for name in TOOL_NAMES)
 
 
@@ -200,7 +203,9 @@ def test_tool_names_disjoint_from_existing_host_tools():
     existing = _existing_tool_names()
     assert len(existing) == 57, f"expected 57 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
-    assert len(set(existing) | set(TOOL_NAMES)) == 64
+    # 57 classic + 8 plugin_* (7 until P26 added `plugin_prepare`), which is what
+    # the VS Code workspace cache reports for this server.
+    assert len(set(existing) | set(TOOL_NAMES)) == 65
 
 
 def test_every_mutating_tool_declares_dry_run_true():
