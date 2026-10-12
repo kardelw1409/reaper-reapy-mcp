@@ -37,6 +37,7 @@ __all__ = [
     "PlanError",
     "UnsupportedProvider",
     "TargetSliceAmbiguous",
+    "DiscoveryArtifactMissing",
     # conflict / identity
     "TargetChanged",
     "StateConflict",
@@ -253,6 +254,19 @@ class SnapshotUnavailable(PluginError):
     """A complete, verifiable capture is impossible; the mutation is refused."""
 
     code: ClassVar[str] = "SnapshotUnavailable"
+
+
+class DiscoveryArtifactMissing(PluginError):
+    """No prepared discovery artifact exists for the addressed instance.
+
+    P28: the providerless path (describe/find/read/write for an FX no provider
+    claims) serves a stored, verified measurement instead of sweeping the plugin
+    on every request. When no usable artifact exists there is nothing verified to
+    work from, and the refusal carries the remedy (`plugin_prepare`) rather than
+    an empty profile that would read as "this plugin has no controls".
+    """
+
+    code: ClassVar[str] = "DiscoveryArtifactMissing"
 
 
 # ---------------------------------------------------------------------------

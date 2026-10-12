@@ -9,7 +9,7 @@ were stale.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .model import (
     Plan,
@@ -84,24 +84,50 @@ def build_plan(
     resolved: ResolvedRequest,
     live: LiveState,
     label: str = "",
+    parameter_key: Callable[[dict[str, Any]], str | None] | None = None,
+    write_order: tuple[str, ...] = ("state", "parameters", "verify"),
 ) -> Plan:
     items: list[PlanItem] = []
     for control_id, row in resolved.controls.items():
         control = row["control"]
         channel = row["channel"]
         if channel == "parameter":
-            ident = (row.get("binding") or {}).get("ident")
-            current = live.parameter_readback.get(str(ident)) if ident is not None else None
+            binding = dict(row.get("binding") or {})
+            # The address a parameter is tracked under is the caller's business: the
+            # ident path keeps its historical `ident` key, the index path (P28) uses
+            # `#<index>`, and `from_` must be read from the key the *live readback*
+            # was actually recorded under - a miss here silently turns the baseline
+            # into `None`, i.e. a preview that cannot show what it changes from.
+            if parameter_key is not None:
+                key = parameter_key(binding)
+            else:
+                ident = binding.get("ident")
+                key = None if ident is None else str(ident)
+            current = live.parameter_readback.get(key) if key is not None else None
+            # Which space this item is stated in: a display request converts (so
+            # both ends are display values), an explicit normalized request - or a
+            # control with no verified law, whose only write target is the host
+            # space - is stated in normalized values at both ends.
+            if V.has_display_law(control):
+                from_value = (
+                    V.from_native(control, V.normalized_to_native(control, current))
+                    if current is not None
+                    else None
+                )
+                to_value = row["display"]
+                value_space = "display"
+            else:
+                from_value = float(current) if current is not None else None
+                to_value = float(row["normalized"])
+                value_space = "normalized"
             items.append(
                 PlanItem(
                     subject={"control": control_id},
                     channel="parameter",
-                    binding=dict(row.get("binding") or {}),
-                    from_=V.from_native(control, V.normalized_to_native(control, current))
-                    if current is not None
-                    else None,
-                    to=row["display"],
-                    value_space="display",
+                    binding=binding,
+                    from_=from_value,
+                    to=to_value,
+                    value_space=value_space,
                 )
             )
         else:
@@ -133,7 +159,7 @@ def build_plan(
         disable_set={},
         warnings=[],
         findings=[],
-        write_order=("state", "parameters", "verify"),
+        write_order=tuple(write_order),
         n_slots_in_use=active_route_count(live.routes),
     )
 

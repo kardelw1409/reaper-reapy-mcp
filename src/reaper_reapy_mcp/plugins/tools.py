@@ -60,16 +60,26 @@ INTERNAL_ERROR_CODE = "InternalError"
 #: True (AUD-009) - enforced by the mutation-default audit test.
 SPEC: dict[str, dict[str, Any]] = {
     "plugin_instances": {
-        "purpose": "List/resolve plugin instances (candidates, identity, target token).",
+        "purpose": (
+            "List/resolve plugin instances (candidates, identity, target token); "
+            "`scope='project'` lists every loaded FX from the host's own facts, provider or not."
+        ),
         "args": {
             "provider": {"type": "string", "required": False, "default": None},
             "selector": {"type": "object", "required": False, "default": None},
             "include_identity": {"type": "boolean", "required": False, "default": True},
+            "scope": {
+                "type": "string",
+                "required": False,
+                "default": "provider",
+                "enum": ["provider", "project"],
+            },
+            "include_readiness": {"type": "boolean", "required": False, "default": False},
         },
         "required": (),
         "destructive": False,
         "mutating_ops": (),
-        "returns": "instances[], ambiguous, refused[]",
+        "returns": "instances[], ambiguous, refused[], scope, slots_scanned",
     },
     "plugin_describe": {
         "purpose": "Identity, module summary and capability counts for one instance.",

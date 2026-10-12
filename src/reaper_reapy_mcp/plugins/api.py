@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from . import modulation as MOD
+from . import host_scope as HS
 from . import resolve as RS
 from . import values as V
 from .binding import declared_names, indexed_controls, normalise_name
@@ -356,6 +357,88 @@ def _check_instance_claims(
             )
 
 
+def _resolution_any(
+    config: PluginConfig,
+    instance: Any,
+    *,
+    require_writable: bool = False,
+    tool: str = "plugin",
+) -> tuple[Any, RS.ProfileResolution, ReaperHostBridge, TargetTokenRegistry, str]:
+    """Resolve the instance on the provider path, or on the discovery path.
+
+    The provider path is tried first and unchanged: a configured provider that
+    claims the FX serves it exactly as before. The **discovery path** answers the
+    cases the provider path cannot - no provider configured, or none of them
+    claims this FX - by materializing the instance's prepared discovery artifact
+    (P26's `plugin_prepare`) into a profile-shaped view (P28).
+
+    Two boundaries are deliberate:
+
+    * a caller who **names** a provider (`instance.provider`) gets that
+      provider's refusal - there is no silent switch to another path, because a
+      named provider is a statement about which plugin the caller means;
+    * the discovery path never sweeps the plugin: with no usable artifact it
+      refuses with `DiscoveryArtifactMissing` and the `plugin_prepare` remedy,
+      since an unmeasured plugin has no verified addresses to write.
+    """
+    try:
+        provider, resolution, bridge, registry = _resolution(
+            config, instance, require_writable=require_writable, tool=tool
+        )
+        return provider, resolution, bridge, registry, "provider"
+    except (UnsupportedProvider, InstanceNotFound) as exc:
+        if isinstance(instance, dict) and instance.get("provider"):
+            # A caller who NAMED a provider gets that provider's refusal: a named
+            # provider is a statement about which plugin they mean, so there is no
+            # silent switch to the generic path.
+            raise
+        if isinstance(exc, UnsupportedProvider) and exc.detail.get("variable") != PROVIDERS_ENV:
+            # Several providers are configured and the instance names none: that
+            # ambiguity is the caller's to resolve (P24's multi-provider rule),
+            # and it is not the "no provider exists for this plugin" case the
+            # generic path answers.
+            raise
+        from . import host_scope as HS  # noqa: PLC0415 - lazy: keeps registration import-light
+
+        selector, expected_identity, token_id = _instance_claims(instance)
+        bridge = session_bridge(config)
+        registry = session_registry()
+        if require_writable:
+            _require_continuity_basis(token_id, registry, tool=tool)
+        provider, resolution, _artifact = HS.discovery_resolution(
+            bridge, selector=selector, registry=registry
+        )
+        if require_writable:
+            resolution.require_writable()
+        _check_instance_claims(
+            resolution,
+            expected_identity=expected_identity,
+            token_id=token_id,
+            registry=registry,
+        )
+        return provider, resolution, bridge, registry, "discovery"
+
+
+def _requires_provider(source: str, tool: str, channel: str) -> None:
+    """Refuse a channel the discovery path cannot honour, before any host work."""
+    if source != "discovery":
+        return
+    raise UnsupportedProvider(
+        f"{tool} needs the {channel} channel, which only a provider codec can read or write; "
+        "this instance is served by the providerless discovery path",
+        detail={
+            "reason": "channel_unavailable_without_provider",
+            "channel": channel,
+            "tool": tool,
+            "profile_source": source,
+            "remedy": (
+                "configure a provider for this plugin, or use the parameter channel "
+                "(plugin_read / plugin_find / plugin_write on controls)"
+            ),
+        },
+    )
+
+
 def _resolution(
     config: PluginConfig,
     instance: Any,
@@ -398,14 +481,18 @@ def _resolution(
     return provider, resolution, bridge, registry
 
 
-def _meta(resolution: RS.ProfileResolution) -> dict[str, Any]:
+def _meta(resolution: RS.ProfileResolution, *, source: str = "provider") -> dict[str, Any]:
     """The sanctioned live-response metadata (cache, provisional flag, token).
 
     ``identity_basis`` is part of the honesty contract: it states what the target
     token validated and what it explicitly does **not** claim. ``startup``
     carries the one-shot preload summary so a caller can see whether the process
     started with prepared profiles loaded - and that a warm call reused them
-    rather than researching the plugin again.
+    rather than researching the plugin again. ``profile_source`` names which of
+    the two paths answered: a configured *provider*'s profile, or the
+    *discovery* path's materialization of a prepared artifact - they have
+    different powers (the state channel exists only on the provider path), so a
+    caller must be able to tell them apart without guessing from the fields.
     """
     from . import preload as _preload  # noqa: PLC0415 - lazy: keeps registration import-light
 
@@ -416,9 +503,18 @@ def _meta(resolution: RS.ProfileResolution) -> dict[str, Any]:
     meta["profile_key"] = resolution.build.key_for(
         str(resolution.instance.ref.provider), resolution.identity
     )
-    report = _preload.prepared_profiles().report
-    if report is not None:
-        meta["startup"] = report.summary()
+    meta["profile_source"] = source
+    if source == "discovery":
+        from . import host_scope as HS  # noqa: PLC0415 - lazy import
+        from .discovery.index import index_census  # noqa: PLC0415 - lazy import
+
+        meta["index"] = index_census()
+        meta["materialization"] = HS.materialization_stats()
+        meta["artifact"] = HS.artifact_stats()
+    else:
+        report = _preload.prepared_profiles().report
+        if report is not None:
+            meta["startup"] = report.summary()
     return meta
 
 
@@ -470,13 +566,51 @@ def plugin_instances(
     provider: str | None = None,
     selector: dict[str, Any] | None = None,
     include_identity: bool = True,
+    scope: str = "provider",
+    include_readiness: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     from .tools import ok_envelope
 
+    mode = str(scope or "provider").strip().lower()
+    if mode not in ("provider", "project"):
+        raise InvalidValue(
+            "`scope` must be 'provider' or 'project'",
+            detail={"argument": "scope", "value": scope, "accepted": ["provider", "project"]},
+        )
     resolved_config = _config(config)
-    providers = _providers(resolved_config)
-    if provider:
+    named_scope_only = bool(provider) and str(provider).strip().lower() in (HS.SCOPE_ID, "host", "reaper")
+    if mode == "project":
+        return _project_instances(
+            resolved_config,
+            selector=selector,
+            include_identity=include_identity,
+            include_readiness=include_readiness,
+        )
+    if resolved_config.provider_ids:
+        providers = _providers(resolved_config)
+    elif named_scope_only or selector:
+        # Measured live (P28 stage G): this tool refused with zero providers even
+        # when the caller had *named the slot*, so the host-scope block below was
+        # unreachable and a providerless plugin could not be discovered by a
+        # caller that knew exactly which track/slot it meant. An enumeration needs
+        # a vocabulary (and still refuses without one); a selector does not, so a
+        # selected slot is answered from the host-scope path instead.
+        providers = []
+    else:
+        raise UnsupportedProvider(
+            f"no plugin provider is configured; set {PROVIDERS_ENV} to enable one",
+            detail={
+                "variable": PROVIDERS_ENV,
+                "configured": [],
+                "known_providers": list(provider_registry.known_provider_ids()),
+                "remedy": (
+                    "pass a selector (track_index/fx_index) to ask about one slot, which the "
+                    "host-scope path answers from its prepared artifact, or configure a provider"
+                ),
+            },
+        )
+    if provider and providers:
         wanted = str(provider).strip().lower()
         providers = [
             item for item in providers if str(getattr(item, "id", "")).strip().lower() == wanted
@@ -499,16 +633,168 @@ def plugin_instances(
             tokens.append(resolved.token.id)
     ambiguous = len(instances) > 1
     data = {"instances": instances, "ambiguous": ambiguous, "refused": []}
+    # A slot no configured provider claims is still a slot a caller can address -
+    # and the providerless path can serve it from its prepared artifact. It is
+    # reported SEPARATELY (`host_scope`), never mixed into `instances`: those are
+    # instances of a configured provider, and blurring the two would make a
+    # caller's `provider` claim hold for a plugin no such provider matched.
+    if selector and (provider is None or str(provider).strip().lower() == HS.SCOPE_ID):
+        data["host_scope"] = _host_scope_candidates(bridge, selector, include_identity=include_identity)
+        if len(data["host_scope"]) == 1 and not instances:
+            data["ambiguous"] = False
     meta: dict[str, Any] = {
         "configured_providers": list(resolved_config.provider_ids),
         "selector": dict(selector or {}),
         "checked_utc": utc_now_iso(),
         "identity_basis": RS.identity_basis(),
+        "profile_source": "provider" if instances else ("discovery" if data.get("host_scope") else "none"),
     }
+    warnings: list[dict[str, Any]] = []
+    if not resolved_config.provider_ids:
+        warnings.append(
+            {
+                "code": "NoProviderConfigured",
+                "message": (
+                    f"no plugin provider is configured ({PROVIDERS_ENV} is unset); only the "
+                    "selected slot's host-scope readiness can be reported"
+                ),
+                "detail": {"variable": PROVIDERS_ENV, "instances_source": "host_scope"},
+            }
+        )
     if len(tokens) == 1:
         # the one target's session-scoped token, so a caller can address it
         meta["target_token"] = tokens[0]
-    return ok_envelope("plugin_instances", data, meta=meta)
+    return ok_envelope("plugin_instances", data, warnings=warnings, meta=meta)
+
+
+def _project_instances(
+    config: Any,
+    *,
+    selector: dict[str, Any] | None,
+    include_identity: bool,
+    include_readiness: bool = False,
+) -> dict[str, Any]:
+    """`plugin_instances(scope="project")`: every loaded FX, provider or not.
+
+    The enumeration is the host's (`HS.enumerate_project`): one track-list read
+    plus one facts read per slot, which is the cost of *listing* rather than of
+    addressing one instance - so it is an explicit scope, never the default, and
+    the answer reports what it scanned. Rows carry the provider that claims each
+    slot (or `host-scope` when none does), so a mixed project is one answer with a
+    per-row truth instead of two half-answers.
+
+    `ambiguous` keeps its historical meaning - "this answer holds more than one
+    candidate" - which for a full listing is the normal case; a caller who wants a
+    single target passes a selector and reads the same flag.
+    """
+    from .tools import ok_envelope
+
+    bridge = session_bridge(config)
+    providers = _providers(config) if config.provider_ids else []
+    registry = session_registry()
+    listed = HS.enumerate_project(
+        bridge,
+        selector=selector,
+        providers=providers,
+        include_readiness=bool(include_readiness),
+    )
+    instances: list[dict[str, Any]] = []
+    for row in listed["instances"]:
+        item = dict(row)
+        if not include_identity:
+            item.pop("identity", None)
+        instances.append(item)
+    data = {
+        "instances": instances,
+        "ambiguous": len(instances) > 1,
+        "refused": list(listed["refused"]),
+        "scope": "project",
+        "slots_scanned": listed["slots_scanned"],
+        "tracks_scanned": listed["tracks_scanned"],
+        "readiness_included": listed["readiness_included"],
+    }
+    warnings: list[dict[str, Any]] = []
+    if listed["refused"]:
+        warnings.append(
+            {
+                "code": "SlotsUnreadable",
+                "message": (
+                    f"{len(listed['refused'])} slot(s) have an index whose identity the host could "
+                    "not read; they are reported under `refused` and offered as no target"
+                ),
+                "detail": {"count": len(listed["refused"])},
+            }
+        )
+    if not config.provider_ids:
+        warnings.append(
+            {
+                "code": "NoProviderConfigured",
+                "message": (
+                    f"no plugin provider is configured ({PROVIDERS_ENV} is unset); every slot is "
+                    "reported from the host's own facts, and a slot with a prepared artifact is "
+                    "readable and writable through the host-scope path"
+                ),
+                "detail": {"variable": PROVIDERS_ENV, "configured": []},
+            }
+        )
+    meta: dict[str, Any] = {
+        "configured_providers": list(config.provider_ids),
+        "selector": dict(selector or {}),
+        "checked_utc": utc_now_iso(),
+        "identity_basis": RS.identity_basis(),
+        "profile_source": "host_facts",
+        "enumerated_by": "host_bridge",
+        "note": (
+            "each row is the object `plugin_describe`/`plugin_read`/`plugin_write` accept as their "
+            "`instance`; `identity` is the fingerprint those calls re-verify"
+        ),
+        "registry_size": len(getattr(registry, "tokens", {}) or {}),
+    }
+    return ok_envelope("plugin_instances", data, warnings=warnings, meta=meta)
+
+
+def _host_scope_candidates(
+    bridge: ReaperHostBridge, selector: dict[str, Any], *, include_identity: bool = True
+) -> list[dict[str, Any]]:
+    """Read-only: the slots a selector names, with their artifact readiness.
+
+    Only the selector's own slot(s) are read (the enumeration narrows to an
+    addressed track/slot), so this costs one track-state read per candidate and
+    cannot degenerate into a project sweep. A host that refuses the enumeration
+    yields an empty list: this is an *addition* to the answer, and a failure to
+    add it must not turn a working `plugin_instances` into an error.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        found = RS.iter_instances(bridge, HS.HostScope(), selector=selector)
+    except PluginError:
+        return rows
+    for facts, _track_name in found:
+        identity = HS.HostScope().identify(facts)
+        artifact = HS.load_artifact(identity)
+        row: dict[str, Any] = {
+            "host": "reaper",
+            "location": RS.facts_location(facts),
+            "provider": HS.SCOPE_ID,
+            "display": f"{facts.fx_name} @ track {facts.track_index + 1} fx {facts.fx_index + 1}",
+            "artifact": {
+                "status": artifact.status,
+                "mode": artifact.document.get("mode"),
+                "written_utc": artifact.document.get("written_utc"),
+                "path": artifact.path,
+                "reason": artifact.reason,
+            },
+            "ready": artifact.ok,
+            "remedy": (
+                None
+                if artifact.ok
+                else "call plugin_prepare with this instance (mode='prepare') to measure it once"
+            ),
+        }
+        if include_identity:
+            row["identity"] = identity
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +822,17 @@ def _counts(profile: dict[str, Any]) -> dict[str, int]:
     controls = list(profile.get("controls") or [])
     return {
         "controls": len(controls),
-        "writable": sum(1 for row in controls if (row.get("authority") or {}).get("write") == "parameter"),
+        # `writable` means what a caller can actually write: a parameter-channel
+        # control *with a verified conversion*. A control whose law is `none`
+        # (a constant display, an unmeasurable one) holds write authority and
+        # still cannot be written - counting it as writable would overstate the
+        # capability (P28).
+        "writable": sum(
+            1
+            for row in controls
+            if (row.get("authority") or {}).get("write") == "parameter"
+            and str((row.get("law") or {}).get("kind")) not in ("none", "unmeasured")
+        ),
         "enums": sum(1 for row in controls if row.get("type") == "enum"),
         "state_only": sum(1 for row in controls if (row.get("authority") or {}).get("write") == "state"),
         "no_law": sum(
@@ -546,13 +842,41 @@ def _counts(profile: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _sampled_points(result: Any, *, limit: int = 65) -> dict[str, dict[str, Any]]:
+    """The measured (position, text) pairs of a targeted run, per control index.
+
+    A row is included only when the run actually sampled it: a control the run did
+    not touch has no observation, and inventing an empty list would read as "this
+    control was measured and printed nothing".
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for observation in getattr(result, "observations", None) or []:
+        index = getattr(observation, "index", None)
+        samples = getattr(observation, "samples", None) or []
+        if index is None or not samples:
+            continue
+        out[str(int(index))] = {
+            "name": getattr(observation, "name", None),
+            "status": getattr(observation, "status", None),
+            "n_samples": len(samples),
+            "points": [
+                {
+                    "normalized": round(float(sample.normalized), 12),
+                    "text": str(sample.text),
+                }
+                for sample in sorted(samples, key=lambda item: item.normalized)[:limit]
+            ],
+        }
+    return out
+
+
 def plugin_describe(
     *, config: Any = None, instance: Any = None, detail: str = "summary", **_: Any
 ) -> dict[str, Any]:
     from .tools import ok_envelope
 
     resolved_config = _config(config)
-    provider, resolution, _bridge, _registry = _resolution(resolved_config, instance)
+    provider, resolution, _bridge, _registry, source = _resolution_any(resolved_config, instance)
     profile = resolution.profile
     modulation = profile.get("modulation") or {}
     data = {
@@ -571,16 +895,32 @@ def plugin_describe(
             "identity": modulation.get("identity"),
             "slots": modulation.get("slots"),
             "active": None,
+            "reason": modulation.get("reason"),
         },
         "state": {
             "codec": (profile.get("state") or {}).get("codec"),
             "derived_leaves": list((profile.get("state") or {}).get("derived_leaves") or []),
             "structural_keys": list((profile.get("state") or {}).get("structural_keys") or []),
+            "reason": (profile.get("state") or {}).get("reason"),
         },
         "limits": list(profile.get("limits") or []),
         "warnings": [],
     }
-    return ok_envelope("plugin_describe", data, meta=_meta(resolution))
+    if source == "discovery":
+        # What a caller needs to know *before* acting on this answer: which
+        # measurement it came from, how old it is, and which channels exist.
+        artifact = dict((profile.get("evidence") or {}).get("artifact") or {})
+        data["discovery"] = {
+            **artifact,
+            "searchable": True,
+            "writable_controls": int((profile.get("counts") or {}).get("writable") or 0),
+            "controls_without_law": int((profile.get("counts") or {}).get("law_none") or 0),
+            "write_blocker_note": (
+                "a control whose law could not be verified against the artifact's samples is "
+                "readable and refused for writing (a typed NoConversion), never guessed"
+            ),
+        }
+    return ok_envelope("plugin_describe", data, meta=_meta(resolution, source=source))
 
 
 def plugin_find(
@@ -597,15 +937,31 @@ def plugin_find(
     from .tools import ok_envelope
 
     resolved_config = _config(config)
-    _provider, resolution, _bridge, _registry = _resolution(resolved_config, instance)
+    provider, resolution, _bridge, _registry, source = _resolution_any(resolved_config, instance)
     profile = resolution.profile
     controls = list(profile.get("controls") or [])
     modules = list(profile.get("modules") or [])
     kind = str(kind or "control")
     limit = max(1, int(limit))
+    index = getattr(provider, "index", None)
+    # A musical request names several functions at once ("oscillator pitch
+    # envelope filter distortion level"), so the query is split into terms. One
+    # term keeps the historical substring semantics exactly; several terms rank
+    # by how many of them a control answers, and a term that matches nothing is
+    # reported as unmatched instead of being dropped silently.
+    terms = [token for token in normalise_name(query).split(" ") if token] if query else []
+    prebuilt: list[dict[str, Any]] | None = None
+    unmatched_terms: list[str] = []
+    term_suggestions: dict[str, list[str]] = {}
+    ranking: str | None = None
 
     if group:
         module = next((row for row in modules if str(row.get("id")) == str(group)), None)
+        if module is None:
+            module = next(
+                (row for row in modules if str(row.get("label") or "") == str(group)),
+                None,
+            )
         if module is None:
             raise InvalidValue(
                 f"unknown group {group!r}",
@@ -618,6 +974,7 @@ def plugin_find(
         matches = _module_rows(profile, full=bool(include_capability))
         groups = []
     elif kind == "route_vocab":
+        _requires_provider(source, "plugin_find(kind=route_vocab)", "routes")
         modulation = profile.get("modulation") or {}
         matches = [
             {"kind": "source", "id": str(key)} for key in (modulation.get("sources") or [])[:limit]
@@ -626,15 +983,48 @@ def plugin_find(
             for key in (modulation.get("destinations") or [])[:limit]
         ]
         groups = []
+    elif index is not None and terms:
+        # The discovery path answers from the artifact's index: role synonyms,
+        # module tokens and an explicit per-match reason, with the tally of what
+        # matched in total (a bounded answer must not hide a large match set).
+        found = index.find(terms, limit=limit)
+        # The index carries the ENGINE's tentative fit for each control, and the
+        # materializer re-derives the law it will actually use with its own
+        # preference rules - measured live (P28 stage G), ReaComp's `ratio` was
+        # reported `law: "none"` in a search row while `plugin_read` answered a
+        # display for it, i.e. the field a caller uses to decide "is this writable"
+        # disagreed with the write path. The profile is the authority here.
+        materialized = {
+            str(control.get("id")): str((control.get("law") or {}).get("kind") or "none")
+            for control in controls
+        }
+        matches = [
+            {**row, "law": materialized.get(str(row.get("id")), row.get("law"))}
+            for row in found["matches"]
+        ]
+        prebuilt = matches
+        unmatched_terms = list(found["unmatched_terms"])
+        term_suggestions = dict(found["suggestions"])
+        ranking = "artifact_index"
+        groups = []
     else:
-        wanted = normalise_name(query)
-        if wanted:
-            matches = [
-                row
-                for row in controls
-                if any(wanted in name for name in declared_names(row))
-                or wanted in normalise_name(row.get("label"))
-            ]
+        if terms:
+            scored: list[tuple[int, int, dict[str, Any]]] = []
+            for position, row in enumerate(controls):
+                count, matched = _score_control(row, terms)
+                if count:
+                    scored.append((count, position, row))
+            hits: dict[str, int] = {term: 0 for term in terms}
+            for row in controls:
+                for term in terms:
+                    if _term_hits(row, term):
+                        hits[term] += 1
+            unmatched_terms = [term for term, count in hits.items() if count == 0]
+            term_suggestions = {term: _suggestions(profile, term) for term in unmatched_terms}
+            if len(terms) > 1:
+                scored.sort(key=lambda item: (-item[0], item[1]))
+                ranking = "term_coverage"
+            matches = [row for _count, _position, row in scored]
         else:
             matches = list(controls)
         groups = [
@@ -642,33 +1032,71 @@ def plugin_find(
             for row in modules
         ]
 
-    rows: list[dict[str, Any]] = []
-    for row in matches[:limit]:
+    def _entry(row: Mapping[str, Any]) -> dict[str, Any]:
+        # The address is the field a caller acts on, and it must be in the row at
+        # the same key the write/read rows use (`index`). Measured live (P28 stage
+        # G): the index path emitted it ONLY inside `binding`, so a caller reading
+        # `match.index` (the natural key, and the one `plugin_write`'s preview and
+        # verification rows carry) got nothing - the batch then had no address to
+        # use. `compact()` declares both; this projection keeps its promise.
+        address = row.get("index")
+        if address is None:
+            address = (row.get("binding") or {}).get("index")
         entry = {
             "kind": str(row.get("type") or row.get("kind") or "control"),
             "id": row.get("id"),
             "label": row.get("label"),
+            "index": address,
             "module": row.get("module"),
             "type": row.get("type"),
             "unit": row.get("unit"),
             "range": row.get("range"),
-            "binding": {"index": (row.get("binding") or {}).get("index")},
+            "binding": {"index": address},
         }
+        if row.get("name") is not None:
+            entry["name"] = row["name"]
+        for key in ("matched_terms", "why", "roles", "class", "confidence", "law", "members", "step"):
+            if row.get(key) is not None:
+                entry[key] = row[key]
+        if row.get("enum_labels"):
+            entry["enum_labels"] = list(row["enum_labels"])
         if row.get("enum_values"):
-            entry["enum_values"] = [item.get("id") for item in row["enum_values"]]
+            entry["enum_values"] = [
+                item.get("id") if isinstance(item, Mapping) else item for item in row["enum_values"]
+            ]
         if include_capability:
             entry["aliases"] = list(row.get("aliases") or [])
             entry["authority"] = dict(row.get("authority") or {})
-            entry["law"] = dict(row.get("law") or {})
+            entry["law_full"] = dict(row.get("law") or {})
             entry["evidence"] = dict(row.get("evidence") or {})
-        rows.append(entry)
-    data = {
+        return entry
+
+    rows = [_entry(row) for row in matches[:limit]]
+    data: dict[str, Any] = {
         "matches": rows,
         "n_matches": len(matches),
         "suggestions": _suggestions(profile, query) if query and not matches else [],
         "groups": groups,
+        "terms": list(terms),
+        "unmatched_terms": unmatched_terms,
+        "term_suggestions": term_suggestions,
+        "returned": len(rows),
+        "truncated": len(matches) > len(rows),
+        "profile_source": source,
     }
-    return ok_envelope("plugin_find", data, meta=_meta(resolution))
+    if ranking:
+        data["ranking"] = ranking
+    return ok_envelope("plugin_find", data, meta=_meta(resolution, source=source))
+
+
+def _term_hits(row: Mapping[str, Any], term: str) -> bool:
+    """Whether one term matches a profile control (single-term search semantics)."""
+    return any(term in name for name in declared_names(row)) or term in normalise_name(row.get("label"))
+
+
+def _score_control(row: Mapping[str, Any], terms: Sequence[str]) -> tuple[int, list[str]]:
+    matched = [term for term in terms if _term_hits(row, term)]
+    return len(matched), matched
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +1118,7 @@ def plugin_read(
     if not controls:
         raise InvalidValue("`controls` must name at least one control", detail={"controls": controls})
     resolved_config = _config(config)
-    provider, resolution, bridge, _registry = _resolution(resolved_config, instance)
+    provider, resolution, bridge, _registry, source = _resolution_any(resolved_config, instance)
     profile = resolution.profile
     ref = resolution.instance.ref
 
@@ -723,6 +1151,7 @@ def plugin_read(
         wanted.append((str(control.get("id")), control, int(index)))
 
     values: dict[str, Any] = {}
+    host_texts: dict[str, str | None] = {}
     if wanted:
         indices = [index for _cid, _control, index in wanted]
         names = bridge.param_names(ref, indices)
@@ -732,6 +1161,18 @@ def plugin_read(
                 "the host returned a short read; a short read is not evidence",
                 detail={"asked": len(indices), "names": len(names), "values": len(raw)},
             )
+        if source == "discovery":
+            # The plugin's OWN text for the current value (one batched hop). On this
+            # path the fitted law is a *model* of the display, so the host formatter
+            # is the authority: it is what a human would read, and what a caller
+            # comparing a target against reality needs. It is also the only display
+            # available for a control whose law could not be verified.
+            formatted = bridge.format_params_normalized(
+                ref, [(index, float(value)) for index, value in zip(indices, raw)]
+            )
+            host_texts = {
+                index: text for index, text in zip(indices, formatted.get("texts") or [])
+            }
         for (control_id, control, index), live_name, normalized in zip(wanted, names, raw):
             if live_name is None or normalise_name(live_name) not in declared_names(control):
                 problems.append(
@@ -753,6 +1194,9 @@ def plugin_read(
                 "native": V.normalized_to_native(control, float(normalized)),
                 "unit": control.get("unit"),
             }
+            if source == "discovery":
+                value["host_display"] = host_texts.get(index)
+                value["display_source"] = "host_formatter"
             kind = str((control.get("law") or {}).get("kind") or "identity")
             if include_display and kind not in ("none", "unmeasured"):
                 value["display"] = V.from_native(control, value["native"])
@@ -762,7 +1206,7 @@ def plugin_read(
             values[control_id] = value
 
     data = {"values": values, "problems": problems}
-    return ok_envelope("plugin_read", data, meta=_meta(resolution))
+    return ok_envelope("plugin_read", data, meta=_meta(resolution, source=source))
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +1229,7 @@ def plugin_write(
     # strict, and before any host contact: `0` from a client means "do not apply"
     enabled = V.strict_bool(dry_run, "dry_run")
     resolved_config = _config(config)
-    provider, resolution, bridge, registry = _resolution(
+    provider, resolution, bridge, registry, source = _resolution_any(
         resolved_config, instance, require_writable=True, tool="plugin_write"
     )
     body = {key: value for key, value in request.items() if key != "label"}
@@ -803,7 +1247,7 @@ def plugin_write(
         label=label,
     )
     result = transaction.run()
-    meta = _meta(resolution)
+    meta = _meta(resolution, source=source)
     data = {
         "instance": _ref_dict(resolution.instance.ref),
         "dry_run": enabled,
@@ -827,6 +1271,10 @@ def plugin_write(
                         # preview (the P18 freshness probe asserts exactly that).
                         "from": item.from_,
                         "to": item.to,
+                        # Which space `from`/`to` are stated in (P29): a plan item
+                        # for a law-less control is a *normalized* pair, and the
+                        # key must not be guessed from the value's shape.
+                        "value_space": item.value_space,
                     }
                     for item in result.plan.changes
                 ],
@@ -864,7 +1312,8 @@ def plugin_state(
             detail={"op": op, "accepted": ["inspect"]},
         )
     resolved_config = _config(config)
-    provider, resolution, bridge, _registry = _resolution(resolved_config, instance)
+    provider, resolution, bridge, _registry, source = _resolution_any(resolved_config, instance)
+    _requires_provider(source, "plugin_state", "state/document")
     ref = resolution.instance.ref
     track_index, fx_index = ref.location["track_index"], ref.location["fx_index"]
     facts = bridge.fx_facts(track_index, fx_index)
@@ -908,7 +1357,7 @@ def plugin_state(
             "block_chars": len(slice_.block_text),
         },
     }
-    return ok_envelope("plugin_state", data, meta=_meta(resolution))
+    return ok_envelope("plugin_state", data, meta=_meta(resolution, source=source))
 
 
 # ---------------------------------------------------------------------------
@@ -952,9 +1401,10 @@ def plugin_modulation(
     force = False
     resolved_config = _config(config)
     mutation = str(op) in ("create", "update", "remove")
-    provider, resolution, bridge, registry = _resolution(
+    provider, resolution, bridge, registry, source = _resolution_any(
         resolved_config, instance, require_writable=mutation, tool=f"plugin_modulation:{op}"
     )
+    _requires_provider(source, f"plugin_modulation:{op}", "routes/modulation")
     result = MOD.modulation(
         provider=provider,
         bridge=bridge,
@@ -972,7 +1422,7 @@ def plugin_modulation(
     )
     envelope = result.to_envelope("plugin_modulation")
     envelope.setdefault("meta", {})
-    envelope["meta"].update(_meta(resolution))
+    envelope["meta"].update(_meta(resolution, source=source))
     envelope["meta"]["dry_run"] = enabled
     return envelope
 
@@ -982,14 +1432,12 @@ def plugin_modulation(
 # ---------------------------------------------------------------------------
 
 
-class _HostScopeProvider:
-    """A provider-shaped scope that claims **every** FX slot.
+class _HostScopeProvider(HS.HostScope):
+    """Historical name of the host-scope class (P26's `plugin_prepare` uses it).
 
-    `plugin_prepare` has to address a plugin no configured provider knows, so it
-    needs the host enumeration and the selector logic without any plugin
-    knowledge. This scope supplies `matches`/`identify` and nothing else: it
-    declares no capability, builds no profile and is never registered as a
-    provider, so it cannot be reached by the profile path.
+    It is the same object as `host_scope.HostScope`: `plugin_prepare` needs a
+    scope that claims every FX slot without plugin knowledge, and that scope is
+    now shared with the providerless tool path rather than duplicated.
     """
 
     id = "host-scope"
@@ -1195,6 +1643,19 @@ def plugin_prepare(
     }
     if store_refusal is not None:
         data["prepared"]["store_refusal"] = store_refusal
+    if limited_run:
+        # P29: a targeted run's whole point is the *measurements*, and the stored
+        # artifact is deliberately not replaced - so the points have to travel with
+        # the answer or the refinement is unusable through the tool (measured live:
+        # `mapping.params` carries only the point COUNT, so the numbers existed
+        # nowhere the caller could read). Bounded to the controls the run asked for.
+        data["sampled_points"] = _sampled_points(result, limit=65)
+        data["sampled_note"] = (
+            "the positions and the text the host printed at each of them, for the controls this "
+            "targeted run measured; they are NOT written into the stored artifact for this "
+            "identity (a limited run never replaces a broader one), so a caller keeps them "
+            "where it needs them"
+        )
     if refused_before is not None:
         data["prepared"]["previous_artifact"] = refused_before
     meta = {

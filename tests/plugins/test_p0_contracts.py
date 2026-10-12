@@ -145,6 +145,9 @@ _EXPECTED_ERROR_CODES = {
     "IdentityContinuityUnprovable",
     "StateConflict",
     "SnapshotUnavailable",
+    # P28: the providerless path has nothing verified to work from until the
+    # addressed instance has been measured once (`plugin_prepare`).
+    "DiscoveryArtifactMissing",
     "WriteNotApplied",
     "StateMismatch",
     "ReadbackMismatch",

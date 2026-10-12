@@ -15,6 +15,7 @@ from .errors import InvalidValue, NoConversion
 
 __all__ = [
     "LAW_KINDS",
+    "has_display_law",
     "law_kind",
     "direction",
     "strict_bool",
@@ -27,7 +28,7 @@ __all__ = [
     "display_to_write_space",
 ]
 
-LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured")
+LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "table", "unmeasured")
 
 _NUMBER_TYPES = (int, float)
 
@@ -53,6 +54,18 @@ def law_kind(control: dict[str, Any]) -> str:
     return str(law.get("kind") or "identity")
 
 
+def has_display_law(control: dict[str, Any]) -> bool:
+    """Whether a display-space claim about this control can be made **at all**.
+
+    A control whose law was never verified has no display conversion, so the only
+    space a claim can be made in is the host's own normalized one. Everything that
+    reports a display value (the plan, the preview, the verification rows) asks
+    this first, instead of turning a normalized number into a display by identity
+    (the shape P28's law-less rows had).
+    """
+    return law_kind(control) not in ("none", "unmeasured")
+
+
 def _law_params(control: dict[str, Any]) -> dict[str, Any]:
     return dict((control.get("law") or {}).get("params") or {})
 
@@ -65,6 +78,80 @@ def _range(control: dict[str, Any]) -> tuple[float | None, float | None]:
 
 def _enum_members(control: dict[str, Any]) -> list[str]:
     return [str(member.get("id")) for member in control.get("enum_values") or []]
+
+
+def _table_points(control: dict[str, Any]) -> list[tuple[float, float]] | None:
+    """The measured (position, value) samples of a ``table`` law, when usable.
+
+    A table is the **measured display**: a plugin whose displayed value is not any
+    closed form the vocabulary can express (REAPER's own log frequency mapping is
+    the measured example: `20 Hz .. 24 kHz` over the normalized sweep, fitted by
+    the discovery engine as a 17-point table) still has a mapping this layer can
+    read and invert - if it keeps the samples. Two things are required and both
+    are checked here rather than assumed: at least three points, and values that
+    are **strictly monotone** (an invertible mapping). A malformed table is
+    ignored, exactly like a malformed quantization grid, so the conversion behaves
+    as it did before the law existed instead of inventing a reading.
+    """
+    raw = control.get("law") or {}
+    points = (raw.get("params") or {}).get("points")
+    if not isinstance(points, (list, tuple)) or len(points) < 3:
+        return None
+    rows: list[tuple[float, float]] = []
+    for item in points:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        position, value = item
+        if isinstance(position, bool) or isinstance(value, bool):
+            return None
+        if not isinstance(position, (int, float)) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(position)) or not math.isfinite(float(value)):
+            return None
+        rows.append((float(position), float(value)))
+    rows.sort(key=lambda row: row[0])
+    values = [value for _position, value in rows]
+    if any(later <= earlier for earlier, later in zip(values, values[1:])) and any(
+        later >= earlier for earlier, later in zip(values, values[1:])
+    ):
+        return None
+    return rows
+
+
+def _interpolate(points: Sequence[tuple[float, float]], x: float) -> float:
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for before, after in zip(points, points[1:]):
+        if x <= after[0]:
+            span = after[0] - before[0]
+            if span <= 0.0:
+                return after[1]
+            share = (x - before[0]) / span
+            return before[1] + share * (after[1] - before[1])
+    return points[-1][1]  # pragma: no cover - guarded by the endpoint checks
+
+
+def _invert_table(points: Sequence[tuple[float, float]], native: float) -> float | None:
+    """The position a displayed value sits at, by the same linear interpolation.
+
+    The table is inverted **in value order** (ascending or descending), so a
+    descending display needs no direction flag: the samples themselves carry it.
+    """
+    ordered = points if points[-1][1] > points[0][1] else list(reversed(points))
+    if native <= ordered[0][1]:
+        return ordered[0][0]
+    if native >= ordered[-1][1]:
+        return ordered[-1][0]
+    for before, after in zip(ordered, ordered[1:]):
+        if native <= after[1]:
+            span = after[1] - before[1]
+            if span <= 0.0:
+                return after[0]
+            share = (native - before[1]) / span
+            return before[0] + share * (after[0] - before[0])
+    return None  # pragma: no cover - guarded by the endpoint checks
 
 
 def _storage_step(control: dict[str, Any]) -> tuple[float, float] | None:
@@ -262,6 +349,23 @@ def to_normalized(control: dict[str, Any], native: Any) -> float:
     low, high = _range(control)
     kind = law_kind(control)
     descending = direction(control) == "descending"
+    if kind == "table":
+        # The inverse of `normalized_to_native`'s interpolation, taken in value
+        # order so a descending display needs no direction flag.
+        table = _table_points(control)
+        if table is None:
+            raise NoConversion(
+                f"control {control.get('id')!r} declares a table law whose points are missing or "
+                "not monotone; the conversion is refused rather than approximated",
+                detail={"control": control.get("id"), "law": kind},
+            )
+        position = _invert_table(table, float(native))
+        if position is None:  # pragma: no cover - `_invert_table` clamps both ends
+            raise NoConversion(
+                f"control {control.get('id')!r}: the value is outside the measured table",
+                detail={"control": control.get("id"), "native": native},
+            )
+        return float(position)
     if kind == "power":
         base = float(_law_params(control).get("base") or 0.0)
         exponent = float(_law_params(control).get("exponent") or 0.0)
@@ -348,6 +452,19 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
     low, high = _range(control)
     kind = law_kind(control)
     descending = direction(control) == "descending"
+    if kind == "table":
+        # A measured display with no closed form: the samples ARE the law (the
+        # discovery engine's own `table` model), interpolated between them. The
+        # table's values live in the same space as the range, so no range
+        # arithmetic is involved - only the interpolation.
+        table = _table_points(control)
+        if table is None:
+            raise NoConversion(
+                f"control {control.get('id')!r} declares a table law whose points are missing or "
+                "not monotone; the conversion is refused rather than approximated",
+                detail={"control": control.get("id"), "law": kind},
+            )
+        return _snap_to_grid(control, _interpolate(table, float(normalized)))
     if kind == "power":
         base = float(_law_params(control).get("base") or 0.0)
         exponent = float(_law_params(control).get("exponent") or 0.0)

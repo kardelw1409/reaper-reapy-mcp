@@ -769,6 +769,119 @@ class ReaperHostBridge:
             effects_verified=None,  # established by Core's verify, never by the setter
         )
 
+    def write_params_by_index(
+        self, ref: PluginInstanceRef, pairs: list[tuple[int, str, float]]
+    ) -> WriteAttempt:
+        """ONE batched, index-addressed parameter write, guarded by a live name read.
+
+        The providerless path has no ident table to bind against: what its
+        prepared artifact measured is the **index** and the parameter's name at
+        that index. An index is not a durable address (a plugin can reorder its
+        parameters), so the guard is a live ``TrackFX_GetParamName`` read at the
+        same index, **inside the same held hop** as the setter: a mismatch raises
+        before that parameter's setter runs, and no index is ever written on the
+        strength of a stale measurement.
+
+        The (index, expected_name) pair is positional: ``pairs`` is
+        ``[(index, expect_name, normalized), ...]``. As in :meth:`write_params`
+        the read-back is recorded but **not compared** - establishing the effect
+        is Core's job through the provider policy - and the setter's return value
+        is recorded, never trusted.
+        """
+        self.ensure()
+        R = self._api()
+        track_index, fx_index = _location(ref)
+
+        def _write() -> list[dict[str, Any]]:
+            track = self._track(R, track_index)
+            rows: list[dict[str, Any]] = []
+            with self._hold():
+                # Phase 1: EVERY index is name-checked before ANY setter runs. A moved
+                # index therefore refuses with `writes_issued: 0` - a datum the caller
+                # may rely on, because no setter call has been made at that point.
+                checked: list[tuple[int, str, float]] = []
+                for index, expect_name, value in pairs:
+                    observed = self._param_name(R, track, fx_index, int(index))
+                    if observed is None:
+                        raise Unreadable(
+                            "the host reports no parameter name at the addressed index",
+                            detail={"index": int(index), "fx_index": fx_index, "writes_issued": 0},
+                        )
+                    if str(observed) != str(expect_name):
+                        raise TargetChanged(
+                            "the parameter at the addressed index is not the control this write was "
+                            "planned against; the index moved",
+                            detail={
+                                "scene": "index_name_guard",
+                                "index": int(index),
+                                "expected_name": str(expect_name),
+                                "observed_name": str(observed),
+                                "writes_issued": 0,
+                                "remedy": (
+                                    "re-measure the instance (plugin_prepare) so the index/name "
+                                    "binding is current, then retry"
+                                ),
+                            },
+                        )
+                    checked.append((int(index), str(expect_name), float(value)))
+                # Phase 2: setters. The name is re-read immediately before EACH
+                # setter, not only once for the batch: a plugin's parameter table
+                # can move *while the batch runs* (a setter that switches a mode),
+                # and a stale index would write the right number to the wrong
+                # control. `writes_issued` reports how many setters had already
+                # run, so a mid-batch refusal is accounted as a partly applied
+                # batch rather than as "nothing happened".
+                for index, expect_name, value in checked:
+                    observed = self._param_name(R, track, fx_index, index)
+                    if str(observed) != expect_name:
+                        raise TargetChanged(
+                            "the parameter table moved while the batch was running",
+                            detail={
+                                "scene": "index_name_guard_mid_batch",
+                                "index": index,
+                                "expected_name": expect_name,
+                                "observed_name": observed,
+                                "writes_issued": len(rows),
+                            },
+                        )
+                    returned = R.TrackFX_SetParamNormalized(track, fx_index, index, value)
+                    rows.append(
+                        {
+                            "index": index,
+                            "expected_name": expect_name,
+                            "observed_name": expect_name,
+                            "sent": value,
+                            "setter_returned": (
+                                bool(returned[0])
+                                if isinstance(returned, (list, tuple))
+                                else returned
+                            ),
+                        }
+                    )
+                for row in rows:
+                    row["read_back"] = float(
+                        R.TrackFX_GetParamNormalized(track, fx_index, int(row["index"]))
+                    )
+                    # The formatter prints what the plugin *displays* for the value it
+                    # now holds - one more call inside the same hop, and the only
+                    # channel in which a caller can see whether a normalised write
+                    # landed on the value they meant in the plugin's own terms.
+                    formatted = R.TrackFX_FormatParamValueNormalized(
+                        track, fx_index, int(row["index"]), float(row["read_back"]), "", 512
+                    )
+                    row["read_back_display"] = (
+                        str(formatted[5]) if isinstance(formatted, (list, tuple)) and len(formatted) > 5 else None
+                    )
+            return rows
+
+        rows = self.call(_write, timeout=self.timeout, label="write_params_by_index")
+        return WriteAttempt(
+            unit_index=-1,
+            attempted_utc=utc_now_iso(),
+            returned={"channel": "parameters", "address": "index", "rows": rows},
+            effects_verified=None,  # established by Core's verify, never by the setter
+        )
+
     def write_state_slice(
         self,
         ref: PluginInstanceRef,

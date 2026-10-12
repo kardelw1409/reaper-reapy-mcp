@@ -3763,3 +3763,283 @@ a methods critique that produced the **third subject** of §33.3; a module-group
 `p27_reeq_third_subject__20261012T181932Z__84bd3d01cb23.json`,
 `p27_track1_repair__20261012T182809Z__b9d8cfc64377.json`; the storage experiment and the
 MCP-transport transcripts are in the round's terminal log (summarised in §33.2/§33.6).
+
+
+## 34. P28 - providerless indexed discovery and batch writes (a plugin needs no provider)
+
+Goal: an AI must be able to shape a sound and do basic mixing with **any** plugin without
+enumerating thousands of parameters and without a per-plugin provider.
+
+### 34.1 The measured cause of the "thousands of parameters" behaviour
+
+`set_fx_param` resolves a *name* by scanning `fx.params[i].name`, and in reapy every `.name`
+is a host roundtrip. Measured read-only on the live Surge XT instance (2858 parameters):
+
+| classic path | measured |
+|---|---|
+| one `fx.params[i].name` read | 31.4 ms unheld, 0.97 ms held |
+| one pass over every parameter name | **89.7 s** |
+| one `set_fx_param` request whose name matched nothing | **540 s** (six passes) |
+| `get_fx_param_list` (projection + names) | ~277 s, 338 KB |
+
+The V3 tools could not substitute: they were provider-gated, so a providerless FX answered
+`InstanceNotFound` (or `UnsupportedProvider`) - there was **no** compact path at all. That is
+the defect this round closes: the path is the *prepared artifact* a `plugin_prepare` already
+wrote, and every interactive answer is served from it with **zero sweeps**.
+
+### 34.2 What was built
+
+* `plugins/discovery/index.py` - an artifact **index** with role synonyms (`oscillator` →
+  `osc`/`vco`/`operator`, `level` → `level`/`volume`/`gain`/`amp`/`mix`, …), whole-token
+  matching, a documented strength ladder (`#n` 8 > token 6 > prefix 5 > role 4 > synonym 3 >
+  id-substring 3 > module 2), per-match `why`, `unmatched_terms` and per-term suggestions.
+  A **name collision is disambiguated deterministically** (`label #index`) by one shared rule
+  used by both the index and the materializer.
+* `plugins/host_scope.py` - the providerless provider: `materialize_control` chooses in order
+  table law (measured samples as the law) → quantised numeric (measured integer grid) →
+  numeric law (affine/power/exponential, verified in both directions) → band map (switch
+  points) → else `law.kind = "none"` with the reason. Profile and artifact memoized per
+  (path, content digest) / (path, size, mtime).
+* `plugins/values.py` - a `table` law kind (≥3 monotone finite points, clamped outside,
+  inverting in value order).
+* `plugins/transaction.py` + `host/reaper.py` - batch, **index-addressed** writes:
+  `write_params_by_index` reads every name first (phase 1) and re-reads the name immediately
+  before **each** setter (phase 2, because a setter can move a table mid-batch), so a moved
+  index refuses with `writes_issued` naming how much ran; one planned-only capture hop, one
+  read-back pass, and a **display cross-check** (`TrackFX_FormatParamValueNormalized`) that
+  reports law-vs-host disagreements instead of asserting agreement.
+* `plugins/api.py` - `_resolution_any` falls back to the artifact path only for
+  `InstanceNotFound` / "no provider configured" (a named or ambiguous provider keeps its
+  refusal); `plugin_describe` gains a `discovery{}` block; `plugin_find` answers multi-term
+  queries from the index; `plugin_read` adds `host_display` (the plugin's own text);
+  `plugin_instances` reports providerless slots in a separate `host_scope[]` block.
+
+### 34.3 Live measurement (new tracks only, project never saved)
+
+Surge XT + ReaEQ + ReaComp on a new track; Vital on a second new track. 89 MCP calls,
+164.6 s wall, 352 KB of answers, 0 errors, 6 pre-existing tracks untouched and named in the
+evidence.
+
+| what | measured |
+|---|---|
+| `plugin_prepare(reuse)` on a new instance of a known build | served in **2.1 s**, **0 sweeps** |
+| Surge materialization | 2858 controls → **2539 writable** (numeric 2240, band map 203, table 68, quantised 28), **319 with no law** |
+| law audit over the real artifact | 43 063 exact + 68 within the printed resolution + 0 beyond + 32 non-numeric samples skipped + 5 423 not sampleable = **48 586 = 2 858 × 17**, counts close |
+| the 68 | all continuous (`exponential` 60, `table` 8), worst 2.24e-4 relative - **no discrete control among them** |
+| one `plugin_write` batch of 4 (capture + write + verify + read-back) | **3.16 s**, host counters `reads 7, write_calls_attempted 1, write_effects_verified 1, write_effects_unknown 0` |
+| Surge cutoff / waveshaper drive | 523.25 Hz → **120.00 Hz**; 0.00 dB → **6.00 dB** (host text confirms) |
+| Surge amp EG (attack/decay/release) | **refused by name** (`NoConversion`, `law: "none"`) - and the *whole batch* refused, 0 writes |
+| ReaComp before a sweep | stored artifact was `inventory` mode with **0 observations** → every control `law: "none"` → unwritable; one `prepare` sweep (**2.04 s**, 19 params) made it writable |
+| ReaComp batch | threshold −12.0 dB, ratio `7.19 :1` (a member label - a *native* 3.0 was refused with the full legal list), attack, release 120 ms: `verdict ALL_VERIFIED`, 4/4 rows `agrees: true` |
+| table-law interpolation at 3 non-sampled positions (ReaEQ `freq_band_2`) | position exact and verified, but the host prints **113.0 / 955.5 / 6438.9 Hz** where the table predicted **115.7 / 973.0 / 6552.85 Hz** (≈1.5-2.4 % low); the write's own `display_checks` reports each disagreement |
+| Vital (provider path, unchanged) | cache hit, 775 controls, one write verified in **21.1 s** - the *existing* provider path's cost, for comparison |
+
+### 34.4 Defects found by measurement and fixed
+
+1. `plugin_instances` refused with zero providers **even when a selector named the slot**, so
+   the host-scope block was unreachable; a selector now answers (an enumeration still refuses
+   without a vocabulary).
+2. `plugin_find` rows carried the address **only** inside `binding.index` - no top-level
+   `index`/`name`, unlike `compact()`'s declared shape and the write/read rows, so a caller
+   had nothing to write with. Projected from `binding`.
+3. Two controls can share a name (ReaComp has two `Attack`s): `by_id` collapsed and a bare
+   `assert` in `materialize_profile` turned it into an `InternalError` with an **empty
+   message** while one of the two was unaddressable. Now one shared `label #index` rule, a
+   census entry, and a typed refusal instead of the assert.
+4. `plugin_find`'s `law` field reported the *engine's* tentative fit, disagreeing with the
+   law the write path uses (ReaComp's `ratio` read as `none` while `plugin_read` answered a
+   display for it). The profile is the authority now.
+5. `add_fx` accepts the **host's** name (`VST3i: Surge XT (Surge Synth Team) (2->6ch)`), not
+   the catalog's display string (`Surge XT (Surge Synth Team) (2-6ch) [VSTi]`) - measured by
+   trying both and re-reading the FX list.
+6. Probe defects, fixed rather than worked around: a bare `{"control": value}` request was
+   correctly refused (the tool's request object is the only shape carrying `controls`) and the
+   *refusal was then dropped from the record*; the sample lookup took "the newest artifact in
+   the directory" (which was another plugin's, so the midpoint check silently did not run);
+   the baseline guard treated a track the probe itself had adopted as pre-existing; and an
+   exception wrote no traceback.
+
+### 34.5 Independent review (GLM-5.3 Flash, 4 checks) - what reproduced
+
+* "Whole-batch pre-flight before the first mutation, machine-readable applied set" and
+  "confirm the target through the read-back, not the index you wrote" - **reproduced**; the
+  first is now *live-proven* (one law-less control refused a 4-control batch and nothing was
+  written), and the second was already implemented (phase-1 + per-setter name re-check).
+* "The audit totals must close" - **reproduced**: they did not (32 samples were dropped
+  silently); the accounting now closes exactly with its unit stated.
+* "Classify the 68; a discrete control among them would be a wrong write" - **done, none is
+  discrete** (see 34.3).
+* "Table laws interpolate between samples; the deviation between samples is unmeasured" -
+  **reproduced and measured** (1.5-2.4 % at ReaEQ's frequency midpoints).
+* "Everything verified is digital; nothing was auditioned" - confirmed and recorded as a gap.
+* "Pin identity to version + artifact digest" - the artifact digest travels on every claim;
+  the host exposes no plugin version on this path (`limits` says so).
+* Not done, named: a `validated_on` field per synonym (the synonym table is hand-written and
+  validated only by this round's ranking tests), and re-validating a law in a *different*
+  plugin state.
+
+### 34.6 Evidence
+
+`p28_live_musical__20261012T204725Z__f65aa4dbd591.json` (the 89-call live pass),
+`p28_compressor_live__*.json` (the compressor batch), `p28_materialization_audit__*.json`
+(the 48 586-sample law audit, verdict `sound`), `p28_enumeration_cost__*.json` (the classic
+cost table), `p28_provider_gap__*.json` (before/after on the three subjects);
+`tests/plugins/live/probe_p28_*.py`, `tests/plugins/probe_p28_materialization_audit.py`.
+
+### 34.7 Residuals (named, not fixed)
+
+**No audio was auditioned**: every value above is a host read-back, never a listened result.
+A control whose display has **no verified law** cannot be written at all (319 of 2858 on
+Surge, including the amp EG times and ReaComp's `ratio` as a native value) - the layer
+refuses by name; a `{"normalized": p}` request shape would lift this and was *not*
+implemented. Between sampled positions a `table` law deviates by up to ~2.4 % on a coarse
+step display (a finer grid or `mode="deep"` should reduce it; not measured this round). Laws
+are re-validated per **artifact**, not per plugin **state**, so a state change that keeps the
+parameter count and names is not detected. The synonym table's provenance is this repository's
+own judgement. A discovery-path call still costs ~1.8-3.0 s (two identity reads plus
+memoized profile/index work), and the provider path's write on Vital costs ~21 s.
+
+
+## 35. P29 - normalized writes, providerless enumeration, and a real 808: what the table laws really do
+
+Goal: lift the blocking limits P28 left, then build a sound with a *few targeted* parameters
+and confirm it can be mixed with ReaEQ/ReaComp without a provider per plugin.
+
+### 35.1 The measured cause of the "sounds like a saw" report
+
+Read-only, live, on the P28 track before anything was written: Surge XT's `A Osc 1 Type`
+(index 256) held **`Classic`** - its analogue, saw-based oscillator - and the P28 patch had
+never addressed it (its queries were cutoff, waveshaper drive and the amp EG times; the
+waveform control was not among them). The report of a saw is the **user's hearing**: what this
+repository measured in P28 *and* P29 is the parameter state, and no render or audio analysis
+was performed in either round. The waveform is a **labelled host state** -
+`Classic | Sine | Wavetable | S&H Noise | Audio In | FM3 | FM2 | Window | Modern | String |
+Twist | Alias` - so it is choosable by name and confirmable by the plugin's own text.
+A **pitch drop is not reachable**: Surge exposes no modulation-matrix and no pitch-envelope
+parameter (the artifact's 93 modules contain no such node), so the attack transient comes from
+the filter envelope instead, and that boundary is recorded rather than glossed.
+
+### 35.2 What was built
+
+* **Normalized writes** (`plugins/request_value.py`, shared by both paths): a control entry may
+  name exactly one of `{"display": v}` (needs the verified law), `{"native": v}` (needs it too)
+  or `{"normalized": p}` (**needs no law** - it is the host's own space). A missing semantic
+  mapping therefore no longer blocks a write the caller stated in normalized terms; the answer
+  says which space each row used (`value_spaces`) and whether a display claim exists at all
+  (`display_claim`). A **labelled state** of an otherwise numeric control resolves to the
+  position that label was *measured* at (Surge's `-inf dB`), and an unknown label is refused
+  with the options. `on_unresolved: "skip"` is an explicit opt-in for a partly unresolvable
+  batch (default `refuse`, unchanged).
+* **Providerless project enumeration** (`host_scope.enumerate_project` +
+  `plugin_instances(scope="project")`): every loaded FX from the host's own facts (track list,
+  slot, FX name, class id, module, parameter count) with a row that is the same object the
+  other tools accept as `instance`; the provider claiming a slot is reported per row, or
+  `host-scope` when none does; a slot whose identity cannot be read is reported under
+  `refused` instead of vanishing.
+* **The write target of an enumerated state is measured** (`host_scope.label_positions`): the
+  band map's write direction had never been verified, and the arithmetic midpoint of a
+  *sampled* band can print a **neighbouring** member.
+* **Targeted refinement is usable through the tool**: a limited `plugin_prepare`
+  (`sample_indices` + `grid_points`) now returns `sampled_points`, so a refinement's
+  measurements can be read by the caller (they were computed and dropped before).
+* **Two honest-reporting fixes**: `display_checks` compares the plugin's text with what the
+  caller *asked for* where a display value was requested (`agrees_with_request`,
+  `n_law_disagreements` beside `n_disagreements`), and `partial_application` reports
+  `verified` (read back) rather than a resolved-set count.
+
+### 35.3 The live 808 (new tracks only, provider config = the editor's)
+
+79 MCP calls, 167.2 s, 527 KB of answers, 0 errors; 6 batched writes, each
+`write_calls_attempted 1 / write_effects_verified 1 / write_effects_unknown 0`; 62 host reads
+for 31 written controls. All values below are the **plugin's own printed text**.
+
+| step | before -> after |
+|---|---|
+| waveform | `A Osc 1 Type` **Classic -> Sine** (target 0.09375 = the midpoint of the two positions that printed "Sine"; `agrees_with_request: true`) |
+| voice | `A Osc 2/3 Volume`, `A Noise Volume` 0.00 dB -> **-inf dB**; `Play Mode` Poly -> **Mono** |
+| amp envelope | attack 0.0 ms -> **6.9 ms**, decay 250.0 ms -> **1.92 s**, sustain 100.00 % -> **0.00 %**, release 31.2 ms -> **353.6 ms** (explicit normalized writes: these times have no verified law) |
+| tone | `Filter 1 Cutoff` 523.25 -> **600.00 Hz**, resonance -> **0.00 %**, filter EG attack -> **6.9 ms**, decay -> **201.3 ms**, sustain -> **0 %**, release -> **201.3 ms**, `Waveshaper Type` Off -> **"Soft Harmonic 4"**, drive 0.00 -> **12.00 dB** |
+| ReaEQ | `freq_band_2` 300.0 -> **86.9 Hz** (a sampled position, exact), `gain_band_2` 6.0 -> **2.6 dB** (asked 2.5 - the table law's interpolation is the cause and is the one reported disagreement) |
+| ReaComp | threshold +0.0 -> **-9.9 dB**, ratio 4.00 :1 -> **7.19 :1** (a member label), attack 3.0 -> **20.0 ms**, release 100 -> **120 ms**, knee 0.0 -> **6.0 dB** - `ALL_VERIFIED`, 0 display disagreements |
+| MIDI | one item (3 measures) with E1/E1/A1 notes at velocity 110/110/100, created through the MCP tools |
+| Vital (separate track) | provider path: `filter_1_cutoff` 60 Hz, `filter_1_style` 12dB -> **24dB**, env 1 attack 8 ms / decay 2.0 s / sustain 45 % / release 600 ms, `osc_1_level` 1.0 - one batch, `ALL_VERIFIED`, **21.5 s** (the provider path's own cost) |
+
+### 35.4 The table law's error, measured and refined
+
+A `table` law *is* the artifact's samples interpolated linearly between them. P29 measured that
+interpolation properly on two ReaEQ controls and one Surge control, by writing positions
+**between** the stored samples through `plugin_write` and reading the plugin's own text back
+(49 writes, 179.5 s):
+
+| control | worst stored-model error at a new position |
+|---|---|
+| `gain_band_2` (dB) | **62.9 dB** at 0.03125 (stored model -81.0 vs host -18.1); <=0.5 dB elsewhere |
+| `freq_band_2` (Hz) | **350.75 Hz** at 0.96875 (20244.35 vs 19893.6), a systematic ~1.7 % low bias above 10 kHz |
+| Surge `a_osc_1_pitch` | <=0.005 semitones - that table is essentially linear, so the model is fine there |
+
+Targeted refinement then ran **through the tool**: `plugin_prepare(force=true,
+sample_indices=[4], grid_points=33)` on ReaEQ, 1.6 s per control, 3 MCP calls total. Two
+independent instruments agree **exactly** on all six overlapping positions (write-based probe
+vs engine: -18.1 / -8.5 / -4.1 / -1.2 / 1.0 / 2.8 dB), and the dense run is **not stored** -
+`store_refusal: limited_run_would_replace_a_broader_artifact`, with `force` not overriding it
+(the P27 review's fix holding in a new place). Adding the measured points to the model cuts the
+error at one independent position from 25.6 dB to **0.44 dB** and from 1.42 Hz to 0.87 Hz; a
+position whose *segment* got no new point stays at 2.90 Hz - refinement must cover the segment
+you care about, which the numbers say.
+
+### 35.5 Defects found by measurement and fixed
+
+1. **The band-map write direction was never verified.** Writing the *midpoint* of a sampled
+   band can print a neighbouring member: a request for ReaComp's `"7.19 :1"` left the host
+   printing **`8.73 :1`**. Targets are now the midpoint of the positions that actually printed
+   the label (a single one is itself), and both directions are verified before a law is
+   offered; a control whose target cannot invert cleanly gets **no law** rather than a wrong
+   one. Audit over the real artifacts: **0 wrong write targets** (Surge 896 `measured` + 529
+   `measured_bracketed`; ReaComp 17 + 4).
+2. **A labelled state of a numeric control could not be written at all** ("expected a number,
+   got '-inf dB'"): the labels are recorded evidence, so they travel with the control
+   (`labelled_states` + the measured position) and are exposed on search rows (`enum_labels`);
+   the count `members` stays for compatibility.
+3. **`plugin_instances` refused with no provider even when a selector named the slot** (P28's
+   half-fix left the listing provider-gated) - `scope="project"` answers from the host.
+4. **`plugin_find` rows carried the address only inside `binding`** - a caller had nothing to
+   write with; the address is a top-level `index`/`name` now.
+5. **Two controls can share a name** (ReaComp has two `Attack`s): `by_id` collapsed and a bare
+   `assert` produced `InternalError` with an **empty message** while one was unaddressable.
+6. **`plugin_find`'s `law` reported the engine's tentative fit**, disagreeing with the law the
+   write path uses; the profile is the authority now.
+7. **`partial_application.applied` counted the resolved set** (a review finding): a batch that
+   failed and rolled back would have reported controls as applied. It reports `verified` now.
+8. **`display_checks.n_disagreements` could stay silent about the law** once a request-space
+   comparison overrode `agrees`: `n_law_disagreements` is reported beside it.
+
+### 35.6 Independent review (GLM-5.3 Flash, four checks) - what reproduced
+
+Verdicts: normalized-write semantics **SOUND** (no bypass; the law-less refusal is reachable
+only through the explicit normalized mode, and `skip` cannot pass a partial batch off as
+complete), waveform evidence **SOUND** (`Classic -> Sine` in the plugin's own text on both
+sides; the target is a measured midpoint, not 1/11 and not the old band midpoint), performance
+**SOUND** (the stored artifact is *served* in 2.3 s, one write hop per step, the targeted
+refinement not stored), **audio honesty NEEDS CHANGE** - and it was right: the probe docstring
+said "the P28 result sounded like a saw", a heard-sound claim this repository never measured
+(that report is the user's). It is reworded to the measured fact. The review's two code
+findings (`partial_application.applied`, the hidden law disagreement) are fixed above with
+tests, and its cosmetic observation stands: `prepare.counts.calls: 48598` is the *stored*
+build's recorded counter, not this call's, and `status: "served"` is what says so.
+
+### 35.7 Residuals (named, not fixed)
+
+**No audio was auditioned and no render was analysed.** Isolating one track would need muting
+or re-levelling pre-existing user tracks (`render_project` renders the master mix), which this
+round's constraints forbid - so "configured and read-back-verified" is as far as the evidence
+goes, and the tracks are left in the session for a human to hear. A **pitch drop** is not
+available through Surge's host parameters (no modulation matrix); the attack transient uses the
+filter envelope. Vital exposes **no** wavetable/oscillator-type parameter at all (775 host
+parameters; three mention `wave`, all `*_wave_frame`), so its core waveform cannot be selected
+through this channel - its 808 remains the P20-measured filter recipe, unverified by ear.
+Off-grid table error is large on steep controls (62.9 dB worst on ReaEQ's gain ladder) and
+refinement is manual and per-segment; nothing refines automatically during a musical task.
+Envelope *shapes* (`Convex`/`Linear`/`Concave`, `Digital`/`Analog`) were deliberately left
+alone: their display labels are measured, but their *meaning* is not, and a guessed shape is
+exactly the kind of claim this round refuses. The synonym table's provenance is still this
+repository's own judgement, and a discovery-path call still costs ~1.8-3.0 s.

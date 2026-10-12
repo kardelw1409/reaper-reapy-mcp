@@ -466,20 +466,18 @@ class VitalProvider:
                     }
                 )
                 continue
-            try:
-                import sys
+            # The **shared** value resolution (P29): one vocabulary for both
+            # paths, so `{"normalized": x}` means the same thing whichever
+            # profile answered - and a display request still needs its confirmed
+            # conversion, which is why this path's laws are used here too.
+            from ... import request_value as request_value_module
+            from ... import values as values_module
 
-                values = sys.modules.get("reaper_reapy_mcp.plugins.values")
-                if values is None:  # pragma: no cover - imported lazily on first use
-                    from ... import values as values_module
-
-                    values = values_module
-                native = values.to_native(control, value)
-                normalized = values.to_normalized(control, native)
-            except (InvalidValue, NoConversion) as exc:
-                resolved.problems.append(
-                    {"control": name, "code": exc.code, "message": exc.message, "detail": exc.detail}
-                )
+            outcome = request_value_module.resolve_control_value(
+                control, value, values_module=values_module
+            )
+            if "problem" in outcome:
+                resolved.problems.append(outcome["problem"])
                 continue
             binding = dict(control.get("binding") or {})
             if not binding.get("ident"):
@@ -504,14 +502,9 @@ class VitalProvider:
                     }
                 )
                 continue
-            resolved.controls[control["id"]] = {
-                "control": control,
-                "display": value,
-                "native": native,
-                "normalized": normalized,
-                "channel": str((control.get("authority") or {}).get("write") or "parameter"),
-                "binding": binding,
-            }
+            row = dict(outcome["row"])
+            row["channel"] = str((control.get("authority") or {}).get("write") or "parameter")
+            resolved.controls[control["id"]] = row
 
         vocabulary_sources = set(str(key) for key in (profile.get("modulation") or {}).get("sources") or [])
         vocabulary_destinations = set(

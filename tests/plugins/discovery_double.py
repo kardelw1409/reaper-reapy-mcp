@@ -9,6 +9,14 @@ double implements exactly those three and counts every call, which is what makes
 It is deliberately *not* a mock of `MockHostBridge`: the real bridge is covered by
 its own conformance suite, and a double that reimplemented it would hide a change
 in the channel shapes. This one speaks only the P26 metadata shapes.
+
+P28 added the four verbs the providerless *tool* path uses (`param_names`,
+`read_params`, `param_idents`, `write_params_by_index`): describing, searching,
+reading and writing an instance whose prepared artifact exists. They are
+implemented here - not in `MockHostBridge` - because the discovery path's
+address space is the artifact's index/name pair, and the double has to be able
+to make that pair *move* (``name_shift``) and to make a write *not land*
+(``refuse_writes``) for the two failure tests.
 """
 
 from __future__ import annotations
@@ -92,12 +100,122 @@ class FakeDiscoveryBridge:
 
     def __init__(self, controls: Iterable[FakeControl], *, fail_format: bool = False) -> None:
         self.controls = {control.index: control for control in controls}
-        self.calls: dict[str, int] = {"param_metadata": 0, "format_params_normalized": 0, "param_sections": 0}
+        self.calls: dict[str, int] = {
+            "param_metadata": 0,
+            "format_params_normalized": 0,
+            "param_sections": 0,
+            "param_names": 0,
+            "param_idents": 0,
+            "read_params": 0,
+            "write_params_by_index": 0,
+        }
         self.values: dict[int, float] = {index: 0.0 for index in self.controls}
         self.fail_format = bool(fail_format)
         self.metadata_calls: list[int] = []
         self.format_batches: list[int] = []
         self.track_name = "Track 1"
+        #: Simulate a write the plugin ignores (the read-back cannot agree).
+        self.refuse_writes = False
+        #: Simulate a parameter table that moved: ``{index: new_name}``.
+        self.name_shift: dict[int, str] = {}
+        #: Every index-addressed batch, as ``(index, expected_name, value)`` rows.
+        self.index_write_rows: list[tuple[int, str, float]] = []
+
+    # -- the P28 tool path's address space -----------------------------
+
+    def param_names(self, ref: Any, indices: Sequence[int]) -> list[str | None]:
+        self.calls["param_names"] += 1
+        return [self._name(int(index)) for index in indices]
+
+    def param_idents(self, ref: Any, indices: Sequence[int]) -> list[str | None]:
+        self.calls["param_idents"] += 1
+        return [
+            (self.controls[int(index)].ident if int(index) in self.controls else None)
+            for index in indices
+        ]
+
+    def read_params(self, ref: Any, indices: Sequence[int]) -> list[float]:
+        self.calls["read_params"] += 1
+        return [float(self.values.get(int(index), 0.0)) for index in indices]
+
+    def write_params_by_index(
+        self, ref: Any, pairs: Sequence[tuple[int, str, float]]
+    ) -> Any:
+        """The index-addressed, live-name-guarded write (P28 host verb).
+
+        Mirrors the real bridge's contract: the name at the index is compared to
+        the expected one **before** that parameter's setter runs, the setter's
+        return value is recorded and never trusted, and the read-back (plus the
+        formatter's text) is recorded for the caller's verification.
+        """
+        from reaper_reapy_mcp.plugins.errors import TargetChanged
+        from reaper_reapy_mcp.plugins.model import WriteAttempt, utc_now_iso
+
+        self.calls["write_params_by_index"] += 1
+        rows: list[dict[str, Any]] = []
+        # Phase 1: every index is name-checked before any setter runs, exactly as
+        # the real verb does, so a moved index refuses with `writes_issued: 0`.
+        checked: list[tuple[int, str, float]] = []
+        for index, expect_name, value in pairs:
+            index = int(index)
+            observed = self._name(index)
+            if observed != str(expect_name):
+                raise TargetChanged(
+                    "the parameter at the addressed index is not the control this write was "
+                    "planned against; the index moved",
+                    detail={
+                        "scene": "index_name_guard",
+                        "index": index,
+                        "expected_name": str(expect_name),
+                        "observed_name": observed,
+                        "writes_issued": 0,
+                    },
+                )
+            checked.append((index, str(expect_name), float(value)))
+        for index, expect_name, value in checked:
+            # The real verb re-reads the name immediately before each setter (a
+            # table can move mid-batch); the double does the same.
+            observed_now = self._name(index)
+            if observed_now != expect_name:
+                raise TargetChanged(
+                    "the parameter table moved while the batch was running",
+                    detail={
+                        "scene": "index_name_guard_mid_batch",
+                        "index": index,
+                        "expected_name": expect_name,
+                        "observed_name": observed_now,
+                        "writes_issued": len(self.index_write_rows),
+                    },
+                )
+            if not self.refuse_writes:
+                self.values[index] = float(value)
+            rows.append(
+                {
+                    "index": index,
+                    "expected_name": expect_name,
+                    "observed_name": expect_name,
+                    "sent": value,
+                    "setter_returned": not self.refuse_writes,
+                    "read_back": float(self.values[index]),
+                    "read_back_display": self._display(index, float(self.values[index])),
+                }
+            )
+            self.index_write_rows.append((index, expect_name, value))
+        return WriteAttempt(
+            unit_index=-1,
+            attempted_utc=utc_now_iso(),
+            returned={"channel": "parameters", "address": "index", "rows": rows},
+            effects_verified=None,
+        )
+
+    def _name(self, index: int) -> str | None:
+        if index is None or int(index) not in self.controls:
+            return None
+        return self.name_shift.get(int(index), self.controls[int(index)].name)
+
+    def _display(self, index: int, value: float) -> str | None:
+        control = self.controls.get(int(index))
+        return None if control is None else control.display(int(index), float(value))
 
     # -- host-level reads the tool layer needs to address a slot -----------
 

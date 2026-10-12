@@ -19,10 +19,11 @@ The engine is provider-agnostic and host-agnostic: it talks to a
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import dependencies as D
 from . import plan as P
+from . import request_value
 from . import values as V
 from . import binding as B
 from .errors import (
@@ -119,6 +120,23 @@ class Transaction:
         self.scope = provider.capture_scope()
         self.timing = timing or self.policy.timing or TimingProfile()
         self.write_order: tuple[str, ...] = tuple(provider.write_order())
+        # P28: the declaration decides which channels this transaction owns. A
+        # provider whose write order carries no state stage has no document
+        # channel (a plugin reached through the providerless discovery path has
+        # no codec), so the state reads/decode/rollback must not run at all - an
+        # out-of-scope channel is REPORTED as such, never silently captured as
+        # empty. And a provider may declare that its parameters are addressed by
+        # their measured **index** (with a live name check inside the write hop)
+        # instead of by an ident table read; that is a declared capability, and
+        # the default keeps the ident path byte-identical.
+        self.state_stage = "state" in self.write_order
+        self.parameter_stage = "parameters" in self.write_order
+        self.index_addressed = bool(getattr(provider, "index_addressed_parameters", False)) and (
+            not self.state_stage
+        )
+        self.scope_channels: tuple[str, ...] = tuple(
+            name for name, present in (("state", self.state_stage), ("parameters", self.parameter_stage)) if present
+        )
 
         self.host = HostAccounting()
         self.stage: Stage = Stage.PREFLIGHT
@@ -134,7 +152,22 @@ class Transaction:
         self._mismatched: dict[str, list[dict[str, Any]]] = {"state": [], "parameters": []}
         self._named_gaps: list[dict[str, Any]] = []
         self._resolved: ResolvedRequest | None = None
+        #: The batch's unresolved-control policy: `refuse` (default, historical) or
+        #: `skip` (explicit opt-in). Validated in `__init__`, before any host work.
+        self.on_unresolved: str = request_value.normalize_request_mode(request)
+        #: The controls a `skip` batch left out, each with its own typed problem.
+        self.refused: list[dict[str, Any]] = []
         self._rollback = RollbackReport()
+        #: The display-space cross-check of the index-addressed write path (see
+        #: `_display_check`): a second channel beside the normalized comparison.
+        self._display_rows: list[dict[str, Any]] = []
+        #: How the parameter addresses of this request are verified. The ident
+        #: path measures the whole ident table before planning; the index path
+        #: verifies the live name at each index **inside the write hop**, so no
+        #: separate binding pass exists to report.
+        self.binding_method = (
+            "index_name_guarded_in_write_hop" if self.index_addressed else "ident_table_verified"
+        )
 
     # ------------------------------------------------------------------
     # Entry point
@@ -155,13 +188,29 @@ class Transaction:
             resolved = self.provider.normalize_request(self.profile, self.request)
             self._resolved = resolved
             if resolved.problems:
-                raise _problem_error(resolved.problems)
+                if self.on_unresolved == "skip" and _workload(resolved):
+                    # Explicit opt-in: the resolved part is applied and every refused
+                    # entry is reported with its own typed problem. The response says
+                    # `partial: true` so a batch is never read as wholly applied.
+                    self.refused = list(resolved.problems)
+                else:
+                    # Default (and the only choice when nothing resolved at all): the
+                    # batch writes nothing and the refusal names every offender.
+                    raise _problem_error(resolved.problems)
 
             self.stage = Stage.PLAN
             self._revalidate_target()
             live = self._read_live_state(resolved)
             plan = P.build_plan(
-                profile=self.profile, ref=self.ref, resolved=resolved, live=live, label=self.label
+                profile=self.profile,
+                ref=self.ref,
+                resolved=resolved,
+                live=live,
+                label=self.label,
+                parameter_key=self._parameter_key if self.index_addressed else None,
+                # The plan states the order the engine will enforce, which is the
+                # provider's own declaration (plus the verify stage).
+                write_order=tuple(self.write_order) + (("verify",) if "verify" not in self.write_order else ()),
             )
             plan.findings = D.evaluate(self.provider.dependencies(), P.project_world(live, resolved))
             D.raise_on(plan.findings)
@@ -170,7 +219,6 @@ class Transaction:
             snapshot = self._assemble_snapshot(live)
             self._snapshot = snapshot
             self._tracker.seed(snapshot.base_revision)
-
             if self.dry_run:
                 # The preview is built through the SAME path a real run uses, so
                 # a request the write path must refuse (a derived leaf, an
@@ -193,6 +241,8 @@ class Transaction:
                         "dependency_findings": [_finding_row(f) for f in plan.findings],
                         "preview": self._preview(live, resolved),
                         "preflight": self._preflight_evidence(),
+                        "refused": list(self.refused),
+                        "partial": bool(self.refused),
                         "read_cost_next": {"needed": 0, "why": "the preview is already computed from live reads"},
                     },
                 )
@@ -214,6 +264,8 @@ class Transaction:
                     "plan_summary": self._plan_summary(plan, resolved),
                     "dependency_findings": [_finding_row(f) for f in plan.findings],
                     "preflight": self._preflight_evidence(),
+                    "refused": list(self.refused),
+                    "partial": bool(self.refused),
                     "read_cost_next": {
                         "needed": 0,
                         "why": "this response already contains the read-back of everything it changed",
@@ -245,6 +297,14 @@ class Transaction:
             self.binding_report = B.BindingReport(controls_indexed=len(B.indexed_controls(self.profile)))
             return
         indexed = B.indexed_controls(self.profile)
+        if self.index_addressed:
+            # The index path does not read the ident table: the artifact measured
+            # the index, and the write hop re-reads the live *name* at that index
+            # before calling the setter, so a stale index refuses there instead of
+            # being written. Report what was (not) measured rather than an empty
+            # binding pass that would read as "nothing verified".
+            self.binding_report = B.BindingReport(controls_indexed=len(indexed))
+            return
         indices = [index for _control_id, index in indexed]
         names = self._read(self.bridge.param_names, self.ref, indices)
         idents = self._read(self.bridge.param_idents, self.ref, indices)
@@ -295,14 +355,32 @@ class Transaction:
             )
 
     def _require_bound_parameters(
-        self, resolved: ResolvedRequest, pairs: list[tuple[str, float]]
+        self, resolved: ResolvedRequest, pairs: list[tuple[Any, ...]]
     ) -> None:
-        """A resolved parameter control must have a verified ident (defence in depth).
+        """A resolved parameter control must have a verified address (defence in depth).
 
-        `parameter_pairs` skips a control with no ident, which would make the
+        `parameter_pairs` skips a control with no address, which would make the
         plan claim a change the batched write silently omits. That must never
         be reachable, so it is refused here loudly for **any** provider.
         """
+        if self.index_addressed:
+            addressed = {int(pair[0]) for pair in pairs}
+            for control_id, row in resolved.controls.items():
+                if row.get("channel") != "parameter":
+                    continue
+                binding = row.get("binding") or {}
+                index = binding.get("index")
+                if isinstance(index, bool) or not isinstance(index, int) or index not in addressed:
+                    raise UnsupportedControl(
+                        "a parameter control has no usable index address; the write is refused "
+                        "instead of being silently omitted from the batch",
+                        detail={
+                            "control": control_id,
+                            "reason": "index_missing",
+                            "binding": dict(binding),
+                        },
+                    )
+            return
         bound = {ident for ident, _value in pairs}
         for control_id, row in resolved.controls.items():
             if row.get("channel") != "parameter":
@@ -328,15 +406,107 @@ class Transaction:
     def _preflight_evidence(self) -> dict[str, Any]:
         """The measured preflight facts a caller can audit (P8)."""
         return {
-            "binding": self.binding_report.as_dict(),
+            "binding": {**self.binding_report.as_dict(), "method": self.binding_method},
             "version_gate": dict(self.version_gate or {"checked": False}),
+            "channels_in_scope": list(self.scope_channels),
         }
+
+    # ------------------------------------------------------------------
+    # Parameter addressing (ident table, or measured index + live name)
+    # ------------------------------------------------------------------
+
+    def _parameter_key(self, binding: Mapping[str, Any]) -> str | None:
+        """The key a parameter is tracked under in vectors and verification rows."""
+        if self.index_addressed:
+            index = binding.get("index")
+            if isinstance(index, bool) or not isinstance(index, int):
+                return None
+            return f"#{int(index)}"
+        ident = binding.get("ident")
+        return None if ident is None else str(ident)
+
+    def _parameter_pairs(self, resolved: ResolvedRequest) -> list[tuple[Any, ...]]:
+        """The one batched parameter write, in plan order, in this path's address space.
+
+        Ident path: ``(ident, normalized)`` - unchanged. Index path:
+        ``(index, expected_live_name, normalized)``, where the name is the one the
+        artifact measured at that index; the hop re-reads it and refuses a
+        mismatch before the setter runs.
+        """
+        pairs: list[tuple[Any, ...]] = []
+        for row in resolved.controls.values():
+            if row.get("channel") != "parameter":
+                continue
+            binding = dict(row.get("binding") or {})
+            if self.index_addressed:
+                index = binding.get("index")
+                if isinstance(index, bool) or not isinstance(index, int):
+                    continue
+                pairs.append((int(index), str(binding.get("live_name") or ""), float(row["normalized"])))
+            else:
+                ident = binding.get("ident")
+                if ident is None:
+                    continue
+                pairs.append((str(ident), float(row["normalized"])))
+        return pairs
+
+    def _planned_indices(self) -> list[int]:
+        """The indices the resolved request names, in plan order (index path)."""
+        resolved = self._resolved
+        if resolved is None:
+            raise SnapshotUnavailable(
+                "the planned parameter set is unknown before the request is resolved",
+                detail={"reason": "plan_not_resolved"},
+            )
+        indices: list[int] = []
+        for row in resolved.controls.values():
+            if row.get("channel") != "parameter":
+                continue
+            index = (row.get("binding") or {}).get("index")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise SnapshotUnavailable(
+                    "a planned control declares no integer index, so the planned vector cannot "
+                    "be captured",
+                    detail={"control": (row.get("control") or {}).get("id"), "index": index},
+                )
+            indices.append(int(index))
+        return indices
+
+    def _read_planned_vector(self) -> dict[str, float]:
+        """The current values of exactly the planned indices, keyed ``#<index>``.
+
+        This is the capture scope of the index path: the parameters the request
+        touches, read in ONE hop, instead of the whole parameter table twice.
+        """
+        indices = self._planned_indices()
+        if not indices:
+            return {}
+        values = self._read(self.bridge.read_params, self.ref, indices)
+        if len(values) != len(indices):
+            raise SnapshotUnavailable(
+                "the parameter read returned fewer values than requested; a short read is not evidence",
+                detail={"expected": len(indices), "read": len(values)},
+            )
+        return {f"#{index}": float(value) for index, value in zip(indices, values)}
 
     # ------------------------------------------------------------------
     # Stages
     # ------------------------------------------------------------------
 
     def _read_live_state(self, resolved: ResolvedRequest) -> P.LiveState:
+        if not self.state_stage:
+            # No document channel is in scope (the provider declares none): the
+            # state chunk is not read, not decoded and not claimed. `read_cost`
+            # records the reason so a cheaper plan cannot read as a fuller one.
+            readback = self._read_planned_parameters(resolved)
+            return P.LiveState(
+                document=None,
+                routes=[],
+                slice=None,
+                revision=None,
+                parameters=readback,
+                parameter_readback=readback,
+            )
         slice_, document = self._read_state()
         self._last_slice = slice_
         self._check_document_version(document)  # P8: the live version gates the write
@@ -353,7 +523,9 @@ class Transaction:
 
     def _assemble_snapshot(self, live: P.LiveState) -> StateSnapshot:
         """Complete capture of every declared channel, or refuse (11 §2.3)."""
-        document_snapshot = self.codec.snapshot_document(live.document)
+        document_snapshot = None
+        if "document" in self.scope.channels or "routes" in self.scope.channels:
+            document_snapshot = self.codec.snapshot_document(live.document)
         captured: list[str] = []
         if "document" in self.scope.channels:
             captured.append("document")
@@ -385,33 +557,63 @@ class Transaction:
                 detail={"not_captured": not_captured, "scope": list(self.scope.channels)},
             )
         revision = StateRevision.compute(
-            state_channel=live.slice.block_text,
+            state_channel=(live.slice.block_text if live.slice is not None else None),
             parameters=parameters,
             scope=list(self.scope.channels),
         )
         # the channels the transaction tracks for its own writes
-        self._last_verified["state"] = text_digest(live.slice.block_text)
+        if live.slice is not None:
+            self._last_verified["state"] = text_digest(live.slice.block_text)
         self._last_verified["parameters"] = _vector_digest(parameters)
+        for channel in _OUTCOME_CHANNELS:
+            if channel not in self.scope_channels:
+                self._named_gaps.append(
+                    {
+                        "channel": channel,
+                        "reason": "channel_not_in_scope",
+                        "detail": (
+                            "the provider declares no stage for this channel, so nothing of it was "
+                            "captured, written or restored - the outcome does not cover it"
+                        ),
+                    }
+                )
         return StateSnapshot(
             document=document_snapshot,
             routes=routes_part,
             parameters=parameters,
             base_revision=revision,
-            manifest={"captured": captured, "not_captured": []},
+            manifest={"captured": captured, "not_captured": [], "out_of_scope": [
+                channel for channel in _OUTCOME_CHANNELS if channel not in self.scope_channels
+            ]},
         )
 
     def _build_units(
         self, document: Any, resolved: ResolvedRequest
-    ) -> tuple[list[StateWriteUnit], list[tuple[str, float]]]:
-        changes = P.state_changes(resolved)
-        state_units = list(self.codec.plan_state_writes(document, changes).units)
-        pairs = P.parameter_pairs(resolved)
+    ) -> tuple[list[StateWriteUnit], list[tuple[Any, ...]]]:
+        if not self.state_stage:
+            # A state/routes request against a provider with no codec must refuse
+            # loudly: `normalize_request` is expected to have refused it already,
+            # and this is the defence in depth for a provider that did not.
+            if resolved.state or resolved.routes_create or resolved.routes_update or resolved.routes_remove:
+                raise WriteOrderViolation(
+                    "this provider declares no state stage, so a state/routes request cannot be "
+                    "planned against it",
+                    detail={"write_order": list(self.write_order), "reason": "no_state_stage"},
+                )
+            state_units: list[StateWriteUnit] = []
+        else:
+            changes = P.state_changes(resolved)
+            state_units = list(self.codec.plan_state_writes(document, changes).units)
+        pairs = self._parameter_pairs(resolved)
         self._require_bound_parameters(resolved, pairs)
         declared = tuple(stage for stage in self.write_order if stage != "verify")
-        if declared not in (("state",), ("state", "parameters")):
+        if declared not in (("state",), ("state", "parameters"), ("parameters",)):
             raise WriteOrderViolation(
-                "the provider's declared write order is not the engine's enforced order",
-                detail={"declared": list(self.write_order), "enforced": ["state", "parameters", "verify"]},
+                "the provider's declared write order is not one the engine enforces",
+                detail={
+                    "declared": list(self.write_order),
+                    "enforced": ["state", "parameters", "verify"],
+                },
             )
         if any(unit.kind == "parameters" for unit in state_units):
             raise WriteOrderViolation("state units may not carry the parameter channel")
@@ -426,7 +628,6 @@ class Transaction:
         for unit in units:
             new_block = self.codec.encode_slice(simulated, unit, current)
             simulated = self.codec.decode(new_block)
-
     # ------------------------------------------------------------------
     # Apply
     # ------------------------------------------------------------------
@@ -466,18 +667,32 @@ class Transaction:
             StateRevision.compute(state_channel=readback_slice.block_text, parameters=fresh)
         )
 
-    def _apply_parameter_batch(self, pairs: list[tuple[str, float]]) -> None:
+    def _apply_parameter_batch(self, pairs: list[tuple[Any, ...]]) -> None:
         self.stage = Stage.PARAMETER_WRITE
         self._check_cancel()
         self._revalidate()
-        sent = {ident: value for ident, value in pairs}
+        if self.index_addressed:
+            sent = {f"#{int(pair[0])}": float(pair[2]) for pair in pairs}
+        else:
+            sent = {str(ident): float(value) for ident, value in pairs}
         self._attempted["parameters"].add(_vector_digest({**self._last_vector, **sent}))
 
-        self._issue_write(lambda: self.bridge.write_params(self.ref, pairs))
+        if self.index_addressed:
+            # ONE hop: the live name at each index is re-read and compared before
+            # that parameter's setter runs (the artifact measured the index; the
+            # hop proves the index still addresses the same control).
+            attempt = self._issue_write(lambda: self.bridge.write_params_by_index(self.ref, pairs))
+            self._display_rows = self._display_check(attempt, pairs, sent)
+        else:
+            self._issue_write(lambda: self.bridge.write_params(self.ref, pairs))
         self._check_cancel(write_issued=True)
 
         self.stage = Stage.VERIFY
-        readback = self._read_full_parameter_vector(ident_filter=[ident for ident, _ in pairs])
+        readback = (
+            self._read_planned_vector()
+            if self.index_addressed
+            else self._read_full_parameter_vector(ident_filter=[ident for ident, _v in pairs])
+        )
         rows, mismatched = self._verify_parameters(sent, readback)
         self._rows["parameters"].extend(rows)
         self._mismatched["parameters"].extend(mismatched)
@@ -487,18 +702,139 @@ class Transaction:
                 "the parameter read-back does not agree in the space that was written",
                 detail={"mismatched": mismatched, "space": "normalized"},
             )
-        full = self._read_full_parameter_vector()
+        full = self._read_planned_vector() if self.index_addressed else self._read_full_parameter_vector()
         self._last_vector = full
         self._last_verified["parameters"] = _vector_digest(full)
         if self._last_slice is not None:
             self._tracker.advance_from_verified_readback(
                 StateRevision.compute(state_channel=self._last_slice.block_text, parameters=full)
             )
+        elif self.index_addressed:
+            self._tracker.advance_from_verified_readback(
+                StateRevision.compute(
+                    state_channel=None, parameters=full, scope=list(self.scope.channels)
+                )
+            )
 
     # ------------------------------------------------------------------
     # Validation / revalidation
     # ------------------------------------------------------------------
 
+    def _display_check(
+        self,
+        attempt: Any,
+        pairs: Sequence[tuple[Any, ...]],
+        sent: Mapping[str, float],
+    ) -> list[dict[str, Any]]:
+        """Compare the plugin's own displayed text with the law's prediction.
+
+        The authoritative comparison stays in normalized space (that is the space
+        that was written). This is a **second, independent channel**: the host
+        formatter prints what the plugin displays for the value it now holds, so
+        a normalised agreement whose *display* disagrees means the law and the
+        plugin disagree about the value between the sampled grid points - a
+        finding the normalized comparison cannot see (the P19 lesson: a read-back
+        through the same law can never detect a law that is wrong by half a
+        printed step). It is reported, never silently absorbed, and it does not
+        fail the write: `parameter.normalized` is the contract.
+        """
+        returned = getattr(attempt, "returned", None) or {}
+        rows_by_index = {
+            int(row.get("index")): row for row in (returned.get("rows") or []) if isinstance(row, Mapping)
+        }
+        requested = self._requested_display()
+        checks: list[dict[str, Any]] = []
+        for index, _expect_name, _value in pairs:
+            key = f"#{int(index)}"
+            row = rows_by_index.get(int(index)) or {}
+            control = self._control_for_index(int(index)) or {}
+            law_kind = str((control.get("law") or {}).get("kind") or "none")
+            predicted: Any = None
+            if law_kind not in ("none", "unmeasured"):
+                try:
+                    native = V.normalized_to_native(control, sent[key])
+                    predicted = V.from_native(control, native)
+                except PluginError:
+                    predicted = None
+            observed = row.get("read_back_display")
+            agrees = None
+            if observed is not None and predicted is not None:
+                agrees = _display_texts_agree(predicted, observed, unit=control.get("unit"))
+            # What the CALLER asked for, when the request stated a display value: it
+            # is the claim a human made, and the plugin's own text is what decides
+            # whether it was honoured. Measured live (P29): a labelled state of a
+            # numeric control resolves to a *position* whose law predicts a
+            # different number (Surge's "-inf dB" sits where the table law says
+            # -72), so the law prediction alone would report a disagreement on a
+            # write that landed exactly as requested.
+            wanted = requested.get(str(control.get("id")))
+            agrees_with_request = None
+            if observed is not None and wanted is not None:
+                agrees_with_request = _display_texts_agree(wanted, observed, unit=control.get("unit"))
+            if agrees_with_request is not None:
+                agrees = agrees_with_request
+            checks.append(
+                {
+                    "control": control.get("id"),
+                    "index": int(index),
+                    "channel": "display",
+                    "written_normalized": sent[key],
+                    "requested_display": wanted,
+                    "law_predicted_display": predicted,
+                    "host_display_read_back": observed,
+                    "agrees": agrees,
+                    "agrees_with_request": agrees_with_request,
+                    "agrees_with_law": None
+                    if predicted is None or observed is None
+                    else _display_texts_agree(predicted, observed, unit=control.get("unit")),
+                    "display_claim": (
+                        "request_and_host_text_compared"
+                        if agrees_with_request is not None
+                        else (
+                            "law_and_host_text_compared"
+                            if predicted is not None and observed is not None
+                            else ("host_text_only" if observed is not None else "unavailable")
+                        )
+                    ),
+                    "note": (
+                        "`agrees` compares the plugin's own text with what the CALLER asked for when "
+                        "the request stated a display value; `agrees_with_law` is the law's opinion, "
+                        "which can differ inside the printed resolution of a sampled display"
+                        if agrees_with_request is not None
+                        else (
+                            "the law and the host formatter can differ inside the printed "
+                            "resolution of a sampled display; the normalized comparison is what "
+                            "the write is verified against"
+                            if predicted is not None
+                            else (
+                                f"this control declares law {law_kind!r}, so no display value could "
+                                "be predicted; the text above is the plugin's OWN reading of the "
+                                "value it now holds, reported without a comparison"
+                            )
+                        )
+                    ),
+                }
+            )
+        return checks
+
+    def _requested_display(self) -> dict[str, Any]:
+        """The display value each resolved control was asked for, by control id.
+
+        Only controls whose request was stated in **display** space carry one: an
+        explicit `{"normalized": p}` request names no display value, so there is
+        nothing to compare the plugin's text against (its text is still reported).
+        """
+        wanted: dict[str, Any] = {}
+        for row in (self._resolved.controls.values() if self._resolved else []):
+            if row.get("channel") != "parameter" or row.get("value_space") != "display":
+                continue
+            display = row.get("display")
+            if display is None:
+                continue
+            control_id = (row.get("control") or {}).get("id")
+            if control_id is not None:
+                wanted[str(control_id)] = display
+        return wanted
     def _fresh_facts(self):
         return self._read(self.bridge.fx_facts, self.ref.location["track_index"], self.ref.location["fx_index"])
 
@@ -509,6 +845,14 @@ class Transaction:
     def _revalidate(self) -> None:
         """Token + expected revision before every write unit / parameter batch."""
         self._revalidate_target()
+        if not self.state_stage:
+            vector = self._read_planned_vector()
+            self._last_vector = vector
+            observed = StateRevision.compute(
+                state_channel=None, parameters=vector, scope=list(self.scope.channels)
+            )
+            self._tracker.check(observed)  # StateConflict before that unit's write
+            return
         slice_, _ = self._read_state()
         vector = self._read_full_parameter_vector()
         self._last_slice = slice_
@@ -546,10 +890,24 @@ class Transaction:
         cancellation, a wedge - leaves the write accounted as unknown instead of
         silently uncounted. That keeps `attempted == verified + unknown` true in
         every terminal state (B-46).
+
+        **One exception, and only one**: a verb that certifies it issued no
+        setter call (`detail['writes_issued'] == 0` - the index-addressed verb
+        checks every name before its first setter) has a KNOWN effect: nothing
+        changed. Counting it as an attempt whose effect is unknown would make the
+        layer refuse to say what it knows, and would trigger a restore of
+        parameters that were never touched, so the counters are rolled back and
+        the refusal is reported as "before any write".
         """
         self.host.write_calls_attempted += 1
         self.host.write_effects_unknown += 1
-        return call()
+        try:
+            return call()
+        except PluginError as exc:
+            if exc.detail.get("writes_issued") == 0:
+                self.host.write_calls_attempted -= 1
+                self.host.write_effects_unknown -= 1
+            raise
 
     def _establish_effect(self) -> None:
         """Called only once a read-back established the effect beyond doubt."""
@@ -570,6 +928,12 @@ class Transaction:
         return facts.param_count
 
     def _read_full_parameter_vector(self, *, ident_filter: Sequence[str] | None = None) -> dict[str, float]:
+        if self.index_addressed:
+            # The index path's capture scope is the planned set (see `capture_scope`),
+            # so "the vector" means that set - read in one hop. A filter argument is
+            # meaningless here (there are no idents to filter by) and is ignored with
+            # the planned scope documented in the outcome instead.
+            return self._read_planned_vector()
         if ident_filter is not None:
             indices = self._indices_for(ident_filter)
         else:
@@ -608,6 +972,12 @@ class Transaction:
         return [index_by_ident[ident] for ident in idents]
 
     def _read_planned_parameters(self, resolved: ResolvedRequest) -> dict[str, float]:
+        if self.index_addressed:
+            indices = self._planned_indices()
+            if not indices:
+                return {}
+            values = self._read(self.bridge.read_params, self.ref, indices)
+            return {f"#{index}": float(value) for index, value in zip(indices, values)}
         idents = [
             str((row.get("binding") or {}).get("ident"))
             for row in resolved.controls.values()
@@ -627,29 +997,36 @@ class Transaction:
         self, sent: dict[str, float], readback: dict[str, float]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         tolerance = float(self.policy.tolerances.get("parameter.normalized", 1e-03))
-        by_ident = {
-            str((row.get("binding") or {}).get("ident")): row["control"]
-            for row in (self._resolved.controls.values() if self._resolved else [])
-            if row.get("channel") == "parameter"
-        }
+        by_key: dict[str, dict[str, Any]] = {}
+        for row in self._resolved.controls.values() if self._resolved else []:
+            if row.get("channel") != "parameter":
+                continue
+            key = self._parameter_key(dict(row.get("binding") or {}))
+            if key is not None:
+                by_key[key] = row["control"]
         rows: list[dict[str, Any]] = []
         mismatched: list[dict[str, Any]] = []
-        for ident, value in sent.items():
-            control = by_ident.get(ident)
-            actual = readback.get(ident)
+        for key, value in sent.items():
+            control = by_key.get(key)
+            actual = readback.get(key)
             row: dict[str, Any] = {
-                "ident": ident,
+                # `ident` is the historical field name of "the address this value
+                # was written to"; the index path writes `#<index>` there and adds
+                # the index as its own field, so neither reading is ambiguous.
+                "ident": key,
                 "control": (control or {}).get("id"),
                 "written": value,
                 "read_back": actual,
                 "channel": "parameter",
             }
+            if self.index_addressed:
+                row["address"] = {"index": int(key.lstrip("#")), "space": "index"}
             if actual is None:
                 row.update({"agrees": False, "space": "normalized", "reason": "unreadable"})
             else:
                 # compare in the space that was written; display is re-resolved
                 # through the same conversion the write used
-                if control is not None:
+                if control is not None and V.has_display_law(control):
                     expected_native = V.normalized_to_native(control, value)
                     actual_native = V.normalized_to_native(control, actual)
                     row["display_expected"] = V.from_native(control, expected_native)
@@ -660,9 +1037,27 @@ class Transaction:
                     else:
                         row["agrees"] = abs(float(value) - float(actual)) <= tolerance
                         row["space"] = "normalized"
+                    row["display_claim"] = {"available": True, "reason": None}
                 else:
+                    # No verified law: the value is only meaningful in the host's own
+                    # space. Saying nothing about a display is the honest report - a
+                    # number here would be the normalized value wearing a display's
+                    # field name (the P29 normalized-write case).
                     row["agrees"] = abs(float(value) - float(actual)) <= tolerance
                     row["space"] = "normalized"
+                    row["display_claim"] = {
+                        "available": False,
+                        "reason": (
+                            "no_control"
+                            if control is None
+                            else f"no_verified_law ({str((control.get('law') or {}).get('kind') or 'none')})"
+                        ),
+                        "note": (
+                            "the normalized comparison is the contract; the plugin's own text for "
+                            "the value it now holds is available from plugin_read as "
+                            "`host_display`"
+                        ),
+                    }
             rows.append(row)
             if not row["agrees"]:
                 mismatched.append(row)
@@ -697,7 +1092,7 @@ class Transaction:
         # then attributed to itself, while a channel that was already foreign is
         # never laundered into "mine" by a sibling restore.
         allowed: dict[str, bool] = {}
-        for channel in _OUTCOME_CHANNELS:
+        for channel in self.scope_channels:
             try:
                 allowed[channel] = self._channel_restorable(channel)
             except PluginError as probe_exc:
@@ -708,7 +1103,7 @@ class Transaction:
             if not allowed[channel]:
                 self._named_gaps.append(_gap(channel, "not_restored (external_change)"))
         try:
-            state_ok = self._restore_state_channel(allowed=allowed["state"])
+            state_ok = self._restore_state_channel(allowed=bool(allowed.get("state")))
         except _TRANSPORT_LOSSES as restore_exc:
             failed_loudly = True
             self._named_gaps.append(_gap("state", f"{restore_exc.code}: {restore_exc.message}"))
@@ -716,7 +1111,7 @@ class Transaction:
             failed_loudly = True
             self._named_gaps.append(_gap("state", f"{restore_exc.code}: {restore_exc.message}"))
         try:
-            parameters_ok = self._restore_parameter_channel(allowed=allowed["parameters"])
+            parameters_ok = self._restore_parameter_channel(allowed=bool(allowed.get("parameters")))
         except _TRANSPORT_LOSSES as restore_exc:
             failed_loudly = True
             self._named_gaps.append(_gap("parameters", f"{restore_exc.code}: {restore_exc.message}"))
@@ -724,8 +1119,13 @@ class Transaction:
             failed_loudly = True
             self._named_gaps.append(_gap("parameters", f"{restore_exc.code}: {restore_exc.message}"))
 
-        self._rollback.channels = {"state": state_ok, "parameters": parameters_ok}
-        self._rollback.verified = state_ok and parameters_ok
+        restored = {"state": state_ok, "parameters": parameters_ok}
+        # Only the channels this provider declared are judged: a channel that was
+        # never in scope contributes neither to `verified` nor to the verdict -
+        # and it is named in the outcome instead (see `_assemble_snapshot`).
+        every_ok = all(restored[name] for name in self.scope_channels)
+        self._rollback.channels = {name: restored[name] for name in self.scope_channels}
+        self._rollback.verified = every_ok
         # `verified` says the restore's own writes landed; `complete` says it
         # covered everything that was captured. A codec-declared derived leaf is
         # excluded on purpose, so the two must not be conflated (Decision 2/5).
@@ -734,12 +1134,12 @@ class Transaction:
             verdict = Verdict.ROLLBACK_FAILED
         elif self._rollback.complete:
             verdict = Verdict.FAILED_AND_RESTORED
-        elif state_ok and parameters_ok:
+        elif every_ok:
             # every channel this restore wrote is verified, but the captured set
             # was not fully restorable: reporting `FAILED_AND_RESTORED` here would
             # claim `unchanged_verified` for state that is not unchanged
             verdict = Verdict.FAILED_AND_PARTIALLY_RESTORED
-        elif state_ok or parameters_ok:
+        elif any(restored[name] for name in self.scope_channels):
             verdict = Verdict.FAILED_AND_PARTIALLY_RESTORED
         else:
             verdict = Verdict.FAILED_AND_NOT_RESTORED
@@ -773,12 +1173,16 @@ class Transaction:
             slice_, _ = self._read_state()
             observed = text_digest(slice_.block_text)
         else:
-            observed = _vector_digest(self._read_full_parameter_vector())
+            observed = _vector_digest(self._read_planned_vector() if self.index_addressed else self._read_full_parameter_vector())
         if observed == self._last_verified.get(channel):
             return True
         return observed in self._attempted.get(channel, set())
 
     def _restore_state_channel(self, *, allowed: bool) -> bool:
+        if not self.state_stage:
+            # The channel was never captured (no codec on this provider): there is
+            # nothing to restore and nothing to claim about it.
+            return False
         if not allowed:
             return False
         self._revalidate_target()  # a stale token at rollback time is ROLLBACK_FAILED
@@ -843,28 +1247,36 @@ class Transaction:
         if not captured:
             # no captured values: prove the live vector is empty too, instead of
             # reporting a channel "restored" that was never compared
-            live = self._read_full_parameter_vector()
+            live = self._read_planned_vector() if self.index_addressed else self._read_full_parameter_vector()
             return not live
         if not allowed:
             return False
         self._revalidate_target()
-        pairs = [(ident, value) for ident, value in captured.items()]
-        for start in range(0, len(pairs), 256):
-            batch = pairs[start : start + 256]
+        tolerance = float(self.policy.tolerances.get("parameter.normalized", 1e-03))
+        for start in range(0, len(captured), 256):
+            batch = list(captured.items())[start : start + 256]
+            if self.index_addressed:
+                pairs: list[tuple[Any, ...]] = []
+                for key, value in batch:
+                    index = int(str(key).lstrip("#"))
+                    pairs.append((index, self._live_name_for(index), float(value)))
+                write = lambda: self.bridge.write_params_by_index(self.ref, pairs)  # noqa: E731
+            else:
+                pairs = [(str(key), float(value)) for key, value in batch]
+                write = lambda: self.bridge.write_params(self.ref, pairs)  # noqa: E731
             self._attempted["parameters"].add(
-                _vector_digest({**self._last_vector, **{ident: value for ident, value in batch}})
+                _vector_digest({**self._last_vector, **{key: value for key, value in batch}})
             )
-            self._issue_write(lambda: self.bridge.write_params(self.ref, batch))
-            readback = self._read_full_parameter_vector()
-            tolerance = float(self.policy.tolerances.get("parameter.normalized", 1e-03))
+            self._issue_write(write)
+            readback = self._read_planned_vector() if self.index_addressed else self._read_full_parameter_vector()
             mismatched: list[dict[str, Any]] = []
             restore_rows: list[dict[str, Any]] = []
-            for ident, value in batch:
-                actual = readback.get(ident)
+            for key, value in batch:
+                actual = readback.get(key)
                 agrees = actual is not None and abs(float(actual) - float(value)) <= tolerance
                 restore_rows.append(
                     {
-                        "ident": ident,
+                        "ident": key,
                         "written": value,
                         "read_back": actual,
                         "channel": "parameter",
@@ -873,7 +1285,7 @@ class Transaction:
                     }
                 )
                 if not agrees:
-                    mismatched.append({"ident": ident, "written": value, "read_back": actual})
+                    mismatched.append({"ident": key, "written": value, "read_back": actual})
             self._rows["parameters"].extend(restore_rows)
             self._establish_effect()
             if mismatched:
@@ -885,18 +1297,88 @@ class Transaction:
             self._last_verified["parameters"] = _vector_digest(readback)
         return True
 
+    def _live_name_for(self, index: int) -> str:
+        """The name this transaction expects at an index (the name it verified).
+
+        The write hop refuses a mismatch, so a restore is guarded by the same
+        check as the write that preceded it - a name that changed since the
+        capture stops the restore instead of writing to whatever moved there.
+        """
+        control = self._control_for_index(index)
+        binding = dict(((control or {}).get("binding") or {}))
+        return str(binding.get("live_name") or binding.get("measured_name") or "")
+
+    def _control_for_index(self, index: int) -> dict[str, Any] | None:
+        for control in self.profile.get("controls") or []:
+            if int((control.get("binding") or {}).get("index") or -1) == int(index):
+                return dict(control)
+        return None
+
+    def _stored_display_for(self, index: int, normalized: float) -> Any:
+        """What the plugin will hold for a normalized target, through the law.
+
+        A grid law snaps, so the value a caller asks for and the value the plugin
+        stores can differ (e.g. 3.4 -> 3 on an integer ladder). The preview says
+        so; the verification row carries the same number after the write.
+        """
+        control = self._control_for_index(index)
+        if control is None:
+            return None
+        law = str((control.get("law") or {}).get("kind") or "none")
+        if law in ("none", "unmeasured"):
+            return None
+        try:
+            return V.from_native(control, V.normalized_to_native(control, float(normalized)))
+        except PluginError:
+            return None
+
+    def _value_space_for(self, index: int) -> str:
+        """The space the request named for this index (what the preview is stated in)."""
+        for row in (self._resolved.controls.values() if self._resolved else []):
+            binding = dict(row.get("binding") or {})
+            if int(binding.get("index") or -1) == int(index):
+                return str(row.get("value_space") or "display")
+        control = self._control_for_index(index)
+        return "display" if control is not None and V.has_display_law(control) else "normalized"
+
     # ------------------------------------------------------------------
     # Result assembly
     # ------------------------------------------------------------------
 
     def _preview(self, live: P.LiveState, resolved: ResolvedRequest) -> dict[str, Any]:
-        changes = P.state_changes(resolved)
+        changes = (
+            P.state_changes(resolved)
+            if self.state_stage
+            else {"paths": {}, "routes_create": [], "routes_update": [], "routes_remove": []}
+        )
         return {
             "state_paths": changes["paths"],
             "routes_create": changes["routes_create"],
             "routes_update": changes["routes_update"],
             "routes_remove": changes["routes_remove"],
-            "parameters": P.parameter_pairs(resolved),
+            # The ident path's shape is untouched; the index path writes an
+            # address that is a *pair* (index + the name the hop must find there),
+            # so it is reported as rows instead of a bare pair.
+            "parameters": (
+                [
+                    {
+                        "index": int(index),
+                        "expect_name": name,
+                        "normalized": value,
+                        # what the plugin will actually HOLD: a grid law snaps a
+                        # requested value, and the preview must show that, not only
+                        # what was asked for. `None` with a reason when no verified
+                        # law exists - never the normalized number dressed as a
+                        # display value.
+                        "stored_display": self._stored_display_for(int(index), value),
+                        "value_space": self._value_space_for(int(index)),
+                    }
+                    for index, name, value in self._parameter_pairs(resolved)
+                ]
+                if self.index_addressed
+                else P.parameter_pairs(resolved)
+            ),
+            "parameter_address_space": "index" if self.index_addressed else "ident",
         }
 
     def _plan_summary(self, plan: Plan | None, resolved: ResolvedRequest) -> dict[str, Any]:
@@ -930,7 +1412,7 @@ class Transaction:
             rollback=self._rollback,
             channels={
                 name: ChannelReport(rows=self._rows[name], mismatched=self._mismatched[name])
-                for name in _OUTCOME_CHANNELS
+                for name in self.scope_channels
             },
             host=HostAccounting(
                 reads=self.host.reads,
@@ -942,6 +1424,72 @@ class Transaction:
         )
         payload = dict(data or {})
         payload.setdefault("outcome", outcome.to_dict())
+        # Which space each resolved control was written in (P29): a batch may mix a
+        # display request (a confirmed conversion) with an explicit normalized one
+        # (no law needed), and the caller must be able to see which is which.
+        spaces: dict[str, int] = {}
+        for row in (self._resolved.controls.values() if self._resolved else []):
+            space = str(row.get("value_space") or "display")
+            spaces[space] = spaces.get(space, 0) + 1
+        if spaces:
+            payload.setdefault("value_spaces", spaces)
+        if self.refused:
+            # `applied` must come from what was VERIFIED, never from the resolved set: on
+            # a batch that failed and rolled back, the resolved count would report
+            # controls as applied that no longer hold their value (an independent review
+            # of P29 caught exactly that). The verified count is read off the parameter
+            # channel's own rows.
+            verified = sum(
+                1
+                for row in self._rows.get("parameters") or []
+                if row.get("agrees") is True and not row.get("restore")
+            )
+            payload.setdefault(
+                "partial_application",
+                {
+                    "on_unresolved": self.on_unresolved,
+                    "resolved": len(self._resolved.controls) if self._resolved else 0,
+                    "verified": verified,
+                    "refused": len(self.refused),
+                    "note": (
+                        "`on_unresolved: 'skip'` was requested: the controls below were refused "
+                        "before any host work and are untouched; `resolved` were planned and "
+                        "`verified` of them read back as written"
+                    ),
+                },
+            )
+        if self._display_rows:
+            # A second, independent channel beside the normalized comparison: what
+            # the plugin *displays* for the values it now holds, next to what the
+            # law predicted. Reported on every write that produced them.
+            disagreements = [row for row in self._display_rows if row.get("agrees") is False]
+            law_disagreements = [
+                row for row in self._display_rows if row.get("agrees_with_law") is False
+            ]
+            request_rows = [row for row in self._display_rows if row.get("agrees_with_request") is not None]
+            payload.setdefault(
+                "display_checks",
+                {
+                    "rows": list(self._display_rows),
+                    "n_rows": len(self._display_rows),
+                    "n_disagreements": len(disagreements),
+                    # A request-space agreement can now override the law's opinion (the
+                    # labelled-state case), so the law's OWN tally is reported separately
+                    # - a headline that hid it read as "the law agreed everywhere" while
+                    # rows said otherwise (found by the P29 review).
+                    "n_law_disagreements": len(law_disagreements),
+                    "n_compared_with_request": len(request_rows),
+                    "note": (
+                        "display agreement is informative, not the contract: the write is "
+                        "verified in the space it was written (normalized). `n_disagreements` "
+                        "counts rows whose `agrees` is false (the plugin's text vs what the "
+                        "caller asked for where a display value was requested, else vs the "
+                        "law's prediction); `n_law_disagreements` counts the rows where the "
+                        "LAW's prediction differs from the plugin's text, which is a different "
+                        "statement and can be non-zero while every request was honoured"
+                    ),
+                },
+            )
         # Honest disclosure on every result, refusals and dry-runs included: the
         # rules this provider declares but does not decide are named, so an empty
         # findings list is never read as "everything was checked" (Decision 1).
@@ -974,6 +1522,32 @@ class Transaction:
 
 def _vector_digest(values: dict[str, float]) -> str:
     return text_digest(canonical_json({str(k): float(v) for k, v in sorted(values.items())}))
+
+
+def _display_texts_agree(predicted: Any, observed: Any, *, unit: Any = None) -> bool:
+    """Whether a law's predicted display and the host's text are the same value.
+
+    The two sides are not the same *kind* of thing: the law predicts a number (or
+    an enum member id) while the host answers a formatted string ("100.00 Hz").
+    So both sides go through the same display parser the discovery engine uses:
+    two numeric texts agree when their numbers agree to 1e-4 relative **and** the
+    unit the host printed is the unit the control declares (a text with no unit,
+    or a declaration with none, cannot disagree about it). Anything else must be
+    string-equal.
+    """
+    from .discovery.text import parse_display
+
+    left, right = parse_display(predicted), parse_display(observed)
+    if left.numeric and right.numeric and left.value is not None and right.value is not None:
+        host_unit = (right.unit_token or "").strip().casefold()
+        declared = ("" if unit is None else str(unit)).strip().casefold()
+        if host_unit and declared and host_unit != declared:
+            return False
+        if left.value == right.value:
+            return True
+        scale = max(abs(left.value), abs(right.value), 1e-9)
+        return abs(left.value - right.value) / scale <= 1e-4
+    return str(predicted) == str(observed)
 
 
 def _changes_are_empty(changes: Any) -> bool:
@@ -1009,6 +1583,21 @@ def _finding_row(finding: Any) -> dict[str, Any]:
         "missing_input": detail.get("missing_input"),
         "detail": detail,
     }
+
+
+def _workload(resolved: ResolvedRequest) -> int:
+    """How much work a resolved request actually asks for, across all channels.
+
+    Used by the `skip` policy to refuse a batch that resolves to *nothing*: a
+    request whose every entry was refused is a refusal, not an empty success.
+    """
+    return (
+        len(resolved.controls)
+        + (1 if resolved.state else 0)
+        + len(resolved.routes_create)
+        + len(resolved.routes_update)
+        + len(resolved.routes_remove)
+    )
 
 
 def _problem_error(problems: list[dict[str, Any]]) -> PluginError:

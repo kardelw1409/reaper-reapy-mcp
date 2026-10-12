@@ -130,32 +130,66 @@ def test_adding_the_plugin_layer_leaves_the_existing_tools_identical():
     assert json.loads(blocks[0].text) == {"status": "success"}
 
 
-def test_zero_providers_answer_a_typed_unsupported_provider_without_host_contact(monkeypatch):
-    """AUD-013: registered but inert, and inert means *no host call at all*."""
+def test_zero_providers_answer_a_typed_refusal_that_never_measures_or_writes(monkeypatch, tmp_path):
+    """P28 contract (replacing AUD-013's "never touches the host"): with no provider
+    configured the four control tools answer the providerless path's refusal, and
+    the properties that matter are sharper than before - a request may resolve the
+    addressed slot (a read-only identity read) and then refuses with the remedy;
+    it must never **measure** the plugin nor write to it. The discovery engine is
+    booby-trapped here, so an accidental sweep fails loudly.
+    """
+    import discovery_double as D
+    from reaper_reapy_mcp.plugins.discovery import pipeline as DISCOVERY
+    from reaper_reapy_mcp.plugins.errors import DiscoveryArtifactMissing
 
     def bomb(*_args, **_kwargs):  # pragma: no cover - it must never run
-        raise AssertionError("a tool with no provider configured touched the host bridge")
+        raise AssertionError("a read/describe/find/write request triggered a measurement")
 
-    monkeypatch.setattr(A, "session_bridge", bomb)
+    monkeypatch.setattr(DISCOVERY.DiscoveryEngine, "run", bomb)
+    monkeypatch.setenv("REAPER_MCP_PLUGIN_DISCOVERY", str(tmp_path / "discovery"))
+    bridge = D.FakeDiscoveryBridge([D.FakeControl(0, "alpha_gain")])
+    monkeypatch.setattr(A, "_BRIDGE", bridge)
+    monkeypatch.setattr(A, "_REGISTRY", None)
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("probe")
     T.setup_plugin_tools(mcp, config=A.PluginConfig(provider_ids=(), env={}))
+
+    # `plugin_instances` lists *provider* instances: with none configured and no
+    # selector it refuses before any host work, exactly as before.
+    envelope = call(mcp, "plugin_instances", {})
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "UnsupportedProvider"
+    assert envelope["error"]["detail"]["variable"] == "REAPER_MCP_PLUGIN_PROVIDERS"
+
+    # ...but a caller that NAMES the slot gets an answer: an enumeration needs a
+    # vocabulary, a selector does not, and the host-scope block reports readiness
+    # from the prepared artifact without measuring (the engine above is trapped).
+    selected = call(mcp, "plugin_instances", {"selector": {"track_index": 0, "fx_index": 0}})
+    assert selected["ok"] is True, selected
+    assert selected["data"]["instances"] == []
+    assert [row["artifact"]["status"] for row in selected["data"]["host_scope"]] == ["absent"]
+    assert selected["meta"]["profile_source"] == "discovery"
+    assert [row["code"] for row in selected["warnings"]] == ["NoProviderConfigured"]
+
+    instance = {"track_index": 0, "fx_index": 0}
     cases = {
-        "plugin_instances": {},
-        "plugin_describe": {"instance": {"location": {"track_index": 0, "fx_index": 1}}},
-        "plugin_find": {"instance": {"location": {"track_index": 0, "fx_index": 1}}},
-        "plugin_read": {"instance": {"location": {"track_index": 0, "fx_index": 1}}, "controls": ["x"]},
-        "plugin_write": {"instance": {"location": {"track_index": 0, "fx_index": 1}}, "request": {"controls": {}}},
-        "plugin_state": {"instance": {"location": {"track_index": 0, "fx_index": 1}}},
-        "plugin_modulation": {"instance": {"location": {"track_index": 0, "fx_index": 1}}, "op": "list"},
+        "plugin_describe": {"instance": dict(instance)},
+        "plugin_find": {"instance": dict(instance)},
+        "plugin_read": {"instance": dict(instance), "controls": ["alpha_gain"]},
+        "plugin_write": {"instance": dict(instance), "request": {"controls": {"alpha_gain": 1.0}}},
+        "plugin_state": {"instance": dict(instance)},
+        "plugin_modulation": {"instance": dict(instance), "op": "list"},
     }
     for name, arguments in cases.items():
         envelope = call(mcp, name, arguments)
         assert envelope["ok"] is False, name
-        assert envelope["error"]["code"] == "UnsupportedProvider", (name, envelope)
-        assert envelope["error"]["detail"]["variable"] == "REAPER_MCP_PLUGIN_PROVIDERS"
+        assert envelope["error"]["code"] == "DiscoveryArtifactMissing", (name, envelope)
+        assert envelope["error"]["detail"]["remedy"].startswith("call plugin_prepare")
         assert envelope["schema"] == 2 and envelope["tool"] == name
+
+    assert bridge.calls["param_metadata"] == 0, "no request may sweep the plugin"
+    assert bridge.calls["format_params_normalized"] == 0, "no request may sweep the display"
 
 
 def test_an_unknown_provider_id_refuses_with_the_known_ids():

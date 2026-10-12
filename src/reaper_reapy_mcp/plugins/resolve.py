@@ -312,6 +312,17 @@ def _matches_selector(facts: FxHostFacts, track_name: str | None, selector: dict
     return True
 
 
+def matches_selector(facts: FxHostFacts, track_name: str | None, selector: dict[str, Any] | None) -> bool:
+    """Public alias of the selector rule (used by the project-wide enumeration).
+
+    P29's `plugin_instances(scope="project")` walks the host's own slot list and
+    must apply **the same** selector semantics as the provider path; a second,
+    hand-written copy of the rule would be a second answer to "does this selector
+    name this slot".
+    """
+    return _matches_selector(facts, track_name, selector)
+
+
 def iter_instances(bridge: Any, provider: Any, *, selector: dict[str, Any] | None = None) -> list[tuple[FxHostFacts, str | None]]:
     """Every FX slot the provider claims, narrowed by the selector.
 

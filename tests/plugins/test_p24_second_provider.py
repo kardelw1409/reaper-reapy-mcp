@@ -446,20 +446,32 @@ def test_a_write_for_the_second_provider_is_refused_by_its_own_channel_rules(
 
 
 def test_a_plugin_with_no_provider_configured_is_a_typed_refusal(tmp_path: Path, monkeypatch):
-    """A plugin the configured providers do not own is refused, not guessed at."""
-    from reaper_reapy_mcp.plugins.errors import InstanceNotFound
+    """A plugin the configured providers do not own is refused, not guessed at.
+
+    P28: the refusal is now the *generic* path's - the addressed slot is resolved
+    (read-only identity) and, having no prepared discovery artifact, the call stops
+    with `DiscoveryArtifactMissing` and the `plugin_prepare` remedy. What the test
+    guards is unchanged and is what matters: nothing is invented for an unmeasured
+    plugin - no write, no profile, no measurement.
+    """
+    from reaper_reapy_mcp.plugins.errors import DiscoveryArtifactMissing
 
     cache_dir = tmp_path / "cache"
     isolated(monkeypatch, cache_dir, providers="vital")
+    monkeypatch.setenv("REAPER_MCP_PLUGIN_DISCOVERY", str(tmp_path / "discovery"))
     host = MH.MockHostBridge(tracks=[MH.MockTrack(0, "T", [second_slot()])])
     monkeypatch.setattr(A, "_BRIDGE", host)
     config = A.PluginConfig(provider_ids=("vital",), cache_dir=str(cache_dir), env={})
-    with pytest.raises(InstanceNotFound):
+    with pytest.raises(DiscoveryArtifactMissing) as refusal:
         A.plugin_read(
             config=config, instance={"track_index": 0, "fx_index": 0}, controls=["second_gain"]
         )
+    assert refusal.value.detail["remedy"].startswith("call plugin_prepare")
     assert host.count("write_params") == 0
     assert not list(cache_dir.glob("profile_*.json")), "no profile is invented for an unknown plugin"
+    assert not list((tmp_path / "discovery").glob("discovery_*.json")), (
+        "a read must never measure the plugin into an artifact"
+    )
 
 
 def test_two_instances_of_two_providers_in_one_track_do_not_collide(tmp_path: Path, monkeypatch):
