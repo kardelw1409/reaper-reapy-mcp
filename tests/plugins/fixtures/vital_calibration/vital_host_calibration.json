@@ -30,7 +30,7 @@
    "param_count": 2858
   },
   "source_path": "C:\\Users\\karde\\AppData\\Local\\reaper_reapy_mcp\\calibration\\vital_host_calibration.json",
-  "source_sha256": "a99644d00980cc5eb924396add7b19f7ee3a3f90966fb4451805e03fd4e7775b"
+  "source_sha256": "bb72d3fba404d453694a2182d8c7687b007140bdc66773c6083506f4489a9e75"
  },
  "controls": {
   "beats_per_minute": {
@@ -999,7 +999,7 @@
    "unit_token": "dB"
   }
  },
- "generated_utc": "2026-10-11T20:48:11Z",
+ "generated_utc": "2026-10-11T23:48:54Z",
  "grid": [
   0.0,
   0.0625,

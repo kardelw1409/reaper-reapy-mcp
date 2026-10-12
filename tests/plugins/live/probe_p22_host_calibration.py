@@ -256,7 +256,11 @@ def capture(profile: dict, *, out_path: Path) -> tuple[dict, dict]:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(artifact, indent=1, sort_keys=True, ensure_ascii=False)
-    out_path.write_text(text, encoding="utf-8")
+    # ``newline="\n"`` matters: the plain form translates LF to CRLF on Windows, so
+    # the file's bytes would differ from the bytes a digest is taken over - and this
+    # file's bytes are cache-key material (a declared profile source), so the evidence
+    # must record the digest of what is actually on disk.
+    out_path.write_text(text, encoding="utf-8", newline="\n")
     return artifact, timings
 
 
@@ -284,7 +288,8 @@ def main(argv: list[str]) -> int:
     baseline = _coverage(baseline_profile)
 
     artifact, timings = capture(baseline_profile, out_path=out_path)
-    artifact_sha = hashlib.sha256(out_path.read_bytes()).hexdigest()
+    artifact_bytes = out_path.read_bytes()
+    artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
 
     calibrated_provider = VitalProvider(calibration_path=str(out_path))
     after_profile = calibrated_provider.build_profile(
@@ -301,7 +306,12 @@ def main(argv: list[str]) -> int:
         "probe": "p22_host_calibration",
         "utc": _utc(),
         "read_only": True,
-        "artifact": {"path": str(out_path), "sha256": artifact_sha, "bytes": out_path.stat().st_size},
+        "artifact": {
+            "path": str(out_path),
+            "sha256": artifact_sha,
+            "bytes": len(artifact_bytes),
+            "sha256_matches_disk": hashlib.sha256(out_path.read_bytes()).hexdigest() == artifact_sha,
+        },
         "timings": timings,
         "identity": artifact["identity"],
         "read_only_proof": artifact["read_only_proof"],

@@ -52,6 +52,13 @@ CONFIRMATION_STATES = ("confirmed", "consistent_within_step", "declined", "insuf
 #: absent (no preparation run yet - a normal state, not a refusal).
 CALIBRATION_STATES = ("applied", "refused", "absent")
 
+#: The measured enum-boundary states (P23): the block's own state, plus the singular
+#: state a *control* carries when no band map could be attached (a ramping display
+#: has no bands; an undetermined one was not measurable). A measured control carries
+#: the plural `states` list of the transition levels instead.
+ENUM_BOUNDARY_BLOCK_STATES = ("applied", "refused", "absent")
+ENUM_BOUNDARY_EVIDENCE_STATES = ("no_band_structure", "undetermined", "unverified_interior")
+
 LAW_KINDS = ("affine", "enum_index", "exponential", "identity", "none", "power", "unmeasured")
 AUTHORITY_SPACES = ("parameter", "state")
 DEPENDENCY_KINDS = ("hard", "soft", "incompatible", "warning", "info")
@@ -263,6 +270,60 @@ def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
                                 f"not in {LAW_DIRECTIONS}",
                             )
                         )
+                # Row 6e - a declared **storage grid** (P25): the plugin's engine
+                # rounds every set, so the provider declares the step. `values` snaps
+                # both directions onto it; a step that is not a positive finite number
+                # would silently change every conversion of the control, so it is a
+                # `REFUSE_REBUILD` - the loader consults `rebuild_required`/`cacheable`
+                # and never `ok`, so only this kind actually stops a stored entry.
+                if isinstance(params, dict) and "quantization" in params:
+                    grid = params["quantization"]
+                    step = grid.get("step") if isinstance(grid, dict) else None
+                    origin = grid.get("origin", 0.0) if isinstance(grid, dict) else None
+                    if (
+                        not isinstance(grid, dict)
+                        or not _is_number(step)
+                        or float(step) <= 0.0
+                        or not _is_number(origin)
+                    ):
+                        problems.append(
+                            ProfileProblem(
+                                "law_quantization_valid",
+                                f"control {control_id!r} declares a storage grid that is not a "
+                                f"usable step ({grid!r})",
+                                kind=REFUSE_REBUILD,
+                            )
+                        )
+                    else:
+                        # and the grid has to be one the *range* can be walked on: the
+                        # snap rounds in the control's own space with the declared
+                        # origin, while a plugin that rounds its value does not clamp
+                        # (measured: `values.convertToEngineValue` in the provider this
+                        # layer was built against). A range whose ends are not multiples
+                        # of the step away from the origin is a grid the conversions
+                        # cannot honour, so it is refused rather than approximated.
+                        bounds = control.get("range") or {}
+                        low, high = bounds.get("min"), bounds.get("max")
+                        if _is_number(low) and _is_number(high):
+                            step_value, origin_value = float(step), float(origin)
+                            aligned = all(
+                                abs(
+                                    (float(bound) - origin_value) / step_value
+                                    - round((float(bound) - origin_value) / step_value)
+                                )
+                                <= 1e-9
+                                for bound in (low, high)
+                            )
+                            if not aligned:
+                                problems.append(
+                                    ProfileProblem(
+                                        "law_quantization_valid",
+                                        f"control {control_id!r} declares a storage grid "
+                                        f"(origin {origin!r}, step {step!r}) that its range "
+                                        f"{bounds!r} does not sit on",
+                                        kind=REFUSE_REBUILD,
+                                    )
+                                )
             # Row 6c - a near-fit candidate is a RECORD, never a conversion: it must
             # name a known kind and carry the residual that refused it, and the
             # control it sits on must not already have a working law.
@@ -294,6 +355,112 @@ def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
                                 f"{law.get('kind')!r} converts",
                             )
                         )
+            # Row 6f - a declaration a measurement replaced (P24). A declared
+            # `enum_index` whose sweep changed at every step it walked is a ramp:
+            # the profile may model it numerically, but only as a *number* with a
+            # numeric law and a real range, and the evidence must say which
+            # declaration it replaced. A control that still claims members may not
+            # claim to have been converted, and one that was converted may not keep
+            # a member list (that would leave two models of one parameter live).
+            override = (control.get("evidence") or {}).get("enum_declaration_overridden")
+            if override is not None:
+                valid = isinstance(override, dict) and (
+                    override.get("declared_kind") == "enum_index"
+                    and _is_number(override.get("declared_members"))
+                    and float(override["declared_members"]) >= 2
+                    and _is_number(override.get("measured_states"))
+                    and float(override["measured_states"]) >= 3
+                    and isinstance(override.get("why"), str)
+                    and bool(override.get("why"))
+                )
+                if not valid:
+                    problems.append(
+                        ProfileProblem(
+                            "enum_declaration_overridden_valid",
+                            f"control {control_id!r} enum_declaration_overridden must name the "
+                            "declared kind, at least two declared members, at least three "
+                            "measured states and the reason",
+                        )
+                    )
+                if control.get("type") != "number":
+                    problems.append(
+                        ProfileProblem(
+                            "enum_declaration_overridden_valid",
+                            f"control {control_id!r} overrides an enum declaration but is not a "
+                            f"number (type {control.get('type')!r})",
+                        )
+                    )
+                if isinstance(law, dict) and law.get("kind") not in (
+                    "affine", "power", "exponential",
+                ):
+                    problems.append(
+                        ProfileProblem(
+                            "enum_declaration_overridden_valid",
+                            f"control {control_id!r} overrides an enum declaration with law "
+                            f"{law.get('kind')!r}: only a numeric law may replace a member list",
+                        )
+                    )
+                if control.get("enum_values"):
+                    problems.append(
+                        ProfileProblem(
+                            "enum_declaration_overridden_valid",
+                            f"control {control_id!r} overrides an enum declaration and still "
+                            "carries a member list",
+                        )
+                    )
+                # A conversion is only usable as a *number* if its range is known:
+                # `values.to_normalized` falls back to the identity space for a
+                # range-less control, so a display value would be planned as the
+                # normalized parameter (measured on a cache-shaped profile with
+                # `range: null`: `display_to_write_space(control, 4095.5)` plans
+                # `normalized: 4095.5`). The sweep that produced the law is also what
+                # produced the range, so requiring one costs nothing and refuses the
+                # only profile that could be written nonsense through.
+                range_spec = control.get("range")
+                if not (
+                    isinstance(range_spec, dict)
+                    and _is_number(range_spec.get("min"))
+                    and _is_number(range_spec.get("max"))
+                    and float(range_spec["max"]) > float(range_spec["min"])
+                ):
+                    # `REFUSE_REBUILD`, not a plain validation error: the loader
+                    # consults `rebuild_required`/`cacheable` and never `ok`, so only
+                    # these kinds actually stop a stored entry from being served (a
+                    # self-consistent corrupt entry is a cache *hit* otherwise, which
+                    # is the shape this row was written against). The builder always
+                    # carries the sweep's range, so a rebuild lands on a valid profile.
+                    problems.append(
+                        ProfileProblem(
+                            "enum_declaration_overridden_valid",
+                            f"control {control_id!r} overrides an enum declaration without a "
+                            f"usable range ({range_spec!r}): a converted control is served as a "
+                            "number and must carry the sweep's own range",
+                            kind=REFUSE_REBUILD,
+                        )
+                    )
+            # and the shape itself, whether or not the row was converted: a `number`
+            # control carries no member list and no enum geometry (positions and
+            # switch points are enum-only, and a number control carrying them would
+            # leave the read path inverting a mapping the write path does not use)
+            if control.get("type") == "number":
+                params_for_shape = (law or {}).get("params") if isinstance(law, dict) else None
+                geometry = (
+                    sorted(
+                        name
+                        for name in ("positions", "switch_points", "positions_source")
+                        if isinstance(params_for_shape, dict) and name in params_for_shape
+                    )
+                    if params_for_shape
+                    else []
+                )
+                if control.get("enum_values") or geometry:
+                    problems.append(
+                        ProfileProblem(
+                            "number_control_shape_valid",
+                            f"control {control_id!r} is a number control but carries "
+                            f"{('a member list' if control.get('enum_values') else geometry)!r}",
+                        )
+                    )
             # Row 6d - host step metadata (P22): numbers and a bool, nothing else.
             steps = control.get("host_steps")
             if steps is not None:
@@ -507,6 +674,286 @@ def validate_profile(profile: dict[str, Any]) -> ProfileValidation:
                         f"calibration.state {state!r} not in {CALIBRATION_STATES}",
                     )
                 )
+
+    # Row 11c - the measured enum band boundaries (P23). A `switch_points` list is
+    # what the *read* path inverts with, so a malformed one would silently misread
+    # every value: it must carry exactly one finite, non-decreasing point per
+    # member, start at 0 and stay inside the normalized domain. A boundary that
+    # claims an evidence level must name the artifact it came from.
+    boundaries = profile.get("enum_boundaries")
+    if boundaries is not None:
+        if not isinstance(boundaries, dict) or not isinstance(boundaries.get("applied"), bool):
+            problems.append(
+                ProfileProblem(
+                    "enum_boundaries_block_valid",
+                    "the enum_boundaries block must be an object with a boolean `applied`",
+                )
+            )
+        else:
+            artifact = boundaries.get("artifact")
+            if boundaries["applied"] and not (
+                isinstance(artifact, dict) and _nonempty(artifact.get("sha256"))
+            ):
+                problems.append(
+                    ProfileProblem(
+                        "enum_boundaries_block_valid",
+                        "enum_boundaries.applied is true but the artifact reference is missing",
+                    )
+                )
+            tolerance = boundaries.get("tolerance")
+            if boundaries["applied"] and (not _is_number(tolerance) or not 0.0 < float(tolerance) < 1.0):
+                problems.append(
+                    ProfileProblem(
+                        "enum_boundaries_block_valid",
+                        f"enum_boundaries.tolerance {tolerance!r} is not a usable tolerance",
+                    )
+                )
+            if boundaries.get("state") not in ENUM_BOUNDARY_BLOCK_STATES:
+                problems.append(
+                    ProfileProblem(
+                        "enum_boundaries_block_valid",
+                        f"enum_boundaries.state {boundaries.get('state')!r} "
+                        f"not in {ENUM_BOUNDARY_BLOCK_STATES}",
+                    )
+                )
+
+        # Row 11c - the value-bounds block (P25): the plugin's own parameter bounds,
+        # attached where a declared range was a corpus sample narrower than them. An
+        # `applied` block must name its source and the controls it widened; the
+        # per-control record lives in `evidence.value_bounds`. A missing block is
+        # legal (a profile built without the fact table), so absence is not a problem.
+        value_bounds = profile.get("value_bounds")
+        if value_bounds is not None:
+            if not isinstance(value_bounds, dict) or not isinstance(value_bounds.get("state"), str):
+                problems.append(
+                    ProfileProblem(
+                        "value_bounds_block_valid",
+                        "the value_bounds block must be an object with a `state`",
+                    )
+                )
+            else:
+                widened = value_bounds.get("controls")
+                if value_bounds["state"] == "applied":
+                    if not _nonempty(value_bounds.get("source")):
+                        problems.append(
+                            ProfileProblem(
+                                "value_bounds_block_valid",
+                                "value_bounds.state is applied but the source is missing",
+                            )
+                        )
+                    if not isinstance(widened, list) or not widened:
+                        problems.append(
+                            ProfileProblem(
+                                "value_bounds_block_valid",
+                                "value_bounds.state is applied but no control is listed",
+                            )
+                        )
+                elif value_bounds["state"] not in ("none", "absent"):
+                    problems.append(
+                        ProfileProblem(
+                            "value_bounds_block_valid",
+                            f"value_bounds.state {value_bounds['state']!r} is not one of "
+                            "applied/none/absent",
+                        )
+                    )
+            for control in profile.get("controls") or []:
+                if not isinstance(control, dict):
+                    continue
+                record = ((control.get("evidence") or {}) if isinstance(control.get("evidence"), dict) else {}).get(
+                    "value_bounds"
+                )
+                if record is None:
+                    continue
+                before = record.get("declared_before") if isinstance(record, dict) else None
+                after = record.get("declared_after") if isinstance(record, dict) else None
+                if not (
+                    isinstance(before, dict)
+                    and isinstance(after, dict)
+                    and _is_number(before.get("min"))
+                    and _is_number(before.get("max"))
+                    and _is_number(after.get("min"))
+                    and _is_number(after.get("max"))
+                ):
+                    # `REFUSE_REBUILD`, like the two rows below: an unreadable record is
+                    # evidence a reader cannot check, and the loader consults only
+                    # `rebuild_required`/`cacheable` - a plain validation error would
+                    # leave the entry served (found by the round's own review,
+                    # 2026-10-12; before the fix this exact corruption was a cache HIT).
+                    problems.append(
+                        ProfileProblem(
+                            "value_bounds_block_valid",
+                            f"control {control.get('id')!r} carries an unreadable value_bounds "
+                            "record (before/after ranges required)",
+                            kind=REFUSE_REBUILD,
+                        )
+                    )
+                elif not (
+                    float(before["min"]) >= float(after["min"])
+                    and float(before["max"]) <= float(after["max"])
+                ):
+                    # the rule the fact table follows: a correction **widens only** -
+                    # a record that narrows or shifts one side is not a correction
+                    problems.append(
+                        ProfileProblem(
+                            "value_bounds_block_valid",
+                            f"control {control.get('id')!r} value_bounds is not a widening "
+                            f"(before {before!r}, after {after!r})",
+                            kind=REFUSE_REBUILD,
+                        )
+                    )
+                else:
+                    # the range the control actually carries has to *be* the corrected
+                    # one: a record that says "widened to X" while the spine stayed (or
+                    # was tampered) elsewhere documents nothing, and every write would
+                    # run through the wrong mapping while the evidence claims otherwise
+                    # (found by the round's review 2026-10-12: a range tampered to
+                    # -999..999 validated `ok` and was served as a cache hit).
+                    control_range = control.get("range") or {}
+                    if not (
+                        _is_number(control_range.get("min"))
+                        and _is_number(control_range.get("max"))
+                        and abs(float(control_range["min"]) - float(after["min"])) <= 1e-9
+                        and abs(float(control_range["max"]) - float(after["max"])) <= 1e-9
+                    ):
+                        problems.append(
+                            ProfileProblem(
+                                "value_bounds_block_valid",
+                                f"control {control.get('id')!r} records a widening to {after!r} "
+                                f"but its range is {control_range!r}",
+                                kind=REFUSE_REBUILD,
+                            )
+                        )
+
+    for control in profile.get("controls") or []:
+        if not isinstance(control, dict) or control.get("type") != "enum":
+            continue
+        control_id = control.get("id")
+        law = control.get("law")
+        params = law.get("params") if isinstance(law, dict) else None
+        if not isinstance(params, dict):
+            continue
+        members = control.get("enum_values")
+        count = len(members) if isinstance(members, list) else 0
+        points = params.get("switch_points")
+        if points is not None:
+            valid = (
+                isinstance(points, list)
+                and len(points) == count
+                and all(_is_number(point) for point in points)
+                and float(points[0]) == 0.0
+                and all(0.0 <= float(point) <= 1.0 for point in points)
+                and all(
+                    float(later) >= float(earlier)
+                    for earlier, later in zip(points, points[1:])
+                )
+            )
+            if not valid:
+                problems.append(
+                    ProfileProblem(
+                        "enum_switch_points_valid",
+                        f"control {control_id!r} switch_points must be {count} finite, "
+                        "non-decreasing points in [0, 1] starting at 0",
+                    )
+                )
+        positions = params.get("positions")
+        if positions is not None:
+            if not (
+                isinstance(positions, list)
+                and len(positions) == count
+                and all(_is_number(position) and 0.0 <= float(position) <= 1.0 for position in positions)
+            ):
+                problems.append(
+                    ProfileProblem(
+                        "enum_switch_points_valid",
+                        f"control {control_id!r} positions must be {count} numbers in [0, 1]",
+                    )
+                )
+        # Row 6g - the measured *bands*, and the invariant that makes a write target
+        # safe: the value written for a member must lie inside the band whose member it
+        # selects, or the read path reports a member the host never prints for it. The
+        # bands are carried in the evidence precisely so this can be re-checked here
+        # rather than taken on trust (an independent review produced a two-ULP band
+        # where a rounded midpoint escaped its own band).
+        evidence = params.get("boundary_evidence")
+        bands = evidence.get("band_ends") if isinstance(evidence, dict) else None
+        if bands is not None:
+            if not (
+                isinstance(bands, list)
+                and len(bands) == count + 1
+                and all(_is_number(band) and 0.0 <= float(band) <= 1.0 for band in bands)
+                and all(
+                    float(later) >= float(earlier) for earlier, later in zip(bands, bands[1:])
+                )
+            ):
+                problems.append(
+                    ProfileProblem(
+                        "enum_band_ends_valid",
+                        f"control {control_id!r} boundary_evidence.band_ends must be "
+                        f"{count + 1} non-decreasing numbers in [0, 1]",
+                    )
+                )
+            else:
+                if isinstance(points, list) and len(points) == count:
+                    if [float(point) for point in points] != [float(band) for band in bands[:-1]]:
+                        problems.append(
+                            ProfileProblem(
+                                "enum_band_ends_valid",
+                                f"control {control_id!r} switch_points disagree with the bands "
+                                "they claim to start",
+                            )
+                        )
+                targets = (
+                    [float(position) for position in positions]
+                    if isinstance(positions, list) and len(positions) == count
+                    else [index / max(1, count - 1) for index in range(count)]
+                )
+                # the last band is closed at the top of the domain unless the bands
+                # stop short of it (an unlabelled region above the last member)
+                closed_top = float(bands[-1]) == 1.0
+                for index, target in enumerate(targets):
+                    low, high = float(bands[index]), float(bands[index + 1])
+                    ok = low <= target <= high if (closed_top and index == count - 1) else (
+                        low <= target < high
+                    )
+                    if not ok:
+                        problems.append(
+                            ProfileProblem(
+                                "enum_write_target_in_band",
+                                f"control {control_id!r} member {index} would be written to "
+                                f"{target!r}, outside its band [{low!r}, {high!r})",
+                            )
+                        )
+            checked = evidence.get("band_interiors_checked")
+            verified = evidence.get("band_interiors_verified")
+            if isinstance(checked, int) and isinstance(verified, int) and checked != verified:
+                problems.append(
+                    ProfileProblem(
+                        "enum_band_interior_verified",
+                        f"control {control_id!r} carries a band map whose interiors the "
+                        f"measurement did not confirm ({verified} of {checked})",
+                    )
+                )
+        evidence = params.get("boundary_evidence")
+        if evidence is not None:
+            artifact = evidence.get("artifact") if isinstance(evidence, dict) else None
+            if not isinstance(artifact, dict) or not _nonempty(artifact.get("sha256")):
+                problems.append(
+                    ProfileProblem(
+                        "enum_boundary_evidence_valid",
+                        f"control {control_id!r} boundary_evidence must name the artifact it "
+                        "was measured from",
+                    )
+                )
+            else:
+                declared = evidence.get("state")
+                if declared is not None and declared not in ENUM_BOUNDARY_EVIDENCE_STATES:
+                    problems.append(
+                        ProfileProblem(
+                            "enum_boundary_evidence_valid",
+                            f"control {control_id!r} boundary_evidence.state {declared!r} "
+                            f"not in {ENUM_BOUNDARY_EVIDENCE_STATES}",
+                        )
+                    )
 
     # Row 12 - capture scope legality.
     state = profile.get("state")

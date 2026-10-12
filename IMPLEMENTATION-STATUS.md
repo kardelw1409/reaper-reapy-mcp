@@ -2690,3 +2690,747 @@ the warm path, the read-only boundary, and the trust/robustness regressions of
   `GetParameterStepSizes`, `GetParamEx`, `GetNamedConfigParm`), each capture
   proving byte-identical watched values and state chunk before and after.
 
+---
+
+## 29. P23 - adaptive read-only enum boundaries, and a proven v2 preload (2026-10-12)
+
+**The round's two questions.** (A) Can more of Vital's enum band boundaries be
+discovered through *adaptive read-only formatting* - `TrackFX_FormatParamValueNormalized`,
+which formats a value the caller passes and never moves a parameter? (B) Does the
+startup preload actually load a **compatible** schema-v2 profile into memory and let
+the next warm call use it without rebuilding or re-reading the cache file? P22 could
+only show 13 entries *rejected* at startup, which does not prove the positive case.
+
+### 29.1 What the census found before anything was changed
+
+The starting point was re-measured, not taken from the report. All 343 enum controls
+have a registry sweep, and the *census* (`tests/plugins/live/probe_p23_enum_gap_census.py`)
+classifies every one of the 294 declared `enum_index` rows: 291 are
+`uniform_is_correct` (the uniform mapping already lands each member inside its own
+measured band) and 3 (`filter_{1,2,fx}_style`) have a sweep denser than their member
+list. Only **52** of the 343 controls carried `switch_points`, and the reason the
+other 291 did not is *not* that their bands were unknown - it is that a sweep cannot
+resolve a boundary:
+
+- the sweep's change points are the first *sampled* value showing the new member, so a
+  recorded change point is an **upper bound** whose resolution is the sweep's own step
+  (1/256 for most controls, 1/16 for the styles);
+- measured: 5,320 of 5,671 internal boundaries sit up to **3.35e-3** from the uniform
+  arithmetic, and *every* one of those distances is smaller than that resolution. The
+  sweep cannot say which of the two is right, and re-reading it cannot help.
+
+The host formatter can, because it accepts an arbitrary double.
+
+### 29.2 The adaptive method, and the four evidence levels it produces
+
+`tests/plugins/live/probe_p23_enum_boundaries.py`, per enum control, with a hard call
+budget and a wall-clock bound:
+
+1. **anchors** - the profile's own write position for each member is formatted; if it
+   does not print that member, a bounded search inside the profile's band looks for one
+   that does (a P19-class *position defect*, now detected mechanically);
+2. **candidate proof** (`exact_at`) - a round candidate (the profile's own boundary,
+   and neighbours on the 1/16, 1/64, 1/100, 1/128, 1/256, 1/1000, 1/1024 grids) is
+   probed: if the candidate itself prints the upper member **and the double below it**
+   prints the lower one, the boundary is proved exact in two calls;
+3. **bracket** (`exact` / `interval` / `coarse_interval`) - otherwise the transition is
+   bracketed (around the profile's own boundary inside epsilon, else between adjacent
+   member anchors) and bisected; at `--tolerance 1e-18` that means down to **adjacent
+   doubles**, so `hi` is the smallest double the host formats as the member that begins
+   there - a claim with **no tolerance in it**;
+4. **third label** - a text that is *neither* adjacent member is classified: a value
+   strictly between them ⇒ `continuous_display` (the control's "members" are the sweep's
+   own samples of a linear ramp), anything else ⇒ `foreign_label`;
+5. **band interiors** - one probe per band, at its midpoint, must print that member;
+6. **the tail** - if the top of the domain prints something that is not the last member,
+   the unlabelled region's start is bracketed (`filter_{1,2,fx}_style`: 0.5625, where
+   the sixth state prints an empty string).
+
+Measured, final run: 343 controls, **5,952 transitions**, **36,895 host calls**,
+**37.9 s**, read-only proof `values_unchanged: true` / `chunk_sha256_unchanged: true`
+(115 watched normalized values + the track chunk's SHA-256), and the artifact's digest
+verified against the bytes on disk.
+
+| Evidence level | Count | What it licenses |
+|---|---|---|
+| `exact_at` | **815** | the candidate double flips the display and the double below it does not: the boundary *is* that double |
+| `exact` | **16** | bisection ended with `hi == nextafter(lo)`: the transition lies between adjacent doubles |
+| `continuous_display` | 5,120 | no band structure exists (20 controls, 257 "members" each) |
+| `unresolved` | 1 | `bypass`: the host prints `0`/`60`, never the member ids |
+| band interiors | 1,153 checked, **1,153 verified** | every band's interior prints its own member |
+
+**Which exact form appears depends on the input profile, and that is by design**: a run
+against a profile that carries no measured boundaries bisects and reports `exact`
+(measured: 831/831 in the first full run); a run against a profile that already carries
+them proves each one in two calls and reports `exact_at` (815 + 16 here). Both are
+tolerance-free. A *wrong* boundary cannot be proved: the proof requires the flip to
+happen exactly between the two adjacent doubles, so a stale 0.6 fails it and falls
+through to bisection. Cross-run reproducibility was measured: **5,951 of 5,951
+boundaries are byte-identical** between the two runs, from the same state and from a
+profile that already carried the values.
+
+### 29.3 What the merge may change, and what it refuses
+
+`src/reaper_reapy_mcp/plugins/providers/vital/enum_boundaries.py`
+(`load_enum_boundaries` + `apply_enum_boundaries`), applied inside the profile build
+(`profile_build.build_profile`, after the calibration merge), with the artifact as a
+declared **source** (its sha256 is cache-key material, provider revision r8 → **r10**):
+
+- **attach** `switch_points` (full precision - rounding them to nine decimals would
+  discard the very resolution the measurement established: 0.4999999850988388 is the
+  boundary, 0.5 is not) plus a compact `boundary_evidence` block, for every control
+  whose measured bracket **contradicts** the profile's present boundary by more than the
+  bracket's own width: **322 controls** (widest disagreement closed 3.3477e-3; the
+  ULP-scale case: `chorus_on` flips at 0.5 − 1.49e-8, not at 0.5);
+- **keep byte-identical geometry** when the measurement agrees (0 controls here, because
+  the ULP-scale offsets are real disagreements);
+- **refuse as a whole** a control whose transitions are not all measurable, whose
+  bracket for a `confirmed_within` claim does not contain the profile's own boundary,
+  whose band interiors were not all verified, or whose write target cannot be placed
+  inside its own band - the geometry stays as it was and the reason is recorded
+  (`bypass`: not measurable);
+- **name, do not invent** the 20 controls whose display ramps: they keep their geometry
+  and gain `boundary_evidence.state = "no_band_structure"` with the measured fit
+  (slope ≈ 2.0 for `distortion_filter_blend`, `linear` residual 2.7e-6) - the member
+  list is the sweep's sampling grid, so the honest fix is a *numeric* law for those
+  controls, which is a provider-data decision this round deliberately did not take;
+- the bands themselves (`band_ends`) travel with the evidence so that **containment of
+  every write target** can be re-checked by a reader and by `validate_profile`
+  (`enum_band_ends_valid`, `enum_write_target_in_band`, `enum_band_interior_verified`)
+  instead of being taken on trust.
+
+### 29.4 The acceptance: does the profile now agree with the host, live?
+
+`tests/plugins/live/probe_p23_read_agreement.py` (read-only) compares the profile's own
+`values.normalized_to_native` with the host's own printout at the same value, testing
+the **live value, both ends of every measured bracket and every member's write target** -
+a live value alone sits mid-band and cannot see a boundary defect.
+
+| | without the artifact (P22 geometry) | with the measured boundaries |
+|---|---|---|
+| read comparisons | 8,297 (2,004 read points + 6,293 write targets) | 8,297 |
+| read agreements | 1,171 | **2,004** |
+| **read disagreements with the host's printout** | **833** (831 of them at a bracket end) | **0** |
+| write targets agreeing | 6,293 / 6,293 | 6,293 / 6,293 |
+| profile size | 1,348,395 bytes | 1,590,914 bytes |
+
+Read-only proof on every run: watched values and the state chunk byte-identical before
+and after; no setter was called (the only host functions used are the formatter,
+`GetParameterStepSizes`, `GetParamNormalized` and `GetTrackStateChunk`).
+
+### 29.5 Workstream B: a compatible v2 profile is really preloaded and reused
+
+`tests/plugins/test_p23_preload_positive.py` (6 tests) and
+`tests/plugins/probe_p23_preload_offline.py` (offline evidence). The lifecycle under
+test: a schema-v2 entry is built and saved through the **real** resolve path with the
+**real** Vital provider on the pinned fixture registry into an isolated cache
+directory; the server is started through the **real** `server.create_server()`; only the
+host *controller* is stubbed (`S.ReaperController`, `S.setup_mcp_tools`,
+`S.setup_plugin_tools` - starting the real one would connect to REAPER). The preload,
+the cache, the provider, the validation table and the warm path are the production
+ones.
+
+| Scenario | discovered | valid | **parsed + loaded** | rejected (by reason) | preload | warm lookup |
+|---|---|---|---|---|---|---|
+| valid entry only | 1 | 1 | **1** | 0 | 0.0272 s | `source=cache`, `prepared=True`, **builds 0**, **disk reads 0**, 0.0028 s, content hash equal |
+| valid + a schema-v1 entry + a stale v2 entry | 3 | 1 | **1** | 2 (`preload.superseded` 1, `preload.format_key` 1) | 0.0307 s | same: builds 0, disk reads 0 |
+
+`disk_reads` is counted by patching `Path.read_text` inside the cache directory - the
+only way a cache entry is read (`cache._read_entry`); the prepared path uses `stat`
+only. The test cannot pass vacuously: clearing the prepared index after startup makes
+the same call fall through to the disk path (`prepared=False`, one disk read), and the
+`sabotage` case is what the independent review measured. Nothing was deleted,
+quarantined or rewritten by starting up. With no valid entry the preload prepares 0 and
+the next call builds once - the existing safe behaviour. Freshness is asserted through
+the tool layer: `plugin_read` after a host value change returns the **new** value, and
+`read_params` is called again on every call (the profile caches capability, never state).
+
+### 29.6 The independent review (GLM-5.3 Flash), and what it changed
+
+Four questions, each with its own reproduction script. Verdicts: **Q1 SOUND**, **Q2
+WEAK**, **Q3 SOUND**, **Q4 SOUND** (one scoped caveat). Everything reported as a defect
+was reproduced locally before being accepted, and every one is now fixed with a test:
+
+| Finding | Reproduction | Fix |
+|---|---|---|
+| **A3 - a write target could escape its own band.** Two transitions two ULP apart make a band 2 ULP wide; the target was the band's midpoint **rounded to 9 decimals**, which then landed outside the band it came from (a write that would read back as another member). | three-member control, transitions at `A` and `nextafter(nextafter(A))` | `_midpoint` is exact and clamped; the merge checks `band_ends[i] <= position < band_ends[i+1]` for **every** attached target (closed at the top of the domain unless a tail caps it) and refuses the control otherwise; `band_ends` travel in the profile and `validate_profile` re-checks containment |
+| **A4 - `confirmed_within` was accepted without being about the profile's boundary.** The state certifies "the *profile's own* boundary reproduces both sides within epsilon", but the merge would take the bracket's far end and refine to it (boundary 0.5, bracket [0.6, 0.9] ⇒ switch point 0.9). | one control, one `confirmed_within` transition whose bracket excludes the boundary | the merge requires `lo <= boundary <= hi` for that state and refuses the control otherwise (`bracket_does_not_contain_the_profile_boundary`); the vocabulary is documented in the profile's own `evidence_levels` (`exact_at`, `coarse_interval`, and the note that `exact` certifies the bracket's *ends*) |
+| **A6 - the recorded artifact digest was not the digest of the artifact.** `Path.write_text` translates LF to CRLF on Windows, so the evidence's sha256 (and the P22 one's) was the digest of the *intended* text, while the file on disk - whose bytes are cache-key material - differed by one byte per line. | compare `p23_enum_boundaries__…96d14838` (4,948,466 bytes recorded) with the file (5,147,162 bytes) | both probes now write with `newline="\n"` and **verify the digest by re-reading the file** (`sha256_matches_disk`), and both artifacts were regenerated (P22's content is unchanged - the same measurement, serialized without translation) |
+| **Q1(b)/F3 - the brackets say nothing about a band's interior**: a non-monotone (spike) display, or one whose printed digits cannot express the band, would have been merged as if the interior were the member the boundaries imply. | synthetic spike display | the probe now verifies every band's interior (1,153/1,153) and the merge refuses a control whose interiors were not all confirmed. **The new check immediately found a bug in my own probe**: the tail was measured *after* the interiors, so the three filter styles' last band looked open to 1.0 and its interior (0.71875) printed the empty string - reported as a mismatch, fixed by measuring the tail first, and re-run (1,153/1,153 verified) |
+| Q1 note - `exact_at` is unreachable on a host that quantizes its input | synthetic float32 quantizer | accepted as measured: on this host `exact_at` fires only when the candidate is strictly below the quantization tie (815 here, 0 in the first bisection run). Both levels are tolerance-free and the artifact never claims more than the two probes it made |
+| Q3 - one vacuous assertion (`builds_before == 0` on an object with no `builds` attribute) | probe output | replaced by a counting subclass: `builds["n"] == 0` is now a real claim |
+| Q4(f) - the 833 → 0 number is artifact-scoped | review's analysis | accepted and stated as such in 29.4: the *host text* is the independent oracle at every tested point and, for an exact bracket, its two ends are the only doubles that exist; what is not covered is the interiors of coarse brackets (none exist here) and the 20 ramp controls, whose interiors cannot be members by construction |
+
+The review also confirmed, with its own scripts: the read-only surface (no setter
+reachable; 115 watched values), that the merge chain takes no bridge, the cache-key
+story for the combined calibration + boundaries case (7 rows, `profile_source_rows` ≡
+`provenance.sources`, changed/removed/**refused** artifacts all move the key), that
+attaching `switch_points` cannot change a write (the write path uses `positions` only;
+real merge: `positions_moved: 0`), and the suite's own state (586 passed at review time;
+593 now, after the fixes).
+
+### 29.7 What remains unresolved, and why (Task A)
+
+| Cause | Count | Why formatting cannot close it |
+|---|---|---|
+| the display **ramps** between "members" | 20 controls / 5,120 transitions | there is no band structure to find: the member list is the sweep's own sampling grid (one transition every 1/256, exactly linear). The correct model is a numeric law with the host's step as its resolution, which changes write acceptance - a provider-data decision, not taken here |
+| the host never prints the member ids | 1 control (`bypass`) | it prints `0`/`60` for a two-state parameter the registry names `normal/ bypassed`; the member vocabulary, not the boundary, is missing |
+| the boundary is only bounded by the host's print resolution | 0 | every measurable transition reached adjacent doubles |
+| unlabelled regions above the last member | 3 controls | measured exactly (0.5625); the *name* of the sixth state is missing from the provider data, so no member can be assigned to that region |
+
+### 29.8 Cost, and what the warm path pays
+
+| Item | Measured |
+|---|---|
+| one preparation sweep (read-only) | **37.9 s**, 36,895 host calls, artifact **5,180,158 bytes** |
+| profile | 1,590,914 bytes (+18% against P22's 1,347,048: the measured bands, their evidence and `band_ends`) |
+| warm path | unchanged in shape: cold **2139.1 ms** / warm-on-disk **782.1 ms** / warm-in-index **682.8 ms** (builds 1/0/0, cache reads 0/1/0) |
+| startup | import 1.5154 s + `create_server` 0.129 s; the real cache directory (14 entries) preloads in **0.2106 s with 0 parses** (all superseded) |
+| key material without a build | 0.016 s (two artifacts hashed instead of one) |
+
+### 29.9 Tests actually run (this round)
+
+| Command | Result |
+|---|---|
+| `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live` | **593 passed** (539 before + 41 in `test_p23_enum_boundaries.py` + 6 in `test_p23_preload_positive.py` + the review's regressions) |
+| `py -3.11 -m pytest tests/test_midi_mock.py tests/test_controller_structure.py -q` | 2 passed |
+| `py -3.11 tests/plugins/live/probe_p23_enum_boundaries.py --tolerance 1e-18` | exit 0; artifact `vital_enum_boundaries.json` 5,180,158 bytes, sha `1a03303e…`, digest verified on disk, read-only proof True/True; evidence `p23_enum_boundaries__20261011T235648Z__1a03303ea3be.json` |
+| `py -3.11 tests/plugins/live/probe_p23_enum_gap_census.py` | exit 0; 294 declared enum rows: 291 `uniform_is_correct`, 3 `sweep_denser_than_members` |
+| `py -3.11 tests/plugins/live/probe_p23_read_agreement.py` | exit 0; 833 → 0 read disagreements; evidence `p23_read_agreement__20261011T235737Z__072406eeb73a.json` |
+| `py -3.11 tests/plugins/probe_p23_preload_offline.py` | exit 0; 1/1/1/0 and 3/1/1/2 counters; evidence `p23_preload_positive__20261011T235750Z__f4351bd2df2f.json` |
+| `py -3.11 tests/plugins/live/probe_p22_host_calibration.py` | exit 0 (re-run for the newline fix; the measurement is unchanged); `p22_host_calibration__20261011T234909Z__cb29f89c6a43.json` |
+| `py -3.11 tests/plugins/live/probe_p21_cache_timing.py` | exit 0; evidence `p21_cache_timing__20261011T235802Z__d67e5fc0f5ff.json` |
+
+New this round: `tests/plugins/probe_p23_preload_offline.py`,
+`tests/plugins/live/probe_p23_enum_boundaries.py`,
+`tests/plugins/live/probe_p23_enum_gap_census.py`,
+`tests/plugins/live/probe_p23_read_agreement.py`,
+`tests/plugins/test_p23_enum_boundaries.py`,
+`tests/plugins/test_p23_preload_positive.py`,
+`tests/plugins/fixtures/build_vital_enum_boundaries_fixture.py` +
+`tests/plugins/fixtures/vital_enum_boundaries/vital_enum_boundaries.json` (12 controls,
+121,614 bytes, one per outcome class, with the trimming recorded in `_fixture`), and the
+scratch lens `tests/plugins/fixtures/p23_fixture_registry_lens.py`.
+
+### 29.10 Residual gaps (named)
+
+- **The 20 ramp controls are still modelled as enums.** Their reads are indices and
+  their writes are quantized to the sweep's grid; the measured slope says the display
+  is a ramp, but changing the law kind - and with it what `plugin_write` accepts - is a
+  provider-data decision with its own acceptance round. Recorded per control, not acted
+  on.
+- **`bypass` remains non-measurable**; its band map stays the uniform one.
+- **The boundaries are `exact` only in the host's *display* space.** The formatter is
+  what a user sees and what a read-back compares against; a plugin-internal
+  representation beneath it is not observable through this channel.
+- **`band_ends` costs ~190 KB of profile.** It buys the ability to re-check write-target
+  containment offline; if the profile's size ever matters more, it can be dropped and
+  the containment claim falls back to "the merge checked it once".
+- **The two runs that produced `exact` and `exact_at` are not the same *instrument
+  claim*** - both are tolerance-free, but a reader comparing evidence files will see
+  different state names for the same boundaries. Documented rather than papered over.
+- **`preload` scans 14 files in 0.21 s** now (vs 13 in 0.047 s in P22) simply because
+  the entries on disk are larger (the superseded r8/r9 profiles are 1.4-1.6 MB each);
+  the scan still parses none of them.
+
+### 29.11 Git state (recorded, not changed)
+
+- `HEAD` **moved during this round, not by me**: the P21/P22 work was committed by the
+  user as `6d0ad25 Add comprehensive tests for P22 calibration and update cache schema
+  version` (2026-10-12 00:30:57 +0200, also on `origin/feature/vst-bridge`), whose parent
+  is the `64220df…` I recorded at the P22 round's end. `HEAD` at the end of this round:
+  `6d0ad25d2be3e3170ec122346bfb3e083d804313`.
+- **No** `git add`, `git commit`, `git reset`, `git stash` or `git checkout` was run in
+  this round either; the index is unchanged (nothing staged).
+- `composer_v1_2_lm_probe.md` was not read, changed, moved or deleted. The REAPER
+  project was **not saved**, and no plugin parameter was mutated: every live call was
+  `TrackFX_FormatParamValueNormalized`, `TrackFX_GetParameterStepSizes`,
+  `TrackFX_GetParamNormalized`, `GetTrackStateChunk` or `GetParamName`, each capture
+  proving byte-identical watched values and state chunk before and after.
+
+## 30. P24 - the twenty declared enums that are ramps, and a second provider used only by tests (2026-10-12)
+
+### 30.1 What was asked, and what the starting state really was
+
+Two workstreams: **(A)** fix the remaining wrong or under-proven Vital control model -
+explicitly the 20 controls the profile described as `enum` although they behave as
+continuous numeric parameters - and **(B)** check (and minimally improve) the shared
+Capability Profile / cache / startup-preload architecture so other plugins can be added
+through their own providers.
+
+The starting state was re-measured rather than quoted: **432 numeric / 343 enum**
+controls, laws `affine` 399, `enum_index` 343, `power` 25, `exponential` 8. P23 had
+measured that 20 of those 343 `enum_index` rows have **no band structure at all** -
+5,120 transitions, every one of them printing a value *between* two "members" - and had
+recorded the finding while keeping the 257-member lists. The consequence was practical:
+an AI wanting "LFO 5 phase = 0.4" had to name one of 257 strings, and a member name is
+an approximation of a level nobody ever measured.
+
+### 30.2 The criterion, and the instrument model that had to be measured first
+
+The registry's sweep records a display at **every step it walked** (`steps: 256`, 257
+sampled positions), so a control whose display changed at *all* 257 positions cannot be
+a banded member set. The predicate (`_sampled_ramp` in
+`plugins/providers/vital/profile_build.py`) is therefore: 257 sampled positions, every
+display a faithful number, strictly monotone, all distinct - and then one numeric law
+must fit.
+
+Three instrument facts had to be established before that fit meant anything, and the
+first two are what had made the ratio rows unfittable:
+
+* the plugin prints a **float32** with `%.6g` (six significant digits) - so the budget
+  for "the law agrees with the display" is the display's own printed precision **plus
+  half a float32 ulp at the largest printed magnitude** (`_float32_storage_term`);
+* the sweep file stores positions rounded to **six decimals**, and at the steep end of
+  a 16-octave law that rounding is worth ~11x the printed precision - so the fit is
+  judged at the position the display was really produced at, `i / (n - 1)`
+  (`_exact_sampled_positions`), not at the stored value;
+* the enum-boundaries artifact is the second, independent measurement of the same
+  question (`continuous_display`); where it agrees it is carried on the control as
+  `law.params.artifact_confirmation`, where it claims *bands* for a control the profile
+  models numerically the merge refuses the whole control loudly, and where it measured
+  **nothing** the confirmation is now *withheld* and named (see 30.8).
+
+### 30.3 The twenty controls: before, after, and the laws
+
+All twenty are `affine` over their swept range; the declared range and the swept range
+agree for 16 of them and the evidence says so per control
+(`evidence.enum_declaration_overridden.range_disagrees_with_the_declaration`):
+
+| control | before | after | range from the sweep | unit |
+|---|---|---|---|---|
+| `distortion_filter_blend`, `filter_1_blend`, `filter_2_blend`, `filter_fx_blend` | enum, 257 members | number, affine | 0..2 | - |
+| `filter_1_drive`, `filter_2_drive`, `filter_fx_drive` | enum, 257 members | number, affine | 0..20 | dB |
+| `effect_chain_order` | enum, 257 members | number, affine | 0..181440 | - |
+| `lfo_1..8_phase` | enum, 257 members | number, affine | 0..1 | - |
+| `mod_wheel` | enum, 257 members | number, affine | 0..1 | - |
+| `reverb_delay` | enum, 257 members | number, affine | 0..0.3 | secs |
+| `reverb_pre_low_cutoff` | enum, 257 members | number, affine | 0..128 | semitones |
+| `sample_transpose_quantize` | enum, 257 members | number, affine | 0..8191 | - |
+
+Profile shape after: **452 numeric / 323 enum**, laws `affine` 419, `enum_index` 323,
+`power` 25, `exponential` 8 - every one of the 775 controls now carries a law that
+converts (`law` `none`/`unmeasured`: 0, `law_candidate`: 0).
+
+**Not converted, deliberately**: `pitch_bend_range` (49 states) and `oversampling`
+(4 states) changed at 49 and 4 of the 256 steps - a member set repeats a label across
+the band it owns, and 49 < 257 is exactly what a banded enum looks like. They keep
+their member lists, their measured bands and their `switch_points` (49 and 4).
+
+### 30.4 The four ratio rows: the refusal was the instrument's fault, not the data's
+
+`random_1..4_frequency` display the *period* of a frequency (16 octaves across the
+range, descending), and P23 had recorded them as refusable. With the exact positions
+and the float32 storage term they derive as `exponential` with `fit_residual_ratio`
+0.955 (the four identical rows), 0.181 (`delay_frequency`, `delay_aux_frequency`) and
+0.021 (`phaser_frequency`) - all eight `exponential` rows in the profile are the
+frequency/period family.
+
+### 30.5 Live acceptance: does the host print what the profile predicts? (read-only)
+
+`tests/plugins/live/probe_p24_continuous_agreement.py` asks the host's own formatter at
+**64 points per control including values no sweep sampled** (thirds, 1e-4 offsets) and
+compares the profile's answer for the same value. Nothing is written: the conversion is
+the production one (`values.display_to_write_space`) and the *setter* is what is absent
+(`writes_attempted: 0`, watched values and `GetTrackStateChunk` sha unchanged - both
+`true`).
+
+| group | read agreement (within one printed digit) | worst | conversion round trip |
+|---|---|---|---|
+| the 20 converted ramps | **1400 / 1400** | 0.523 printed units | **240 / 240** |
+| the 7 ratio rows | 448 / 448 numeric reads (484 / 490 within **two** units) | 2.191 | 72 / 84 |
+| the pre-P24 model, same points | **43 / 1400** (2 of 70 per ramp, 5 of 70 for `sample_transpose_quantize`) | - | - |
+
+The conversion round trip is: the value the profile's write path would send, formatted
+by the host, must print that value back. It is a *read-only* round trip - the setter is
+never called - and the evidence field now says so (`write_round_trip_kind`, added after
+the review; see 30.8).
+
+### 30.6 The three unnamed `filter_N_style` states
+
+P23 had recorded 3 regions where the host prints **nothing**. The plugin's own source
+is now the citation (`mtytel/vital`: `kFilterStyleNames` has five names;
+`src/common/synth_parameters.cpp` declares the parameter over 0.0..9.0; the label is
+looked up through a *model-dependent* table in
+`src/interface/editor_sections/filter_section.cpp`), so the state is "the style index
+has no name to print at this model" - a fact about the plugin, not a gap in the sweep.
+No name was invented; `unlabelled_regions` carries the `why` and the `source` per row.
+
+### 30.7 Workstream B: does the shared layer really carry a second plugin?
+
+A **test-only** provider (`tests/plugins/second_provider.py`, fixtures under
+`tests/plugins/fixtures/second_provider/`) with its own id, revision
+(`second-provider-r1`), fingerprint, provenance, one numeric control with a range and
+one enum with uneven bounds was exercised through the **real** paths - key determinants
+(`key_material_of`), cache save/load, the startup preload index, `plugin_read` /
+`plugin_write` and `create_server()`:
+
+* it builds, validates, saves and reloads through its own key (`da63ef27...`), and a
+  warm call is served from the cache with `built: false`;
+* two providers coexist in one directory without key collisions, and the live path
+  answers each slot through the provider that owns it - with more than one provider
+  configured an instance that names none is a typed refusal;
+* stale/incompatible entries are rejected (revision, artifact digest, schema version)
+  without collateral loss: the entry's bytes survive, its owner still loads it;
+* no provider, no profile: a plugin the configured providers do not own is a typed
+  `InstanceNotFound` and nothing is invented or cached.
+
+**The one real defect the round found (fixed)**: `ProfileCache(provider_id="second").load(<vital key>)`
+returned the *other* provider's profile as a **hit** - the cache directory is shared and
+the key is provider-scoped, so nothing stopped a caller from being served a foreign
+profile. `_read_entry` now refuses a foreign `provider_id`
+(`CacheRefusal("provider_id", ...)`, `status="refused"`, **no quarantine** - the entry is
+valid for its owner and destroying it would be a worse bug), independently of whether a
+live identity was passed; `save()` refuses up front when the profile's own `provider` is
+not this cache's. Regression tests are in `test_p24_second_provider.py`.
+**No production provider was added and no plugin is declared supported.**
+
+### 30.8 The independent review (GLM-5.3 Flash), and what it changed
+
+The reviewer reproduced the round independently (637 offline tests at the time, its own
+fuzz of 135,600 conversion round trips over every converting control: 0 violations, the
+descending endpoints exact) and raised two MAJOR findings plus four MINOR ones. Every one
+was reproduced here before being accepted, and the accepted ones are fixed:
+
+| finding | reproduced as | disposition |
+|---|---|---|
+| **M1** `enum_declaration_overridden_valid` promised "a real range" but never checked one: a self-consistent corrupt entry with `range: null` validated **ok** and the loader treats only `rebuild_required`/`cacheable`, so it was served as a hit - and `display_to_write_space(control, 4095.5)` then plans `normalized: 4095.5` | own script, cache-shaped profile | **fixed**: the row now requires a usable range (`min < max`, both finite) and raises it as `refuse_rebuild` (the kind the loader honours); the regression test also drives the *load* path to a quarantine |
+| **M2** `artifact_confirmation` was attached even when the artifact measured **nothing**: 256 `unresolved` transitions produced `state: "continuous_display"`, `transitions_measured: 256` and the note "the host printed a value between adjacent members at every measured transition" | own script, fixture artifact flipped | **fixed**: the confirmation requires *every* transition to be `continuous_display`; otherwise it is **withheld** and named (`confirmations_withheld`, with the reason and the measured count). The real artifact is unaffected: all 5,120 ramp transitions are `continuous_display`, so `confirmations_withheld` is 0 in the served profile |
+| **m1** a Task-B assertion compared a digest against a literal (`!= "0"*64`) - true for any digest, so the intent "rewriting a source file moves the key" was never asserted | own run | **fixed**: it compares against the previous material's digest, and also asserts the key moved |
+| **m2** the Task-B fixture rewrite restored the file with `write_text` (line-end translation on Windows) - a text round trip is only byte-preserving by accident of the file's current convention, and the file is untracked | own run | **fixed**: `read_bytes`/`write_bytes` and an explicit byte-equality assertion; both fixtures verified unchanged (digests `241f6a03...`, `78cb2214...`) |
+| **m3** two of the 20 (`effect_chain_order`, `sample_transpose_quantize`) never printed a fraction at 70 arbitrary points: they are integer ladders, yet the model is a continuous affine law, and the probe's round trips could not have caught it (the sampled values are integers) | own run of the new evidence | **documented, not guessed**: the field that exists (`law.params.sampled_display.printed_values_are_integers`) describes the *sweep's samples*, not the display's resolution; what the host *stores* for a fractional request needs a marked live write, which this round forbids. Named in 30.11 |
+| **m4** the range census compared declared `min` against the host's print at normalized 0 - wrong for a **descending** law, so all 7 ratio rows were counted as disagreements; the comment above it carried a stale count | own run | **fixed**: the census compares in each control's own orientation and records `direction`/`compared` per row; re-run: **452 checked, 349 agree, 103 disagree** (the 7 descending rows were artefacts of the old comparison) |
+| **n1** `_exact_sampled_positions` checked the grid as a *set* but paired the entries in their recorded order - a permuted entries list would pair displays with other states' positions | read | **fixed**: the stored positions must be strictly ascending as recorded |
+| **n2** the r11 comment claimed the buffer would otherwise be served stale | read | **corrected**: the key also covers the provider's own source files, so the code edit alone moves the key; the revision is what *declares* the semantics generation |
+| **n3** `if True:` scaffolding in `cache.py` | `git show HEAD:` | **pre-existing** (present at HEAD and in the staged index), left alone |
+| **n4** `controls_confirmed: 0` on every fresh build | read | **pre-existing P23 behaviour**: the fresh build's 9-decimal switch points differ from the artifact's full-precision ones, so all 322 measured enums count as *refined*; `positions_moved` stays 0 |
+
+### 30.9 Cache invalidation: the revision had to move (r10 -> r11)
+
+The 20 controls changed *meaning* at an unchanged identity, and `ProfileCache`
+validates a stored entry against **itself** (its own content hash and counts) and the
+live identity - never against a fresh build. `IMPLEMENTATION_REVISION` therefore moved
+to `vital-provider-2026.10-r11` (the determinant the cache's key is built from, and the
+one a reader can see without diffing code). Measured live, in a **temporary** cache
+directory (`tests/plugins/live/probe_p24_warm_revision.py`): the cold call is
+`source=built` and the saved entry's `provenance.provider_revision` is `r11`; the warm
+call is `source=cache, built=false`; the r10 key (`fe5f10c9...`) and the r11 key
+(`9709316d...`) differ, the served key is the r11 one, and the r10 file is neither
+addressed nor touched.
+
+### 30.10 Coverage, cost, and the tests actually run
+
+* Coverage in the profile a real installation serves (registry + both artifacts): 452
+  numbers, **0 without a range**, 272 without a unit, 12 with `weak` evidence. The
+  registry-only build - the fallback a machine with no preparation artifact gets - is
+  the one `test_p21_profile_completeness.py` pins (157 range-less rows, 36 weak); it is
+  a different configuration, not a different measurement.
+* The declared-range census, live: of 452 declared ranges, **349 agree** with the
+  host's own display endpoints and **103 disagree** beyond the display's own resolution
+  (e.g. `filter_1_cutoff` declared 8..136 semitones, displays -52..140; `chorus_delay_1`
+  declared -10..-5.64, displays 0.977..20 ms). All 103 are `affine` and none are
+  descending - a **pre-existing class** (a range taken from the preset corpus truncates
+  a parameter at the largest value any preset used), measured and recorded so the next
+  round has the list instead of the question.
+* Tests: **639 passed** offline (`tests/plugins`, `--ignore=tests/plugins/live`) and
+  **20 passed** for the repo-level regressions (`test_midi_mock.py`,
+  `test_controller_structure.py`, `test_reaper_dialogs.py`). New: 33 in
+  `test_p24_continuous_controls.py`, 5 in `test_p24_unlabelled_states.py`, 9 in
+  `test_p24_second_provider.py`.
+
+### 30.11 Residual gaps (named)
+
+- **Two integer ladders have no *storage* measurement.** `effect_chain_order` and
+  `sample_transpose_quantize` never printed a fraction at 70 arbitrary values each
+  while the model is a continuous affine law; a fractional request therefore lands
+  somewhere inside one printed unit of the request, unmeasured. What would settle it is
+  a marked live write (owner-authorised), not another read.
+- **103 declared ranges disagree with the live display endpoints** (30.10). The write
+  path catches a wrong landing through verification, but the profile's own range is
+  still wrong for those rows; the fix is a calibration pass over the P22 artifact,
+  which already carries `first`/`last`/`samples`/`unit_token` per control.
+- **`bypass` still prints `0`/`60` while its members are `normal`/`bypassed`**, so its
+  1 transition remains `unresolved` and the merge refuses it by name
+  (`not_every_transition_is_measured`); 1 of 323 enums therefore has no
+  `switch_points`/`positions`.
+- **The `%`-space trap is unchanged**: percent-displaying controls are still an
+  *evidence* row (`percentage_units_are_not_one_space`) with no conversion, because the
+  artifact has not measured which of them are percentages.
+- **`sampled_display.printed_values_are_integers` describes the sweep's samples, not
+  the display's resolution.** The name invites the stronger reading; the note beside it
+  says "the sweep's own samples are integers". A rename is a profile-content change and
+  was deliberately not taken at the end of a round.
+- **The confirmation covers transitions, not intervals**: 256 measured transitions
+  between 257 sampled positions confirm the *sampled grid*, and the probe's 64
+  non-grid points per control are what extend that to arbitrary values. An artifact
+  measured at fewer points would be weaker than it looks.
+
+### 30.12 Git state (recorded, not changed)
+
+- `HEAD` is `6d0ad25d2be3e3170ec122346bfb3e083d804313` (`Add comprehensive tests for P22
+  calibration and update cache schema version`, committed by the user at
+  2026-10-12 00:30:57 +0200) - unchanged by this round.
+- **The index is no longer empty, and that is not this round's doing**: the user staged
+  30 files of the P21/P22/P23 work (status `M `/`A `, e.g.
+  `src/reaper_reapy_mcp/plugins/providers/vital/profile_build.py`,
+  `tests/plugins/live/evidence/p23_*.json`). P23's journal entry ("nothing staged") was
+  true when it was written. This round added **no** entry to the index: every P24 file
+  is untracked (`??`), and the files this round edited that the user had staged
+  (`profile_build.py`, `enum_boundaries.py`, `provider.py`, `profile.py`,
+  `test_p23_enum_boundaries.py`) carry the P24 changes in the **working tree only**, so
+  the index holds their P23 content.
+- **No** `git add`, `git commit`, `git reset`, `git stash`, `git checkout` or
+  `git restore` was run in this round (verified by searching the session transcript for
+  every terminal command containing them: the only hits are the diagnostic greps
+  themselves).
+- `composer_v1_2_lm_probe.md` was not read, changed, moved or deleted. The REAPER
+  project was **not saved**, and **no plugin parameter was written**: the P24 probes call
+  `TrackFX_FormatParamValueNormalized`, `TrackFX_GetParamNormalized`,
+  `TrackFX_GetFXName`, `TrackFX_GetNumParams` and `GetTrackStateChunk`, plus the
+  parameter reads inside `plugin_read`, and each capture proves watched values and state
+  chunk identical before and after.
+
+## 31. P25 - range integrity, the two integer ladders, and the unnamed states (2026-10-12)
+
+Task A was to check and fix the 103 declared ranges that disagreed with the live display;
+Task B to decide the model of two controls that never display a fraction
+(`effect_chain_order`, `sample_transpose_quantize`); Task C to settle the semantics of
+`bypass` and `filter_N_style` **if the evidence supports it**. The round's rule, taken
+from the brief: eliminate proven metadata errors and separate, in the record, a
+confirmed range from a displayed one from a real semantic from an unknown - not to fill
+fields.
+
+### 31.1 What the 103 "disagreements" were: one third of the answer is "not an error"
+
+The P24 census compared the number the host *prints* at normalized 0 and 1 against the
+number in `control["range"]`. Both are numbers; they are not always in the same space.
+Reading the plugin's own parameter table showed the profile's `range` is the **state
+space** the presets store, while the display is a transform of it: `value - 60`
+semitones for the filter/EQ cutoffs, `value * 100` percent for the mixes and pans,
+`2**value` seconds for the times (and `2**-value` where the direction inverts),
+`value**4` for the quartic envelope stages. Re-measured with float32-exact bounds and
+with the space question asked explicitly, the 103 split:
+
+- **51 rows**: the declared range **is** the plugin's own range; the census compared two
+  spaces (`filter_1_cutoff` 8..136 state = "-52 semitones".."76 semitones" displayed);
+- **52 rows**: the declared range was genuinely narrower than the parameter - a corpus
+  sample, not a bound.
+
+### 31.2 The instrument: the plugin's own table, checked against the live host
+
+`source_facts.py` carries what `mtytel/vital` declares (`synth_parameters.cpp`'s
+`ValueDetails` arrays and group expansion; `value_bridge.h`'s display model:
+`adjusted = norm*(max-min)+min`, `kIndexed` rounds, `text = display_multiply*skew(adjusted)
++ post_offset`, six significant digits, trimmed; `synth_strings.h`'s label tables).
+The source was **checked against the loaded plugin, not assumed**, because the public
+branch is not the released binary:
+
+| correspondence (450 numeric controls x 17 grid points) | result |
+| --- | --- |
+| samples compared | 7,650 |
+| texts identical | 7,565 |
+| same number, unit label differs | 85 (on 5 controls: `secs` vs `s` for four frequency rows, `cents` vs `c` for `voice_tune`) |
+| numbers differ | **0** |
+| controls the public branch does not declare | 3 (`osc_1..3_spectral_morph_phase` - the release has them) |
+
+### 31.3 Task A: what changed (70 ranges) and the rule it follows
+
+- **Rule: widen only.** `source_facts.widen_to_source_bounds(control_id, declared)`
+  returns a correction only when the declared range is a *strict subset* of the plugin's
+  bounds. Equal, wider, shifted and absent ranges return `None` and are left untouched.
+- **Scope: declared rows only.** A row whose law was fitted to the sweep or corrected by
+  a live measurement lives in the **display** space; comparing it against state-space
+  bounds would repeat the census's own mistake, so the correction runs only in the branch
+  where the registry's declared law/range is used. Of the 452 numeric controls, 225 are
+  state-space rows: **155 already equal** the plugin's bounds, **70 were strict subsets**,
+  **0 were wider or shifted**. The other 227 are display-space rows (fitted/live).
+- **Evidence per control** (`evidence.value_bounds`): `declared_before`,
+  `declared_after`, `widened` (which end moved), `why`, `source`, the registry's own
+  `fit` as corroboration (with `fit_units: "display space"` where the fit was taken in
+  display units - `sample_pan` -100..100 against a state range of -1..1), `evidence_level`
+  ("state-space bounds ... corroborated by the live formatter ... not a claim that writes
+  across the range were exercised"), and `value_space.display` (multiply/scale/invert/
+  post_offset + the source-computed text at both ends **and** the live text measured
+  there).
+- **Profile block** `value_bounds`: state, source, the correspondence counts, the rule,
+  the count and the list of the widened controls.
+- **Why it matters** (all measured): `lfo_1_frequency`'s own minimum `-7` (= 128 s)
+  mapped to normalized **-0.34** under the corpus range - outside the parameter;
+  `eq_high_cutoff`'s declared minimum 31.2 **refused the plugin's own 8**;
+  `sample_pan`'s declared cap 0.06 truncated the pan space to a third;
+  `modulation_NN_power`'s ranges were the extremes a handful of presets used against the
+  documented and source-declared -10..+10.
+- **Live oracle**: for all 70, the text the source computes at both extremes equals the
+  text the live host printed when the bound was measured (**70/70**), and equals it again
+  in this round's re-run (**70/70**); the only source-text difference is `voice_tune`'s
+  unit token (`cents` vs the release's `c`), which is named in the facts table.
+
+### 31.4 Task B: the two ladders - what the display could not decide, the source could
+
+The display never printed a fraction at 70 arbitrary points each, which is consistent
+with both "the display rounds" and "the engine quantises". The source settles it:
+both controls are `ValueDetails::kIndexed` over spans of 10,000s, so
+`ValueBridge::isDiscrete()` is false (it requires span < 300) - the plugin tells the host
+the parameter is *continuous*, which is why REAPER reports **no step**
+(`TrackFX_GetParameterStepSizes`: `reported: false`, step 0, for both) - while
+`convertToEngineValue` **rounds every value the host write channel stores**. A
+fractional request is therefore stored rounded, and the display rounds too. The chosen
+model is "numeric with proven discretisation", expressed with existing fields plus one
+law parameter:
+
+- `law.params.quantization = {step: 1.0, origin: 0.0, rounding: "half_away_from_zero"}`,
+  `discrete: true`, range unchanged (0..362879 = 9!-1 = the permutation index of the
+  nine effects; 0..8191);
+- `values._snap_to_grid` snaps **both** directions onto that grid (std::round's
+  halfway-away-from-zero), clamped to the grid within the range, so a read never reports
+  a value the plugin cannot hold and a write target is the number the plugin will store;
+- the round trip is therefore no longer the identity, by construction: normalized 0.5 on
+  `effect_chain_order` is state 181439.5, the engine holds **181440**, and reading that
+  back is 0.5000014 - the tests' tolerances say so instead of pretending otherwise;
+- **live (read-only)**: the normalized value the write conversion produces formats back
+  to exactly the asked state, **7/7** and **6/6** across the ladders including the top
+  (362879, 8191);
+- **what remains unknown**: an engine-set value does not pass through
+  `convertToEngineValue`; no fractional-reachable state was found, but nothing here was
+  written. A marked live write (owner-authorised) is the experiment that would close it;
+  its prediction is recorded (a write of normalized 0.5 must read back 181440/362879).
+
+### 31.5 Task C: `bypass` explained, and `filter_N_style` needs no dependency
+
+- **`bypass` prints `0`/`60` because its own table says so**: the row is
+  `{..., 0.0, 1.0, 0.0, 0.0, 60.0, kIndexed, false, "", "Bypass", nullptr}` - display =
+  value x 60, **no label table at all**. The words `normal`/`bypassed` come from the
+  registry's sweep channel, not from the plugin, and the profile now says exactly that
+  (`boundary_evidence.state_labels`: the source shape, the multiply, `string_lookup:
+  null`, the consequence, the live texts, the REAPER step channel that calls it a
+  two-state toggle, and `member_ids_source`). The transition stays `unresolved` **by
+  construction** - there is no state label to measure - not by a measurement gap.
+  Live: `0,0,0,60,60,60,60` across 0/0.25/0.49/0.5/0.51/0.75/1.0.
+- **`filter_N_style`'s five names are model-independent**: `value_bridge.h getText` uses
+  `kFilterStyleNames` unconditionally, so the *parameter's* text does not change with
+  `filter_N_model`; the model-dependent naming lives in the editor
+  (`filter_section.cpp getStyleName`, recorded per model: Analog/Dirty/Ladder/Digital 5,
+  Diode 2, Formant 3, Comb 6, Phase 2). **No contextual dependency is therefore needed**
+  in the profile - the enum's members and positions do not depend on another control -
+  and the semantics are recorded as a limitation rather than modelled.
+- **The release's span is 8, not the public branch's 9.** The public table declares
+  `style` over 0.0..9.0, which would put the first label change at 1/18 = 0.0556; P23's
+  ULP bisection put it at 0.0625 - 2^-29, i.e. (k+0.5)/8. This round re-decided it with
+  its own discriminating experiment (a probe *between* the two candidates): at
+  normalized 0.058 and 0.06 the host prints **"12dB"**, where a span of 9 predicts
+  "24dB". The facts carry `parameter_bounds {0, 8}` and `public_source_bounds {0, 9}`
+  with the reason; the profile's own measured `switch_points` already were the span-8
+  boundaries (P23 measured them live), so nothing in the enum geometry changed.
+- **The unnamed band prints nothing**: the region from 0.5625 (indices 5..8, past a
+  five-entry table) formats as an empty string, live, on all three filter styles.
+
+### 31.6 The percent trap: a defect the range work exposed
+
+`unit_trap` refused `1.0` on any `%`-unit control as "1 percent". For the **27** controls
+whose declared range proves a *fraction* space (every bound within 1.0 - the plugin
+multiplies by 100 only for the display) that refusal was wrong: `1.0` is the top of the
+range, and a caller writing "full mix" got a refusal while `0.999` was accepted. The trap
+now fires only where the range proves a percent space (bounds beyond 1, e.g.
+`filter_1_keytrack` -100..100, still refused), and keeps firing when no range can prove
+either space - unchanged behaviour in both of those cases. Live: the write conversion of
+`1.0` on six fraction-space controls formats as **"100%"** (6/6).
+
+### 31.7 Cache invalidation: revision r11 -> r12
+
+Ranges are part of what a profile *means*, and `source_facts.py` is now in
+`_PROVIDER_FILES` (the artifact digest hashes it), so the key moves twice over; the
+revision `vital-provider-2026.10-r12` is the determinant a reader can see without
+diffing code. A stale r11 entry is not served and not touched (test:
+`test_the_change_moves_the_provider_revision_and_therefore_the_cache_key`).
+
+### 31.8 The independent review (GLM-5.3 Flash), and what it changed
+
+The reviewer re-pulled the source, re-derived the 225-row partition independently
+(155/70/0/0, "0 declared truncations escaped the widening", 1190/1190 formatter
+agreement through the recorded transform) and produced four findings; every one was
+reproduced locally before being accepted:
+
+| finding | reproduced how | outcome |
+| --- | --- | --- |
+| **F1 (MEDIUM-LOW)**: two fail-open branches in the new `value_bounds` validator row | a self-consistent entry with a tampered `range` (-999..999) validated **`ok`** and loaded as a **cache hit**; an unreadable `declared_before` produced a plain error, also a hit | **fixed**: both branches are `refuse_rebuild`, plus a new check that the control's `range` equals the record's `declared_after`; tests cover both, and the loader quarantines the tampered entry (reproduced before and after: `hit` -> `refused/profile_invalid`) |
+| **F2 (LOW)**: the cited evidence file's span discriminator was **vacuous** (both probe points fall on the same side under either span) | opened both runs: the cited `110104Z` probes 0.0555/0.0625 (same prediction under span 8 and 9); the deciding rows are in `110127Z` (0.058/0.06) | **accepted**: the authoritative evidence is `p25_range_acceptance__20261012T110127Z__7ba5826e08c7.json`; `110032Z` (no discriminator) and `110104Z` are retained as run history and named as superseded here |
+| **F3 (LOW)**: a stale count in a comment ("45 of 103") | re-measured: 51 spaces / 52 truncations | **fixed** to 51 |
+| **F4 (INFO, latent)**: `_snap_to_grid` clamps into the grid ∩ range while the plugin's own conversion does not clamp; for a range whose ends are not on the declared grid the two would disagree about the first step | constructed a control with `origin 0.3`: today's code snaps a first-step request up to 1.0 | **fixed as a precondition**: a validator row refuses a declared grid the range does not sit on (`law_quantization_valid`, `refuse_rebuild`); both ladders are 0-aligned and unaffected |
+| **F5 (INFO)**: "every value the engine holds is an integer" is one channel wider than the source proves | source read: `setValue` rounds; an engine-set value bypasses it | **fixed in wording** (facts + comments + tests now scope the claim to the host write channel) |
+
+The reviewer also observed a one-off `test_p4_cache.py::test_b55_foreign_file_*` failure
+in a full-suite run that did not reproduce standalone or on re-runs (672 passed both
+times here). It is not P25-scoped and is recorded as unexplained.
+
+### 31.9 Live acceptance (read-only), and what the warm path pays
+
+`probe_p25_range_acceptance.py` (read-only: formats doubles the caller passes; watched
+normalized values and the track-state-chunk sha256 are identical before and after;
+`writes_attempted: 0`), evidence
+`p25_range_acceptance__20261012T110127Z__7ba5826e08c7.json`:
+
+| check | result |
+| --- | --- |
+| the 70 widened ranges at both extremes, host text vs the recorded live text | **70/70** |
+| ... vs the source-computed text | 69/70 (the 1 is `voice_tune`'s named unit drift) |
+| the profile's range vs the fact table | 70/70 |
+| `1.0` on six fraction-space controls (the trap) | 6/6 -> the host prints **"100%"** |
+| ladder write conversions format back to the asked state | **7/7** and **6/6** |
+| `bypass` at 7 points | `0,0,0,60,60,60,60` |
+| the styles' five named bands | 5/5 per control, and the unnamed band prints `""` |
+| the span discriminator (0.058, 0.06) | **"12dB"** -> span **8** |
+
+The warm path is untouched: this round changes profile *content* and two `values`
+functions; nothing new runs at preload or on a cache hit (the P21/P23 tests that pin
+"warm call builds 0 / reads 0" still pass).
+
+### 31.10 Tests actually run
+
+- `py -3.11 -m pytest tests/plugins -q -p no:cacheprovider --ignore=tests/plugins/live`
+  -> **672 passed** (33 of them new in `test_p25_value_bounds.py`; the +2 over the
+  pre-review 670 are the F1/F4 regressions).
+- `py -3.11 -m pytest tests/test_midi_mock.py tests/test_controller_structure.py
+  tests/test_reaper_dialogs.py -q` -> **20 passed**.
+- Updated pins that this round deliberately moved: `artifact_paths()` 8 -> **9** (the new
+  module must be key material), the two ladders may be `discrete` **with** a grid (the
+  other eighteen ramps must not), a quantized control's round trip is allowed half a step,
+  and a declared range may differ from the declaration **only** by the fact-table
+  widening.
+- `tests/plugins/live/probe_p25_range_acceptance.py` (live, read-only) -> see 31.9.
+
+### 31.11 Residual gaps (named)
+
+- **The 227 display-space rows** (sweep-fitted or live-corrected) are validated against
+  the display channel, not against the source's state bounds; naming them is not the
+  same as verifying them, and the source *could* be used to re-derive their spans as a
+  future step.
+- **The ladder write experiment is not run** (no writes this round): the prediction is
+  recorded, the authorisation is not.
+- **An engine-set value** (outside the host write channel) was not probed.
+- **The release-vs-public-source deltas** beyond the five named unit strings and the
+  three missing parameters are unbounded by construction: the correspondence measurement
+  (450 controls x 17 points) is what bounds them, and it is a *sample* of the surface,
+  not a proof about the binary.
+- **`sampled_display.printed_values_are_integers`** still describes the sweep's samples,
+  not the display's resolution; the name is still deferred (a profile-content rename).
+- **The one-off `test_p4_cache` b55 failure** the reviewer saw did not reproduce.
+
+### 31.12 Git state (recorded, not changed)
+
+- `HEAD` is `6d0ad25d2be3e3170ec122346bfb3e083d804313` - unchanged by this round, and the
+  user's 30 staged files from the P21-P23 work are unchanged in count and content (index
+  left untouched: no `git add`, `git commit`, `git reset`, `git stash`, `git checkout` or
+  `git restore` was run - verified by searching the session transcript for every terminal
+  command containing them).
+- New files this round (untracked): `source_facts.py`,
+  `tests/plugins/test_p25_value_bounds.py`,
+  `tests/plugins/live/probe_p25_range_acceptance.py`, and the three
+  `p25_range_acceptance__*.json` evidence runs.
+- Edited working files (their staged P23/P24 content in the index is untouched):
+  `profile_build.py`, `values.py`, `profile.py`, `enum_boundaries.py`, `provider.py`,
+  `test_p16_measured_laws.py`, `test_p24_continuous_controls.py`, `test_p7_vital.py`,
+  `test_p7_isolation.py`, this journal and the register.
+- `composer_v1_2_lm_probe.md` was not read, changed, moved or deleted. The REAPER project
+  was **not saved** and **no parameter was written**: every probe call this round formats
+  a double the caller passes, and each capture proves the watched values and the state
+  chunk digest identical before and after.

@@ -1,0 +1,12 @@
+{
+  "_fixture": {
+    "kind": "second-provider-notes",
+    "synthetic": true,
+    "note": "The second source file of the second provider, so its provenance has more than one row and its `source_digest` is a digest over a *set* - the shape the shared cache key must handle for any provider."
+  },
+  "parameter_declaration": {
+    "shape": {"min": 0.0, "max": 3.0, "kind": "indexed", "names": ["Soft", "Hard", "Fold"]},
+    "note": "four states declared, three names given - the fourth prints nothing"
+  },
+  "measured_on": {"host": "reaper", "evidence": ["second_registry.json"], "synthetic": true}
+}

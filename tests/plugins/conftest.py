@@ -23,13 +23,15 @@ import pytest
 #: override points at a file that does not exist, so a machine whose user-local
 #: preview directory holds a real artifact cannot change an offline result. Tests
 #: that exercise calibration pass an explicit `calibration_path=` (the pinned
-#: fixture) or their own environment mapping.
+#: fixture) or their own environment mapping. The measured enum-boundary artifact
+#: gets the same treatment for the same reason.
 _CALIBRATION_OFF = str(Path(__file__).resolve().parent / "fixtures" / "no_calibration_configured.json")
 
 
 @pytest.fixture(autouse=True)
 def _pin_offline_calibration(monkeypatch):
     monkeypatch.setenv("REAPER_MCP_VITAL_CALIBRATION", _CALIBRATION_OFF)
+    monkeypatch.setenv("REAPER_MCP_VITAL_ENUM_BOUNDARIES", _CALIBRATION_OFF)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"

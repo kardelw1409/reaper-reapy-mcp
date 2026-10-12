@@ -48,6 +48,7 @@ from ...model import (
 )
 from ...provider import DependencyRuleSet
 from . import calibration as calibration_module
+from . import enum_boundaries as enum_boundaries_module
 from . import codec as codec_module
 from . import dependencies_rules as rules_module
 from . import depth as depth_module
@@ -94,7 +95,42 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: derived from a measured sweep, units filled from the host's own formatted text,
 #: per-state law confirmations, host step/toggle metadata, and `law_candidate`
 #: records for sweeps a law nearly fits. The profile schema moves to 2 with it.
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r8"
+#: r9 (2026-10-11): the **measured enum band boundaries** - a second preparation
+#: artifact (also a declared source) holding, per enum control, the boundary
+#: between each adjacent pair of printed states located through the read-only host
+#: formatter on arbitrary normalized values. `switch_points`/`positions` now come
+#: from that measurement for every enum whose bands were measurable, with the
+#: evidence level attached; controls whose display turned out to be a ramp
+#: (no band structure) and controls whose members the host never prints are named
+#: instead of being given an invented map.
+#: r10 (2026-10-12): the measured bands are carried with the profile
+#: (`boundary_evidence.band_ends`), the merge refuses a control whose write target
+#: could fall outside its own band or whose band *interiors* the measurement did not
+#: confirm, a `confirmed_within` bracket must contain the profile's boundary, and the
+#: profiler's `positions`/`switch_points` values are validated against the bands.
+#: r11 (2026-10-12): a declared `enum_index` whose *measured* display changes at every
+#: swept position and follows one numeric law is served as a **number** with that law
+#: (20 controls), the law is fitted at the sweep's own stored positions with the
+#: float32 storage term in the budget (the four `random_N_frequency` ratios), and the
+#: enum-boundaries merge records `enum_declaration_overridden` / withholds a
+#: confirmation the artifact did not measure / refuses a numeric model the artifact
+#: contradicts. The profile for those controls therefore *changes meaning* at an
+#: unchanged identity, and the key must move with the semantics (07 §3.4) - as r7 put
+#: it. (The key would also move on its own: `provider_artifact_digest` hashes this
+#: provider's own source files, so an edit to the builder is key material too. The
+#: revision is what *declares* the semantics generation, and it is the determinant a
+#: reader can see without diffing the code.)
+#: r12 (2026-10-12): **range integrity** - the plugin's own parameter table
+#: (`source_facts.py`, verified against the live host formatter on 7,650 samples)
+#: replaces a declared range wherever a 900-preset corpus range truncated the
+#: parameter (70 controls; widen only, never narrow or shift, with the before/after
+#: and the display transform in `evidence.value_bounds` and the counts in the
+#: profile's `value_bounds` block). Two integer ladders (`effect_chain_order`,
+#: `sample_transpose_quantize`) gain their proven engine step, which the core applies
+#: in both conversion directions, and the percent-unit trap no longer fires on a
+#: **fraction** value space whose `%` is only the display's unit. Ranges are part of
+#: what a stored profile means, so the key must move (07 §3.4).
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r12"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -103,6 +139,8 @@ _PROVIDER_FILES = (
     "dependencies_rules.py",
     "depth.py",
     "calibration.py",
+    "enum_boundaries.py",
+    "source_facts.py",
     "__init__.py",
 )
 
@@ -121,11 +159,13 @@ class VitalProvider:
         registry: VitalRegistry | None = None,
         registry_dir: str | None = None,
         calibration_path: str | None = None,
+        enum_boundaries_path: str | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self._registry = registry
         self._registry_dir = registry_dir
         self._calibration_path = calibration_path
+        self._enum_boundaries_path = enum_boundaries_path
         self._env = env
         self._last_profile: dict[str, Any] | None = None
         self._timing = TimingProfile(settle_s=0.4, retry_after_s=2.0, retry_count=1, timeout_s=20.0)
@@ -181,6 +221,9 @@ class VitalProvider:
         calibration_row = self._calibration_source_row()
         if calibration_row is not None:
             rows.append(calibration_row)
+        enum_row = self._enum_boundaries_source_row()
+        if enum_row is not None:
+            rows.append(enum_row)
         return rows
 
     def calibration_artifact_path(self) -> str | None:
@@ -227,6 +270,34 @@ class VitalProvider:
         # hashed in chunks: the key must include the artifact's bytes even when a
         # malformed artifact is huge, and the fast path must not read it into memory
         # to do so (the loader, which does decode, has its own size bound)
+        return {"file": candidate.name, "sha256": digest.hexdigest()}
+
+    def enum_boundaries_artifact_path(self) -> str | None:
+        """The resolved measured-boundaries path (explicit > env > user-local default)."""
+        return enum_boundaries_module.resolve_enum_boundaries_path(
+            self._enum_boundaries_path, self._env
+        )
+
+    def enum_boundaries_configured(self) -> bool:
+        """Whether a measured-boundaries artifact was *asked for* (see `calibration_configured`)."""
+        if self._enum_boundaries_path is not None:
+            return True
+        environ = os.environ if self._env is None else self._env
+        return environ.get(enum_boundaries_module.ENUM_BOUNDARIES_ENV) is not None
+
+    def _enum_boundaries_source_row(self) -> dict[str, Any] | None:
+        """The boundaries artifact's hash, or ``None`` when no usable file exists."""
+        path = self.enum_boundaries_artifact_path()
+        if not path:
+            return None
+        candidate = Path(path)
+        try:
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
         return {"file": candidate.name, "sha256": digest.hexdigest()}
 
     def adopt_profile(self, profile: Mapping[str, Any]) -> None:
@@ -330,12 +401,39 @@ class VitalProvider:
                             "the artifact was measured on a different build than this "
                             "identity; nothing was applied"
                         )
+
+        enum_row = self._enum_boundaries_source_row()
+        enum_boundaries = None
+        enum_note: str | None = None
+        boundaries_path = self.enum_boundaries_artifact_path()
+        if boundaries_path:
+            if enum_row is None:
+                if self.enum_boundaries_configured():
+                    enum_note = (
+                        "the configured enum-boundary artifact is not readable; nothing was applied"
+                    )
+            else:
+                try:
+                    loaded_boundaries = enum_boundaries_module.load_enum_boundaries(boundaries_path)
+                except PluginError as exc:
+                    enum_note = f"{exc.code}: {exc.message}"
+                else:
+                    if loaded_boundaries.matches_identity(identity):
+                        enum_boundaries = loaded_boundaries
+                    else:
+                        enum_note = (
+                            "the artifact was measured on a different build than this "
+                            "identity; nothing was applied"
+                        )
         profile = build_profile(
             self.registry(),
             identity,
             calibration=calibration,
             calibration_row=row,
             calibration_note=note,
+            enum_boundaries=enum_boundaries,
+            enum_boundaries_row=enum_row,
+            enum_boundaries_note=enum_note,
         )
         self._last_profile = profile
         return profile

@@ -43,6 +43,7 @@ from reaper_reapy_mcp.plugins import cache as cache_module
 from reaper_reapy_mcp.plugins import profile as profile_module
 from reaper_reapy_mcp.plugins import values as V
 from reaper_reapy_mcp.plugins.errors import InvalidValue, NoConversion, PluginError
+from reaper_reapy_mcp.plugins.providers.vital import source_facts as SF
 from reaper_reapy_mcp.plugins.providers.vital import (
     DEFAULT_REGISTRY_DIR,
     VitalProvider,
@@ -319,7 +320,15 @@ def test_every_control_converts_inside_the_unit_interval(real_profile):
                     problems.append(f"{control['id']} native {norm} -> {native}")
                     continue
                 back = V.to_normalized(control, native)
-                if not math.isfinite(back) or abs(back - norm) > 1e-6:
+                # A control whose engine stores a *step* cannot round trip to the
+                # identity: norm 0.5 on a 0..362879 ladder is state 181439.5, the
+                # engine holds 181440, and reading that back is 0.5000014 (P25). Half
+                # a step in normalized units is the honest tolerance.
+                grid = (control["law"].get("params") or {}).get("quantization")
+                step = float(grid["step"]) if isinstance(grid, dict) else 0.0
+                span = float(bounds["max"]) - float(bounds["min"])
+                tolerance = 1e-6 + (0.5 * step / span if step > 0.0 and span > 0.0 else 0.0)
+                if not math.isfinite(back) or abs(back - norm) > tolerance:
                     problems.append(f"{control['id']} round trip {norm} -> {back}")
         except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
             problems.append(f"{control['id']} raised {type(exc).__name__}: {exc}")
@@ -337,10 +346,9 @@ def test_descending_displays_are_now_measured_laws_and_round_trip(real_profile):
     runs in spine space, so the range keeps `min <= max` as numeric extremes.
 
     Three controls derive; one does not, and the reason is a measurement, not a
-    gap: `random_N_frequency`'s exponential is anchored on printed endpoints
-    (``0.00195312`` for 2**-9) and lands within 5.7e-6 *relative* of every state
-    but outside each state's printed precision at the large end - so it stays
-    refused with a `law_candidate` recording the miss.
+    gap: since P24 (2026-10-12) all four derive - the P22 refusal was an
+    instrument-model artefact (the fit was judged at the sweep's stored positions
+    and the budget did not carry the float32 storage rounding); see the block below.
     """
     controls = {control["id"]: control for control in real_profile["controls"]}
     derived = {
@@ -372,17 +380,38 @@ def test_descending_displays_are_now_measured_laws_and_round_trip(real_profile):
     assert members[:2] == ["4/1", "2/1"] and members[-1] == "1/64", members
     assert len(tempo["law"]["params"]["positions"]) == len(members)
 
-    # the four that remain refused carry a named candidate instead of silence
+    # the four that were refused until P24 now carry the measured ratio law:
+    # the display is the *period* of an exponential frequency, 16 octaves across the
+    # normalized range (2**16 ratio between the endpoints, measured to 1e-6 of an
+    # octave). They were refused because the endpoint-anchored exponential was
+    # judged at the sweep's *stored* positions (rounded to six decimals) rather
+    # than the grid it sampled - at the steep end that rounding is worth 11x the
+    # state's printed precision. The x is now recovered (`_exact_sampled_positions`)
+    # and the budget carries half a float32 ulp (the plugin prints a 32-bit float),
+    # so every one of the 257 states is inside its own bound.
     for cid in ("random_1_frequency", "random_2_frequency", "random_3_frequency", "random_4_frequency"):
         control = controls[cid]
-        assert control["law"]["kind"] == "none", (cid, control["law"])
-        candidate = control.get("law_candidate")
-        assert candidate and candidate["kind"] == "exponential", (cid, candidate)
-        assert candidate["direction"] == "descending", (cid, candidate)
-        assert candidate["worst_state"]["ratio"] > 1.0, (cid, candidate)
-        # and the candidate must NOT have been installed
-        with pytest.raises(V.NoConversion):
-            V.to_native(control, float(control["law_candidate"]["range"]["max"]))
+        law = control["law"]
+        params = law.get("params") or {}
+        assert law["kind"] == "exponential", (cid, law)
+        assert params.get("direction") == "descending", (cid, params)
+        assert control.get("law_candidate") is None, (cid, "the law is installed, not a diagnosis")
+        low, high = control["range"]["min"], control["range"]["max"]
+        assert (low, high) == (0.00195312, 128.0), (cid, control["range"])
+        # the ratio is 16 octaves - to the precision the *printed* endpoints can
+        # carry: 0.00195312 is the six-digit print of 2**-9, so the ratio is known to
+        # about 4e-6 of an octave (and the law encodes exactly the endpoints it was
+        # given, which is why the round trip below is exact at both ends)
+        assert abs(math.log2(high / low) - 16.0) <= 5e-6, (cid, math.log2(high / low))
+        assert math.isclose(math.log2(high / low), 16.0, abs_tol=5e-6), cid
+        assert float(params["fit_residual_ratio"]) < 1.0, (cid, params)
+        for norm in (0.0, 0.25, 0.5, 0.75, 1.0):
+            native = V.normalized_to_native(control, norm)
+            assert abs(V.to_normalized(control, native) - norm) < 1e-6, (cid, norm)
+        assert float(V.normalized_to_native(control, 0.0)) == high, cid
+        assert float(V.normalized_to_native(control, 1.0)) == low, cid
+        # and a write is accepted through the ordinary path (no special case)
+        assert 0.0 <= float(V.to_normalized(control, 1.0)) <= 1.0, cid
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +453,7 @@ def test_declared_laws_are_not_re_derived(real_profile):
     re_derived: set[str] = set()
     corrected: set[str] = set()
     positions_corrected: set[str] = set()
+    ramps: set[str] = set()
     for row in registry.rows():
         control_id = row.get("state_key")
         if not control_id or row.get("kind") not in ("affine", "enum_index"):
@@ -443,16 +473,58 @@ def test_declared_laws_are_not_re_derived(real_profile):
             assert (control["law"]["params"] or {}).get("positions"), control_id
             positions_corrected.add(str(control_id))
             continue
+        # The fourth exception (P24, 2026-10-12): a declared ``enum_index`` whose
+        # sweep changed at *every* step it walked, with a faithful monotone number
+        # at each position and a numeric law accepted - i.e. the member list was a
+        # sampling grid. The declared ``pitch_bend_range`` (49 integers over a
+        # 256-step sweep) and ``oversampling`` (4) do NOT qualify: their displays
+        # hold still between changes, which is what a member set does.
+        override = (control.get("evidence") or {}).get("enum_declaration_overridden")
+        if override:
+            assert row["kind"] == "enum_index", control_id
+            assert override["declared_kind"] == "enum_index", control_id
+            assert control["type"] == "number", control_id
+            assert control["law"]["kind"] in ("affine", "power", "exponential"), control_id
+            assert control.get("enum_values") is None, control_id
+            # P25: two of the twenty are integer ladders (`ValueDetails::kIndexed`,
+            # whose engine rounds every set), so *they* are discrete and carry the
+            # storage grid; the other eighteen are continuous ramps.
+            if str(control_id) in SF.INTEGER_LADDERS:
+                assert control["discrete"] is True, control_id
+                assert (control["law"]["params"] or {}).get("quantization"), control_id
+            else:
+                assert control["discrete"] is False, control_id
+            assert override["measured_states"] == override["declared_members"], control_id
+            assert "strictly" in str(override["measured_display"]), control_id
+            ramps.add(str(control_id))
+            continue
         assert control["law"]["kind"] == row["kind"], control_id
         if derived_markers & set(control["law"]["params"]):
             assert control["range"] is not None, control_id
             re_derived.add(str(control_id))
         else:
-            assert control["range"] == _declared_range(row), control_id
+            # P25: a declared range may differ from the declaration *only* by the
+            # fact-table widening (the plugin's own parameter bounds), and nothing
+            # else.
+            declared = _declared_range(row)
+            bounds = SF.widen_to_source_bounds(str(control_id), declared)
+            expected = {"min": bounds["min"], "max": bounds["max"]} if bounds else declared
+            assert control["range"] == expected, control_id
     assert corrected == set(LIVE_MEASURED_CORRECTIONS), sorted(corrected ^ set(LIVE_MEASURED_CORRECTIONS))
     assert positions_corrected == {"filter_1_style", "filter_2_style", "filter_fx_style"}, sorted(
         positions_corrected
     )
+    # the measured set of converted declarations: the twenty controls whose display
+    # changed at all 256 swept steps (pinned, not derived - a new conversion must be
+    # a deliberate edit here, and ``pitch_bend_range``/``oversampling`` must stay out)
+    assert ramps == {
+        "distortion_filter_blend", "effect_chain_order", "filter_1_blend", "filter_1_drive",
+        "filter_2_blend", "filter_2_drive", "filter_fx_blend", "filter_fx_drive",
+        "lfo_1_phase", "lfo_2_phase", "lfo_3_phase", "lfo_4_phase", "lfo_5_phase",
+        "lfo_6_phase", "lfo_7_phase", "lfo_8_phase", "mod_wheel", "reverb_delay",
+        "reverb_pre_low_cutoff", "sample_transpose_quantize",
+    }, sorted(ramps)
+    assert "pitch_bend_range" not in ramps and "oversampling" not in ramps
     expected_re_derived = {
         str(row["state_key"])
         for row in registry.rows()

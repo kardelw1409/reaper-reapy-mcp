@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -99,6 +100,19 @@ class VitalRegistry:
 
     def scales(self) -> dict[str, Any]:
         return dict((self.data.get("laws") or {}).get("scales") or {})
+
+    def sweep_steps(self) -> int | None:
+        """How many steps the registry's sweep walked (``vital_scales_full.json``).
+
+        The file records it (`steps: 256`, so 257 sampled positions) and the number
+        is the structural evidence `_sampled_ramp` needs: a control whose display
+        changed at *every* step is a ramp, one that changed at 49 of 256 is a
+        banded member set. Absent (a foreign registry), the predicate declines.
+        """
+        steps = (self.data.get("laws") or {}).get("steps")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            return None
+        return int(steps)
 
     def vocabulary(self) -> dict[str, Any]:
         return dict(self.data.get("capabilities") or {})
@@ -339,6 +353,19 @@ _MAX_DERIVED_ENUM_MEMBERS = 40
 #: stores 0.0117188 for 3/256 and the uniform arithmetic asks for 0.01171875.
 _SWEEP_NORMALIZED_TOLERANCE = 1e-5
 
+#: The resolution the sweep writes its *positions* at (measured 2026-10-12: six
+#: decimals - 1/256 is stored as ``0.003906``). What it costs the fit is not a
+#: tolerance but a *measurement*: the sweep is a uniform grid of ``n`` points and
+#: the file stores each one rounded, so the position the display was produced at
+#: is recoverable exactly (``_exact_sampled_positions``) - where the stored
+#: rounding is used as if it were the position, a steep law is measurably wrong.
+#: Measured: on ``random_1_frequency`` (the 2**16 ratio law, 128 s ->
+#: 0.00195312 s) the steep end moves by ``128 * 16 * ln(2) * 5e-7 = 5.5e-4`` -
+#: 11x the state's printed precision, and enough to refuse a law every one of the
+#: 257 states obeys.
+_SWEEP_POSITION_DECIMALS = 6
+_SWEEP_POSITION_QUANTUM = 10.0 ** (-_SWEEP_POSITION_DECIMALS)
+
 #: What may follow a number in a *faithful* numeric display: one unit-like token
 #: (letters, or the micro/degree/percent/hash signs) and nothing else. ``"/2"``,
 #: ``"x Octave"`` and ``" of 16"`` are labels wearing a number, not a numeric
@@ -427,22 +454,251 @@ def _worst_fit_ratio(
     predict: Any,
     oriented: list[tuple[float, float, float]],
     floor: float,
-) -> tuple[float, float]:
-    """``(worst absolute residual, worst residual / that state's own bound)``.
+    storage_term: float = 0.0,
+) -> tuple[float, float, float]:
+    """``(worst residual, worst residual / its own bound, the largest bound)``.
 
     Each state is judged against **its own** reading resolution (never below the
     half-step floor, so every row that was accepted before stays accepted), and
     the ratio is what the profile records: it says how close to the instrument's
     limit the fit is, which an absolute residual cannot express across decades.
+
+    Two further terms the display's *text* carries are added by the caller:
+    ``storage_term`` (half a float32 ulp - the plugin stores a 32-bit float and
+    the sweep's text is a print of it, measured 2026-10-12) and the position the
+    text was produced at, which `_exact_sampled_positions` recovers rather than
+    approximating. Without the storage term a state can miss by 0.5 print
+    quanta *plus* the storage rounding and be refused for the instrument's own
+    arithmetic: measured on ``random_1_frequency`` (worst ratio 1.0754 with 1 of
+    257 states over, at a state whose position is exact).
     """
     worst_abs = 0.0
     worst_ratio = 0.0
+    worst_bound = 0.0
     for norm, value, precision in oriented:
+        bound = max(precision, floor, 1e-15) + storage_term
         residual = abs(value - predict(norm))
-        bound = max(precision, floor, 1e-15)
         worst_abs = max(worst_abs, residual)
         worst_ratio = max(worst_ratio, residual / bound)
-    return worst_abs, worst_ratio
+        worst_bound = max(worst_bound, bound)
+    return worst_abs, worst_ratio, worst_bound
+
+
+#: A VST3 parameter is a 32-bit float and the plugin's displayed value is a print
+#: of one: rounding the *true* value onto the float32 grid costs up to half an ulp,
+#: which the printed precision does not cover. Measured 2026-10-12 on
+#: ``random_1_frequency``: the state that missed by 7.5 % of its budget is explained
+#: by exactly this term plus the print's own half quantum.
+_FLOAT32_MANTISSA_BITS = 24
+
+
+def _float32_ulp(value: float) -> float:
+    """The spacing of the float32 grid at ``value`` (0.0 for a non-finite input)."""
+    magnitude = abs(float(value))
+    if not math.isfinite(magnitude):
+        return 0.0
+    if magnitude == 0.0:
+        return float.fromhex("0x1p-149")
+    exponent = math.floor(math.log2(magnitude))
+    ulp = 2.0 ** (exponent - (_FLOAT32_MANTISSA_BITS - 1))
+    return ulp if math.isfinite(ulp) else 0.0
+
+
+def _float32_storage_term(values: list[float]) -> float:
+    """Half a float32 ulp at the largest printed magnitude (the worst state)."""
+    if not values:
+        return 0.0
+    return 0.5 * _float32_ulp(max(abs(value) for value in values))
+
+
+def _exact_sampled_positions(
+    entries: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]] | None:
+    """The sweep's positions as the sampling plan fixes them, or ``None``.
+
+    The sweep walks a uniform grid of ``len(states)`` points and the file stores
+    each position rounded to six decimals, so the position a state's display was
+    really produced at is ``i / (n - 1)`` - recoverable exactly, not approximately.
+    Recognised only when *every* stored position is within half of the storage
+    quantum of that grid; otherwise ``None`` and the stored positions are used as
+    recorded (fail-closed: an unrecognised sweep gets no correction at all, which
+    is what the member enums - whose change points are band boundaries, not grid
+    points - need).
+    """
+    count = len(entries)
+    if count < _MIN_DERIVATION_STATES:
+        return None
+    stored = [float(entry[0]) for entry in entries]
+    # Strictly ascending *as recorded*: the plan walks the grid forward, and the
+    # enumeration below pairs ``entries`` (not the sorted list) with ``i / (n - 1)`` -
+    # an entries list that were only a permutation of the grid would otherwise pair
+    # every display with another state's position, silently (reviewer's P24 note;
+    # unreachable with the registry's forward sweeps, refused rather than trusted).
+    if any(later <= earlier for earlier, later in zip(stored, stored[1:])):
+        return None
+    half = 0.5 * _SWEEP_POSITION_QUANTUM + 1e-12
+    for index, position in enumerate(stored):
+        if abs(position - index / (count - 1)) > half:
+            return None
+    return [
+        (index / (count - 1), value, precision)
+        for index, (_norm, value, precision) in enumerate(entries)
+    ]
+
+
+def _g6(value: float) -> str:
+    """The plugin's own display format: six significant digits (measured)."""
+    return "%.6g" % float(value)
+
+
+def _float32(value: float) -> float:
+    """``value`` rounded onto the float32 grid."""
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
+def _printed_text_reproduced(
+    predict: Any,
+    states: list[tuple[float, str]],
+    positions: dict[float, float] | None = None,
+) -> dict[str, Any]:
+    """How many printed states the law reproduces **digit for digit**.
+
+    The strongest form of the display model this provider can state: the plugin
+    stores a float32, prints it with ``%.6g``, and the law predicts both steps. A
+    residual says "within the display's resolution"; this says "the same string",
+    and is carried as evidence rather than as the acceptance test (a plugin build
+    that prints differently would fail the count, not the law).
+    """
+    matched = 0
+    compared = 0
+    first_miss: dict[str, Any] | None = None
+    for norm, display in states:
+        number = depth_module.display_number(display)
+        if number is None:
+            continue
+        remainder = depth_module.display_unit(display)
+        text = str(display).strip()
+        number_text = text[: len(text) - len(remainder)].strip() if remainder else text
+        position = float(norm) if positions is None else positions.get(round(float(norm), 12), float(norm))
+        compared += 1
+        predicted = _g6(_float32(predict(position)))
+        if predicted == number_text:
+            matched += 1
+        elif first_miss is None:
+            first_miss = {
+                "normalized": round(position, 9),
+                "printed": number_text,
+                "predicted": predicted,
+            }
+    block: dict[str, Any] = {
+        "states_compared": compared,
+        "states_reproduced": matched,
+        "format": "%.6g of the float32 law value",
+        # a fit that is *within* the display's budget (see `fit_residual_ratio`) but
+        # not exact to the last digit misses a count here without being wrong: the
+        # acceptance test is the residual, this is the stronger statement when it holds
+        "note": (
+            "the same digits come out; a fit within the display's own budget but not "
+            "exact to its last digit finishes below `states_compared` without being wrong"
+        ),
+    }
+    if first_miss is not None:
+        block["first_miss"] = first_miss
+    return block
+
+
+def _print_model_params(
+    predict_spine: Any,
+    descending: bool,
+    states: list[tuple[float, str]],
+    positions: dict[float, float] | None,
+) -> dict[str, Any]:
+    """The digit-for-digit print check, as a law parameter (see `_printed_text_reproduced`)."""
+    predict = (
+        (lambda value: predict_spine(1.0 - float(value))) if descending else predict_spine
+    )
+    return {"print_model": _printed_text_reproduced(predict, states, positions)}
+
+
+#: A display whose printed number carries no fraction: the *display* steps by one
+#: of its own units (``Oscillator 1 Wave Frame`` steps by 1 frame, ``Sample
+#: Transpose Quantize`` by 1 of 8192). The sweep's own sampling step is a different
+#: quantity and is not a display resolution.
+_INTEGER_TEXT_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _printed_values_are_integers(states: list[tuple[float, str]]) -> bool:
+    """Every state prints an integer (the display quantises to 1)."""
+    if not states:
+        return False
+    for _norm, display in states:
+        number = depth_module.display_number(display)
+        if number is None or float(number) != float(int(number)):
+            return False
+        remainder = depth_module.display_unit(display)
+        text = str(display).strip()
+        number_text = text[: len(text) - len(remainder)].strip() if remainder else text
+        if not _INTEGER_TEXT_RE.match(number_text):
+            return False
+    return True
+
+
+def _display_step_params(states: list[tuple[float, str]]) -> dict[str, Any]:
+    """What the sweep *sampled*: integers a whole unit apart - not a display quantum.
+
+    A first version of this recorded ``display_step: 1.0`` ("the display steps by
+    1"), which the live read-agreement probe of 2026-10-12 falsified: measured on
+    ``Oscillator 1 Wave Frame``, whose 257 sampled states are the integers 0..256,
+    the host prints **12.1905** at normalized 0.0476 - the display is continuous and
+    the sweep's own step was exactly one unit, so the sweep cannot see below it. A
+    sweep cannot establish a display's resolution; only the host formatter, asked
+    between the sampled points, can.
+    """
+    if not _printed_values_are_integers(states):
+        return {}
+    values = sorted({float(depth_module.display_number(display)) for _norm, display in states})
+    smallest = min((b - a for a, b in zip(values, values[1:]) if b > a), default=None)
+    return {
+        "sampled_display": {
+            "printed_values_are_integers": True,
+            "smallest_sampled_step": smallest,
+            "note": (
+                "the sweep's own samples are integers and the smallest step between them "
+                "is this; a sweep cannot see below its own step, so this is not the "
+                "display's resolution - the host formatter, asked between the sampled "
+                "points, is the channel that measures it (see the P24 probe)"
+            ),
+        }
+    }
+
+
+def _display_step_accuracy(
+    residual: float, states: list[tuple[float, str]]
+) -> dict[str, Any]:
+    """The residual measured in the sweep's **own** sampled step.
+
+    On a display whose sampled values are integers a whole unit apart, the absolute
+    residual is not the whole story: a staircase's printed value is a rounding of
+    the parameter, so a law that sits half a *sampled* step away is as accurate as
+    the sampling can show, while the budget it was judged against can be far larger.
+    Measured 2026-10-12: ``sample_transpose_quantize`` fits to 0.498 sampled steps
+    against a budget of 15.5 (its sweep sampled every 32nd integer), and
+    ``effect_chain_order`` to 0.50004 against a budget of 708.
+    """
+    if not _printed_values_are_integers(states):
+        return {}
+    values = sorted({float(depth_module.display_number(display)) for _norm, display in states})
+    smallest = min((b - a for a, b in zip(values, values[1:]) if b > a), default=None)
+    if not smallest:
+        return {}
+    return {
+        "residual_in_sampled_steps": round(float(residual) / smallest, 9),
+        "residual_in_sampled_steps_note": (
+            "measured in the sweep's smallest sampled step, not in a display quantum "
+            "(see `sampled_display`); the budget the fit was judged against is half "
+            "that step, floored by each state's printed precision"
+        ),
+    }
 
 
 def _measured_pairs(states: list[tuple[float, str]]) -> list[tuple[float, float]] | None:
@@ -468,6 +724,73 @@ def _measured_pairs(states: list[tuple[float, str]]) -> list[tuple[float, float]
     if entries is None:
         return None
     return [(norm, value) for norm, value, _precision in entries]
+
+
+#: The law kinds a *measured* derivation may install. `enum_index` is not one of
+#: them: a numeric derivation that produced a member list would be a different
+#: decision, and the ramp override below is exactly the decision not to take it.
+_NUMERIC_LAW_KINDS = ("affine", "power", "exponential")
+
+
+def _sampled_ramp(states: list[tuple[float, str]], steps: int | None) -> dict[str, Any] | None:
+    """Does this sweep prove a declared member list is a **sampling grid**?
+
+    The registry declares 294 rows as ``enum_index``, and for most of them the
+    declaration is a measurement: the sweep shows each label repeating across its
+    band (``filter_1_style``: six labels over 257 samples; ``chorus_tempo``: eleven
+    over 257). For twenty the sweep shows something a member list cannot produce -
+    **a faithful number at every sampled position, strictly monotone, all values
+    distinct, with a change at every step the sweep walked** (measured 2026-10-12).
+    A member set repeats its label across the band it owns; a display that changes
+    at *every* one of the sweep's 256 steps and follows one law (see
+    `derive_measured_law`) is a numeric ramp sampled on the sweep's grid, and the
+    member list built from it is a grid artefact - the AI had to name one of 257
+    strings to set a continuous level.
+
+    The *step* requirement is what separates a ramp from a **quantised ladder**:
+    ``pitch_bend_range`` shows 49 distinct integers over 49 stored positions, but
+    only at 49 of the sweep's 257 positions did anything change - the display is
+    constant in between, which is a banded member set (its bands were measured
+    exactly, by the artifact) and not a ramp. ``steps`` comes from the registry's
+    own record of the sweep; when it is absent the predicate declines.
+
+    Returns the evidence block, or ``None`` when the declaration stands. The caller
+    adds the second half of the guard: a *numeric law* must be accepted for the
+    sweep, or nothing is overridden - so ``oversampling`` ("1x/2x/4x/8x" on
+    non-uniform bands, 4 states, no acceptable fit) keeps its four members. What it
+    does **not** decide is whether the control is continuous between the sampled
+    positions; the host's own formatter, measured on arbitrary values, is the
+    channel that can (P23's artifact, when present, and the P24 read agreement
+    probe).
+    """
+    if len(states) < _MIN_DERIVATION_STATES:
+        return None
+    #: the sweep records *change points*: one per step is what a ramp produces, and
+    #: fewer than the steps it walked means the display held still in between
+    if steps is None or len(states) != steps + 1:
+        return None
+    entries = _measurement_entries(states)
+    if entries is None:  # a labelled sweep: the member list is a member list
+        return None
+    ordered = sorted(entries, key=lambda entry: entry[0])
+    strictly_increasing = all(b[1] > a[1] for a, b in zip(ordered, ordered[1:]))
+    strictly_decreasing = all(b[1] < a[1] for a, b in zip(ordered, ordered[1:]))
+    if not (strictly_increasing or strictly_decreasing):
+        # a repeated value between two samples is a band; two labels wearing numbers
+        # that swap places are not a scale
+        return None
+    values = [value for _norm, value, _precision in entries]
+    display_params = _display_step_params(states)
+    return {
+        "sampled_positions": len(entries),
+        "sweep_steps": int(steps),
+        "direction": "increasing" if strictly_increasing else "decreasing",
+        "distinct_values": len({round(value, 12) for value in values}),
+        "smallest_measured_step": min(
+            b - a for a, b in zip(sorted(values), sorted(values)[1:]) if b > a
+        ),
+        **display_params,
+    }
 
 
 def _measurement_quantum(values: list[float]) -> float:
@@ -719,9 +1042,36 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
     entries = _measurement_entries(states)
     if entries is None:  # pragma: no cover - `pairs` was not None, so this holds
         return None
+    #: the positions the displays were really produced at, when the sweep is a
+    #: recognised uniform grid (the file stores them to six decimals; see
+    #: `_exact_sampled_positions`). Without this a steep law is judged against the
+    #: wrong x - measured on `random_N_frequency`: ratio 11.2 refused, 0.95 accepted.
+    exact = _exact_sampled_positions(entries)
+    position_model = (
+        "the sweep's own uniform grid i/(n-1), which every stored position matches "
+        "to within the file's six decimals"
+        if exact is not None
+        else "the stored positions as recorded"
+    )
+    if exact is not None:
+        entries = exact
+    #: stored position -> the position the display was produced at, for the
+    #: digit-for-digit print check (`_print_model_params`)
+    position_map = (
+        {
+            round(float(states[index][0]), 12): float(exact[index][0])
+            for index in range(len(states))
+        }
+        if exact is not None
+        else None
+    )
     values = [value for _norm, value, _precision in entries]
     quantum = _measurement_quantum(values)
     floor = 0.5 * quantum + 1e-9
+    #: half a float32 ulp at the largest printed magnitude: the plugin prints a
+    #: 32-bit float, and a display at magnitude M can miss the *real* value by that
+    #: much on top of its own print rounding
+    storage_term = _float32_storage_term(values)
     ordered = sorted(entries, key=lambda entry: entry[0])
     non_decreasing = all(b[1] >= a[1] for a, b in zip(ordered, ordered[1:]))
     non_increasing = all(b[1] <= a[1] for a, b in zip(ordered, ordered[1:]))
@@ -746,16 +1096,38 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
     # carrying the direction only when it is not the default keeps every
     # ascending row's profile byte-identical to what it was before
     spine_params = {"direction": direction} if direction == "descending" else {}
-    bound_model = "max(printed precision of each state, half the measured display step)"
+    bound_model = (
+        "max(printed precision of each state, half the measured display step) + half a float32 "
+        "ulp at the largest printed magnitude (the display is a print of a 32-bit float)"
+    )
+    display_params = _display_step_params(states)
+    #: the sampled position is a *measurement*, not an allowance: both the fit and
+    #: the residual use it, and the model is recorded with the law
+    position_params = {"position_model": position_model}
 
-    def _accepted(predict: Any) -> tuple[bool, float, float]:
-        worst_abs, worst_ratio = _worst_fit_ratio(predict, oriented, floor)
-        return worst_ratio <= 1.0 + 1e-9, worst_abs, worst_ratio
+    def _bound_params(worst_bound: float) -> dict[str, Any]:
+        """The budget the residual was judged against, and the terms it sums."""
+        return {
+            "fit_bound": round(float(worst_bound), 12),
+            "fit_bound_terms": {
+                "from_the_display": round(float(floor), 12),
+                "from_the_float32_storage": round(float(storage_term), 12),
+            },
+            "fit_bound_model": bound_model,
+        }
+
+    def _accepted(predict: Any) -> tuple[bool, float, float, float]:
+        worst_abs, worst_ratio, worst_bound = _worst_fit_ratio(
+            predict, oriented, floor, storage_term
+        )
+        return worst_ratio <= 1.0 + 1e-9, worst_abs, worst_ratio, worst_bound
 
     fit = depth_module.linear_fit([(norm, value) for norm, value, _p in oriented])
     if fit is not None:
         slope, intercept, _residual = fit
-        ok, worst_abs, worst_ratio = _accepted(lambda t: slope * t + intercept)
+        ok, worst_abs, worst_ratio, worst_bound = _accepted(
+            lambda t: slope * t + intercept
+        )
         if ok:
             return {
                 "kind": "affine",
@@ -769,16 +1141,23 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                     "measured_intercept": round(float(intercept), 9),
                     "fit_residual": round(float(worst_abs), 12),
                     "fit_residual_ratio": round(float(worst_ratio), 9),
-                    "fit_bound": round(float(floor), 12),
-                    "fit_bound_model": bound_model,
+                    **_bound_params(worst_bound),
                     "source": "vital_scales_full.json (measured sweep fit)",
                     "n_states": len(states),
+                    **position_params,
+                    **_print_model_params(
+                        lambda t: slope * t + intercept, direction == "descending", states, position_map
+                    ),
+                    **display_params,
+                    **_display_step_accuracy(worst_abs, states),
                     **spine_params,
                 },
             }
 
     if low > 0.0 and high > 0.0:
-        ok, worst_abs, worst_ratio = _accepted(lambda t: low * (high / low) ** t)
+        ok, worst_abs, worst_ratio, worst_bound = _accepted(
+            lambda t: low * (high / low) ** t
+        )
         if ok:
             return {
                 "kind": "exponential",
@@ -790,10 +1169,15 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                     "offset": 0.0,
                     "fit_residual": round(float(worst_abs), 12),
                     "fit_residual_ratio": round(float(worst_ratio), 9),
-                    "fit_bound": round(float(floor), 12),
-                    "fit_bound_model": bound_model,
+                    **_bound_params(worst_bound),
                     "source": "vital_scales_full.json (measured sweep fit)",
                     "n_states": len(states),
+                    **position_params,
+                    **_print_model_params(
+                        lambda t: low * (high / low) ** t, direction == "descending", states, position_map
+                    ),
+                    **display_params,
+                    **_display_step_accuracy(worst_abs, states),
                     **spine_params,
                 },
             }
@@ -811,7 +1195,9 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
             math.log(value / base) / math.log(norm) for norm, value in exponent_points
         ) / len(exponent_points)
         if exponent > 0.0:
-            ok, worst_abs, worst_ratio = _accepted(lambda t: base * t**exponent)
+            ok, worst_abs, worst_ratio, worst_bound = _accepted(
+                lambda t: base * t**exponent
+            )
             if ok:
                 return {
                     "kind": "power",
@@ -823,10 +1209,15 @@ def derive_measured_law(row: dict[str, Any], states: list[tuple[float, str]]) ->
                         "exponent": round(float(exponent), 9),
                         "fit_residual": round(float(worst_abs), 12),
                         "fit_residual_ratio": round(float(worst_ratio), 9),
-                        "fit_bound": round(float(floor), 12),
-                        "fit_bound_model": bound_model,
+                        **_bound_params(worst_bound),
                         "source": "vital_scales_full.json (measured sweep fit)",
                         "n_states": len(states),
+                        **position_params,
+                        **_print_model_params(
+                            lambda t: base * t**exponent, direction == "descending", states, position_map
+                        ),
+                        **display_params,
+                        **_display_step_accuracy(worst_abs, states),
                         **spine_params,
                     },
                 }
@@ -851,18 +1242,24 @@ def derive_law_candidate(states: list[tuple[float, str]]) -> dict[str, Any] | No
     knows exactly what to verify.
 
     Measured 2026-10-11 (``random_1..4_frequency``): the endpoint-anchored
-    exponential lands within 5.7e-6 *relative* of every printed state, but the
-    low endpoint is itself a rounded print (``0.00195312`` for 2**-9), and that
-    rounding shifts the curve by up to 11x a state's printed precision - a
-    ratio-fitted parametrization would have to be added to the law vocabulary to
-    express it, which is a Core change, not a guess this provider may make.
+    exponential lands within 5.7e-6 *relative* of every printed state, and every
+    state obeys the law within the instrument's own budget once the *stored
+    position's* rounding is accounted for (2026-10-12: it is, so the four rows
+    gained the law and no longer carry a candidate). The diagnosis stays for the
+    rows that are still refused for a real reason - e.g. ``oversampling`` (four
+    states ``1x/2x/4x/8x`` on non-uniform bands), where the best family still
+    misses a state's printed precision and so the member list is kept.
     """
     entries = _measurement_entries(states)
     if entries is None or len(entries) < _MIN_DERIVATION_STATES:
         return None
+    exact = _exact_sampled_positions(entries)
+    if exact is not None:
+        entries = exact
     values = [value for _norm, value, _precision in entries]
     quantum = _measurement_quantum(values)
     floor = 0.5 * quantum + 1e-9
+    storage_term = _float32_storage_term(values)
     ordered = sorted(entries, key=lambda entry: entry[0])
     non_decreasing = all(b[1] >= a[1] for a, b in zip(ordered, ordered[1:]))
     non_increasing = all(b[1] <= a[1] for a, b in zip(ordered, ordered[1:]))
@@ -903,6 +1300,9 @@ def derive_law_candidate(states: list[tuple[float, str]]) -> dict[str, Any] | No
     if not candidates:
         return None
 
+    #: the same two instrument terms the fit test uses, or a refused law and its
+    #: recorded diagnosis would disagree about the budget (see `_worst_fit_ratio`
+    #: and `_exact_sampled_positions`)
     displays = {round(norm, 12): display for norm, display in states}
     best: dict[str, Any] | None = None
     for kind in _CANDIDATE_ORDER:
@@ -911,7 +1311,7 @@ def derive_law_candidate(states: list[tuple[float, str]]) -> dict[str, Any] | No
         predict, params = candidates[kind]
         worst: dict[str, Any] | None = None
         for norm, value, precision in oriented:
-            bound = max(precision, floor, 1e-15)
+            bound = max(precision, floor, 1e-15) + storage_term
             predicted = predict(norm)
             ratio = abs(value - predicted) / bound
             if worst is None or ratio > worst["ratio"]:
@@ -921,6 +1321,7 @@ def derive_law_candidate(states: list[tuple[float, str]]) -> dict[str, Any] | No
                     "display": displays.get(round(original_norm, 12)),
                     "predicted": round(float(predicted), 9),
                     "precision": precision,
+                    "bound": round(float(bound), 12),
                     "ratio": round(float(ratio), 6),
                 }
         record = {
@@ -1134,6 +1535,9 @@ def build_profile(
     calibration: Any = None,
     calibration_row: dict[str, Any] | None = None,
     calibration_note: str | None = None,
+    enum_boundaries: Any = None,
+    enum_boundaries_row: dict[str, Any] | None = None,
+    enum_boundaries_note: str | None = None,
 ) -> dict[str, Any]:
     """Build the [07 §1] profile from the loaded registry and a live identity.
 
@@ -1145,6 +1549,8 @@ def build_profile(
     was applied - a half-applied artifact is never a silent state.
     """
     from . import calibration as calibration_module  # noqa: PLC0415 - one-way, lazy
+    from . import enum_boundaries as enum_boundaries_module  # noqa: PLC0415 - one-way, lazy
+    from . import source_facts as source_facts_module  # noqa: PLC0415 - one-way, lazy
     from ... import values as values_module  # noqa: PLC0415
 
     rows = registry.rows()
@@ -1155,6 +1561,9 @@ def build_profile(
     module_ids = [str(name) for name in modules]
     module_descriptors: list[dict[str, Any]] = []
     controls: list[dict[str, Any]] = []
+    #: every range widened to the plugin's own parameter bounds (see
+    #: `source_facts.widen_to_source_bounds`), for the profile's `value_bounds` block
+    value_bounds_records: list[dict[str, Any]] = []
     units_by_control: dict[str, str | None] = {}
     for row in rows:
         state_key = row.get("state_key")
@@ -1174,24 +1583,138 @@ def build_profile(
         # the range is -10..+10) converts as an identity, which is not a law.
         # Both cases are answered from the sweep; a declared law with a usable
         # range is never re-derived.
-        needs_measurement = declared_law["kind"] in ("none", "unmeasured") or (
-            declared_law["kind"] == "affine" and declared_range is None
+        #
+        # A declared ``enum_index`` is a third case, added 2026-10-12: the
+        # declaration was built from "distinct display strings at 257 sample
+        # points", which a *ramp* also produces. Where the sweep shows a strictly
+        # monotone faithful number at every sampled position, the member list is
+        # that grid's artefact and the row is answered from the sweep too - but
+        # only if a numeric law is then accepted (see `_sampled_ramp`).
+        sampled_ramp = (
+            _sampled_ramp(states, registry.sweep_steps())
+            if declared_law["kind"] == "enum_index" and states
+            else None
+        )
+        needs_measurement = (
+            declared_law["kind"] in ("none", "unmeasured")
+            or (declared_law["kind"] == "affine" and declared_range is None)
+            or sampled_ramp is not None
         )
         measured = derive_measured_law(row, states) if needs_measurement else None
+        if measured is not None and sampled_ramp is not None \
+                and str(measured.get("kind")) not in _NUMERIC_LAW_KINDS:
+            # fail-closed: contradicting a declaration requires a *numeric* law.
+            # `_sampled_ramp` already excludes the labelled branch, so this guards
+            # a future derivation change rather than today's data.
+            measured = None
         #: set for a row whose sweep nearly fits a law the display-precision
         #: budget refused (see `derive_law_candidate`): recorded as a named
         #: diagnosis, never installed - `values.to_native` keeps refusing
         law_candidate: dict[str, Any] | None = (
             derive_law_candidate(states) if needs_measurement and measured is None else None
         )
+        #: set when a *declared enum* survived a numeric derivation attempt, i.e. the
+        #: sweep showed a monotone number at every sampled position but no law of the
+        #: vocabulary fitted it inside the instrument's budget. The member list is
+        #: then the right model and the reason is carried in the evidence - `law_candidate`
+        #: may not say it, because the control *does* convert (as an enum): measured on
+        #: `oversampling` ("1x/2x/4x/8x", four states on non-uniform bands, best family
+        #: 1.54x the budget), where a candidate on a converting enum is a validator
+        #: contradiction.
+        numeric_model_declined: dict[str, Any] | None = (
+            {
+                "why": (
+                    "the sweep shows a faithful number at every sampled position with no "
+                    "repeat, but no law of the vocabulary fits it within the instrument's "
+                    "own budget: the declared member list is kept"
+                ),
+                "measured": dict(sampled_ramp),
+                "best_candidate": law_candidate,
+            }
+            if sampled_ramp is not None and measured is None
+            else None
+        )
+        if numeric_model_declined is not None:
+            # the control keeps converting as an enum, so it is not a `law_candidate`
+            law_candidate = None
         #: set only for a declared `enum_index` row whose *measured* bands are not
         #: uniform (see `_declared_enum_positions`); carried into the evidence
         positions_correction: dict[str, Any] | None = None
+        #: set when the row's declared member list was replaced by a measured
+        #: numeric law (`_sampled_ramp`); carried into the evidence
+        enum_override: dict[str, Any] | None = None
         if measured is not None:
             law = {"kind": str(measured["kind"]), "params": dict(measured.get("params") or {})}
             control_type = str(measured.get("type") or _control_type(row))
             range_spec = measured.get("range") if measured.get("range") is not None else _range_from_row(row)
-            discrete = bool(measured.get("discrete")) or bool(row.get("discrete"))
+            if sampled_ramp is not None:
+                # the *measurement* decided the shape, so the declaration's own
+                # `discrete` flag is not evidence about it
+                discrete = bool(measured.get("discrete"))
+                enum_override = {
+                    "declared_kind": "enum_index",
+                    "declared_members": int(row.get("n_states") or len(states)),
+                    "measured_states": int(sampled_ramp["sampled_positions"]),
+                    "measured_display": (
+                        "a faithful number at every sampled position, strictly "
+                        f"{sampled_ramp['direction']} "
+                        f"({sampled_ramp['distinct_values']} distinct values)"
+                    ),
+                    "law": str(measured["kind"]),
+                    "range_from_the_sweep": measured.get("range"),
+                    "range_from_the_declaration": dict(declared_range) if declared_range else None,
+                    "range_disagrees_with_the_declaration": bool(
+                        declared_range is None
+                        or measured.get("range") is None
+                        or float(declared_range.get("min", 0.0))
+                        != float(measured["range"].get("min", 0.0))
+                        or float(declared_range.get("max", 0.0))
+                        != float(measured["range"].get("max", 0.0))
+                    ),
+                    "why": (
+                        "a labelled member set repeats each label across the band it owns; a "
+                        "display that changes at every sampled position and follows one law "
+                        "within the display's own printing precision is a ramp sampled on the "
+                        "sweep's grid - naming one of its members would mean naming a sample"
+                    ),
+                    "what_this_does_not_decide": (
+                        "whether the control is continuous between the sampled positions; the "
+                        "host's own formatter, read at arbitrary values, is the channel that "
+                        "can decide it (the P23 artifact when present, the P24 probe live)"
+                    ),
+                }
+                #: the two controls the plugin's own table declares as an integer ladder
+                #: (`sample_transpose_quantize`, `effect_chain_order`): 257 sampled
+                #: positions cannot see a step, but the *source* can - `ValueDetails::kIndexed`
+                #: with a span of 10,000s, whose `convertToEngineValue` rounds every
+                #: value the host write channel stores. The law stays the fitted affine
+                #: one; the step says where its values live.
+                ladder = source_facts_module.INTEGER_LADDERS.get(str(state_key))
+                if ladder is not None:
+                    discrete = True
+                    law["params"] = {
+                        **dict(law.get("params") or {}),
+                        "quantization": {
+                            "step": float(ladder["step"]),
+                            "origin": float(ladder["min"]),
+                            "rounding": "half_away_from_zero",
+                            "source": source_facts_module.CORRESPONDENCE["source"],
+                        },
+                    }
+                    enum_override["integer_ladder"] = {
+                        "state_bounds": {"min": ladder["min"], "max": ladder["max"]},
+                        "step": ladder["step"],
+                        "span_explanation": ladder["span_explanation"],
+                        "vst3_continuity": ladder["vst3_continuity"],
+                        "plugin_rounding": ladder["plugin_rounding"],
+                        "consequence": (
+                            "a fractional request is stored rounded, and the display - which "
+                            "rounds before printing - is an integer: the step is in the engine, "
+                            "not in the formatter"
+                        ),
+                    }
+            else:
+                discrete = bool(measured.get("discrete")) or bool(row.get("discrete"))
             enum_values = measured.get("enum_values")
         else:
             law = declared_law
@@ -1217,10 +1740,111 @@ def build_profile(
                         "params": {**dict(law.get("params") or {}), **positions_correction},
                     }
         correction = LIVE_MEASURED_CORRECTIONS.get(str(state_key))
+        #: set when the plugin's own parameter table holds *wider* bounds than the
+        #: declared range (see `source_facts.widen_to_source_bounds`): a correction of
+        #: the same class as `LIVE_MEASURED_CORRECTIONS`, but for the 70 rows where a
+        #: 900-preset corpus range truncated the parameter. Only ever widens.
+        bounds_record: dict[str, Any] | None = None
         if correction is None:
+            if measured is None and control_type == "number" and range_spec is not None:
+                bounds_record = source_facts_module.widen_to_source_bounds(
+                    str(state_key), range_spec
+                )
+                if bounds_record is not None:
+                    range_spec = {"min": bounds_record["min"], "max": bounds_record["max"]}
+                    value_bounds_records.append({"control": str(state_key), **bounds_record})
             evidence = _evidence(row, bool(states), measured=measured)
             if positions_correction is not None:
                 evidence = {**evidence, "positions_correction": dict(positions_correction)}
+            if enum_override is not None:
+                evidence = {**evidence, "enum_declaration_overridden": dict(enum_override)}
+            if numeric_model_declined is not None:
+                evidence = {
+                    **evidence,
+                    "numeric_model_declined": dict(numeric_model_declined),
+                }
+            if bounds_record is not None:
+                fit = row.get("fit") or {}
+                fit_bounds = {
+                    "min": fit.get("nmin"),
+                    "max": fit.get("nmax"),
+                    "source": fit.get("source"),
+                }
+                agrees = bool(
+                    isinstance(fit_bounds["min"], (int, float))
+                    and isinstance(fit_bounds["max"], (int, float))
+                    and abs(float(fit_bounds["min"]) - bounds_record["min"]) <= 1e-6
+                    and abs(float(fit_bounds["max"]) - bounds_record["max"]) <= 1e-6
+                )
+                display = source_facts_module.DISPLAY_FACTS.get(str(state_key)) or {}
+                # The registry's own fit is the second authority, and where it does not
+                # agree numerically the reason is a *space*: the fit was taken in the
+                # display's units (a `*_pan` fit of -100..100 against a state range of
+                # -1..1 with `display_multiply: 100`). Name which of the two it is
+                # instead of reporting a bare disagreement.
+                transform = float(display.get("multiply") or 1.0)
+                fit_in_display_space = bool(
+                    not agrees
+                    and transform != 1.0
+                    and isinstance(fit_bounds["min"], (int, float))
+                    and isinstance(fit_bounds["max"], (int, float))
+                    and abs(float(fit_bounds["min"]) - bounds_record["min"] * transform) <= 1e-6 * transform
+                    and abs(float(fit_bounds["max"]) - bounds_record["max"] * transform) <= 1e-6 * transform
+                )
+                evidence = {
+                    **evidence,
+                    "value_bounds": {
+                        "declared_before": dict(bounds_record["declared_before"]),
+                        "declared_after": {"min": bounds_record["min"], "max": bounds_record["max"]},
+                        "widened": dict(bounds_record["widened"]),
+                        "why": (
+                            "the declared range came from a 900-preset corpus (native_min/max); "
+                            "the plugin's own parameter table declares wider bounds, so the "
+                            "corpus range truncated the parameter"
+                        ),
+                        "source": source_facts_module.CORRESPONDENCE["source"],
+                        "correspondence": (
+                            "the source's display model reproduces the live host formatter at "
+                            "both ends (and at all sampled points) - see source_facts.CORRESPONDENCE"
+                        ),
+                        "registry_fit": {
+                            **fit_bounds,
+                            "agrees_with_the_source": agrees,
+                            **(
+                                {
+                                    "fit_units": "display space",
+                                    "agrees_after_the_display_transform": True,
+                                }
+                                if fit_in_display_space
+                                else {}
+                            ),
+                        },
+                        "evidence_level": (
+                            "state-space bounds: the plugin's own declared parameter bounds, "
+                            "with the display text at both ends corroborated by the live "
+                            "formatter. Not a claim that writes across the range were "
+                            "exercised"
+                        ),
+                        "value_space": {
+                            "units": unit,
+                            "display": {
+                                "multiply": display.get("multiply"),
+                                "scale": display.get("scale"),
+                                "invert": display.get("invert"),
+                                "post_offset": display.get("post_offset"),
+                                "text_at_0": display.get("text_at_0"),
+                                "text_at_1": display.get("text_at_1"),
+                                "live_text_at_0": display.get("live_text_at_0"),
+                                "live_text_at_1": display.get("live_text_at_1"),
+                            },
+                            "note": (
+                                "the range is in the plugin's state space; the display text is "
+                                "that transform's rendering of it, which is why the raw numbers "
+                                "differ (the P24 range census compared the two spaces)"
+                            ),
+                        },
+                    },
+                }
         else:
             # a live host measurement contradicted the registry's declaration:
             # the measurement wins (see `_live_measured_corrections`)
@@ -1307,6 +1931,8 @@ def build_profile(
     source_rows = [{"file": row["file"], "sha256": row["sha256"]} for row in registry.sources]
     if calibration_row is not None:
         source_rows.append(dict(calibration_row))
+    if enum_boundaries_row is not None:
+        source_rows.append(dict(enum_boundaries_row))
     calibration_block: dict[str, Any] = {
         "state": (
             "applied"
@@ -1351,6 +1977,132 @@ def build_profile(
             report.get("display_offset_candidates") or []
         )
 
+    # The measured enum band boundaries (P23). Applied *after* the calibration
+    # merge, because that merge fills units/metadata while this one rewrites the
+    # numbers the two conversion directions use - and it never touches a law kind
+    # or a member list, only the band geometry of an `enum_index` control.
+    enum_block: dict[str, Any] = {
+        "state": (
+            "applied"
+            if enum_boundaries is not None
+            else ("refused" if enum_boundaries_note else "absent")
+        ),
+        "applied": enum_boundaries is not None,
+        "artifact": dict(enum_boundaries_row) if enum_boundaries_row is not None else None,
+        "method_version": (
+            int(enum_boundaries.method_version) if enum_boundaries is not None else None
+        ),
+        "tolerance": enum_boundaries.tolerance if enum_boundaries is not None else None,
+        "call": "TrackFX_FormatParamValueNormalized (read-only: formats a value the caller passes)",
+        "evidence_levels": {
+            "exact": (
+                "the transition lies between two adjacent IEEE doubles: `hi` is the smallest "
+                "double the host formats as the member that begins there. The claim is about "
+                "the bracket's *ends* - what the host prints exactly at and just below the "
+                "boundary - and each band's interior is verified separately "
+                "(`band_interiors_verified`)"
+            ),
+            "exact_at": (
+                "a round candidate value was proved exact in two calls: the candidate itself "
+                "formats as the upper member and the double below it as the lower one"
+            ),
+            "interval": "the transition is bracketed to the method's tolerance",
+            "coarse_interval": (
+                "bracketed wider than the tolerance because the call budget ran out: the "
+                "residual error is the bracket's full width"
+            ),
+            "confirmed_within": (
+                "the profile's own boundary reproduced both sides of the display within "
+                "epsilon; the merge only accepts it when the bracket contains that boundary"
+            ),
+            "continuous_display": (
+                "the host prints a value between adjacent members: the control has no band "
+                "structure (its member list came from a swept sampling grid)"
+            ),
+            "undetermined": "no measurement of this control's bands exists",
+        },
+        "counts_note": {
+            "controls_without_band_structure": (
+                "artifact-derived: how many artifact rows show a display between members, "
+                "whether or not the profile still models the control as an enum"
+            ),
+            "controls_not_enums_any_more": (
+                "profile-derived: artifact rows whose control a measured numeric law now "
+                "models (`not_enums_any_more`), so there are no members to place bands on"
+            ),
+            "confirmations_withheld": (
+                "profile-derived: converted controls the artifact could not confirm because "
+                "it did not measure every transition as a display between members; the "
+                "numeric law still comes from the sweep, so the model stands"
+            ),
+        },
+        "refusals": [enum_boundaries_note] if enum_boundaries_note else [],
+        "counts": {},
+    }
+    if enum_boundaries is not None:
+        enum_report = enum_boundaries_module.apply_enum_boundaries(controls, enum_boundaries)
+        control_by_id = {str(control.get("id")): control for control in controls}
+        enum_block["counts"] = dict(enum_report.get("counts") or {})
+        enum_block["controls_refined"] = [
+            row["control"] for row in enum_report.get("attached") or [] if row.get("outcome") == "refined"
+        ]
+        enum_block["refused_controls"] = list(enum_report.get("refusals") or [])
+        enum_block["without_band_structure"] = [
+            {
+                **row,
+                "profile_model": {
+                    "type": str(
+                        (control_by_id.get(str(row.get("control"))) or {}).get("type")
+                    ),
+                    "law": str(
+                        (
+                            ((control_by_id.get(str(row.get("control"))) or {}).get("law") or {})
+                            .get("kind")
+                        )
+                    ),
+                },
+            }
+            for row in enum_report.get("unresolved_band_structures") or []
+        ]
+        enum_block["not_enums_any_more"] = list(enum_report.get("not_enums_any_more") or [])
+        enum_block["confirmations_withheld"] = list(
+            enum_report.get("confirmations_withheld") or []
+        )
+        enum_block["positions_moved"] = list(enum_report.get("positions_moved") or [])
+        enum_block["unlabelled_regions"] = list(enum_report.get("unlabelled_regions") or [])
+
+    # The plugin's own parameter bounds (P25). A declared range that a 900-preset
+    # corpus truncated is widened to the bounds the plugin itself declares - never
+    # narrowed, never shifted - and every widened control carries the before/after
+    # with its provenance in `evidence.value_bounds`. The display half of the same
+    # facts is recorded with it: the range is in the plugin's **state space** while
+    # the host prints a transformed **display space**, and the P24 range census
+    # compared the two (51 of its 103 "disagreements" were this artefact alone;
+    # the other 52 were the truncations this block fixes).
+    value_bounds_block: dict[str, Any] = {
+        "state": "applied" if value_bounds_records else "none",
+        "source": source_facts_module.CORRESPONDENCE["source"],
+        "channel": source_facts_module.CORRESPONDENCE["channel"],
+        "correspondence": {
+            "samples_compared": source_facts_module.CORRESPONDENCE["samples_compared"],
+            "texts_identical": source_facts_module.CORRESPONDENCE["texts_identical"],
+            "numbers_equal_unit_label_differs": source_facts_module.CORRESPONDENCE[
+                "numbers_equal_unit_label_differs"
+            ],
+            "numbers_differ": source_facts_module.CORRESPONDENCE["numbers_differ"],
+            "absent_from_the_source": list(
+                source_facts_module.CORRESPONDENCE["absent_from_the_source"]
+            ),
+        },
+        "rule": (
+            "widen only: a declared range that is a strict subset of the plugin's own "
+            "bounds is replaced by them; a range that is equal, wider, shifted or absent "
+            "is left exactly as it was"
+        ),
+        "counts": {"controls_widened": len(value_bounds_records)},
+        "controls": [str(record["control"]) for record in value_bounds_records],
+    }
+
     return {
         "profile_schema_version": 2,
         "provider": "vital",
@@ -1376,6 +2128,8 @@ def build_profile(
             },
         },
         "calibration": calibration_block,
+        "enum_boundaries": enum_block,
+        "value_bounds": value_bounds_block,
         "modules": module_descriptors,
         "controls": controls,
         "values": {

@@ -795,6 +795,26 @@ class ProfileCache:
                 f"the stored counts {stored_counts!r} disagree with the recomputed {actual_counts!r}",
             )
 
+        # Which provider's entry this is does **not** depend on the live identity, so
+        # the check cannot live inside the identity guard below. The cache directory is
+        # shared by every provider and the key is provider-scoped, so a foreign key can
+        # only be addressed by a mistake - and serving it would hand one plugin's
+        # capability profile to another plugin (P24's cross-provider test found this
+        # reachable: a cache built for provider B served provider A's profile as a *hit*
+        # when addressed with A's key). Refused, **not** quarantined: the entry is valid -
+        # for its own provider - and destroying a working entry because somebody asked
+        # for the wrong key would be a worse bug than the one fixed.
+        entry_provider = entry.get("provider_id")
+        if isinstance(entry_provider, str) and entry_provider and entry_provider != self.provider_id:
+            refusal = CacheRefusal(
+                "provider_id",
+                f"the entry belongs to provider {entry_provider!r} and this cache files "
+                f"{self.provider_id!r}; a profile is served only through its own provider",
+            )
+            self._status.source = "none"
+            self._record(refusal)
+            return CacheLoad(status="refused", path=str(target), refusal=refusal)
+
         if identity is not None:
             disagreements = identity_disagreements(profile, identity)
             if disagreements:
@@ -877,6 +897,20 @@ class ProfileCache:
         self._status.key = key
         target = self.path_for(key)
         self._status.path = str(target)
+
+        profile_provider = str(profile.get("provider") or "")
+        if profile_provider != self.provider_id:
+            # A provider that hands this cache another provider's profile has a bug;
+            # filing it would make that bug permanent and addressable. Refused, and
+            # the bytes are not touched (there is nothing at the path to touch yet).
+            self._record(
+                CacheRefusal(
+                    "provider_id",
+                    f"the profile is the {profile_provider!r} provider's and this cache files "
+                    f"{self.provider_id!r} entries",
+                )
+            )
+            return self._status
 
         validation = validate_profile(profile)
         if validation.rebuild_required or not validation.cacheable:

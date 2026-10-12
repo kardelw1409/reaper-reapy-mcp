@@ -1,0 +1,87 @@
+{
+  "_fixture": {
+    "kind": "second-provider-registry",
+    "note": "A deliberately small registry for the P24 cross-provider tests. It is NOT a real plugin's data: the numbers are synthetic and declared as such, and the provider that reads it is a test-only class (never registered in the production provider map). Its only job is to be *different* from the first provider in every way the shared layer could accidentally assume: a parameter-only plugin, a numeric control with a measured law, an enum with uneven bands and one state the host cannot name, and its own provenance.",
+    "synthetic": true
+  },
+  "plugin": {
+    "plugin_id": "second",
+    "vendor": "Second Audio",
+    "format": "vst3",
+    "fx_name": "VST3i: Second Test Synth",
+    "class_id": "00112233445566778899AABBCCDDEEFF",
+    "module": "second_test.vst3",
+    "version": "2.4.0",
+    "param_count": 8
+  },
+  "controls": [
+    {
+      "id": "second_gain",
+      "label": "Gain",
+      "module": "Output",
+      "type": "number",
+      "unit": "dB",
+      "range": {"min": -12.0, "max": 12.0},
+      "discrete": false,
+      "index": 2,
+      "law": {
+        "kind": "affine",
+        "params": {
+          "scale": 1.0,
+          "offset": 0.0,
+          "measured_slope": 24.0,
+          "measured_intercept": -12.0,
+          "fit_residual": 1.2e-05,
+          "fit_bound": 0.005,
+          "fit_bound_model": "declared for this synthetic registry: half the smallest measured step",
+          "source": "second_registry.json (synthetic sweep fit)",
+          "n_states": 33,
+          "direction": "ascending"
+        }
+      },
+      "evidence": {"strength": "strong", "source": "second_registry.json (synthetic sweep fit)"}
+    },
+    {
+      "id": "second_shape",
+      "label": "Shape",
+      "module": "Output",
+      "type": "enum",
+      "unit": null,
+      "range": null,
+      "discrete": true,
+      "index": 4,
+      "enum_values": [
+        {"id": "Soft", "label": "Soft"},
+        {"id": "Hard", "label": "Hard"},
+        {"id": "Fold", "label": "Fold"}
+      ],
+      "law": {
+        "kind": "enum_index",
+        "params": {
+          "positions": [0.1, 0.45, 0.8],
+          "switch_points": [0.0, 0.25, 0.65],
+          "positions_source": "measured band midpoints of second_registry.json (synthetic)",
+          "n_states": 3,
+          "unlabelled_region": {
+            "lo": 0.9,
+            "hi": 1.0,
+            "text": "",
+            "why": "the registry's own name table has three entries and the parameter is declared over four states, so the last one has no name to print - the same class of finding as the first provider's filter styles, carried in this provider's own vocabulary rather than in that provider's artifact format",
+            "source": "second_registry.json (names) + second_notes.json (declaration)"
+          },
+          "boundary_evidence": {
+            "artifact": {"file": "second_notes.json", "sha256": "declared-below"},
+            "tolerance": 1e-9,
+            "band_ends": [0.0, 0.25, 0.65, 0.9],
+            "band_interiors_checked": 3,
+            "band_interiors_verified": 3
+          }
+        }
+      },
+      "evidence": {"strength": "strong", "source": "second_registry.json (synthetic sweep)"}
+    }
+  ],
+  "modules": [
+    {"id": "Output", "kind": "module", "label": "Output", "parent": null, "controls": ["second_gain", "second_shape"], "state_refs": []}
+  ]
+}

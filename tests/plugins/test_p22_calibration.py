@@ -87,7 +87,7 @@ def test_the_calibration_block_names_the_artifact_and_its_proof(calibrated_profi
     assert block["proof"]["chunk_sha256_unchanged"] is True
     # the artifact's bytes are a declared source, so they are cache-key material
     sources = [row["file"] for row in calibrated_profile["provenance"]["sources"]]
-    assert sources[-1] == "vital_host_calibration.json"
+    assert "vital_host_calibration.json" in sources
     # the host's own metadata is recorded, including the *absent* default
     assert block["host_param_space"]["uniform_0_1"] is True
     assert block["host_default_value"]["available"] is False
@@ -283,7 +283,7 @@ def test_a_malformed_artifact_is_refused_and_reported(tmp_path):
     assert block["refusals"], block
     # the bytes still travel in the sources: a changed (even broken) artifact must
     # invalidate the cache entry
-    assert [row["file"] for row in profile["provenance"]["sources"]][-1] == "bad.json"
+    assert "bad.json" in [row["file"] for row in profile["provenance"]["sources"]]
     assert not any(control.get("unit_source") for control in profile["controls"])
 
 

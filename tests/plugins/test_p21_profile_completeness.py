@@ -169,31 +169,35 @@ def test_the_real_registry_accounts_for_every_host_parameter():
     # the honest "not fully described" set, pinned so a silent regression is visible.
     # P22 note: the descending derivation (2026-10-11) moved five of these rows -
     # `delay_frequency`/`phaser_frequency`/`delay_aux_frequency` became measured
-    # descending exponentials and `delay_aux_tempo` a labelled enum; the four
-    # `random_N_frequency` rows remain refused because their endpoint-anchored
-    # exponential misses each state's *printed* precision (their `law_candidate`
-    # records the measured miss). The suite pins calibration OFF, so these are the
-    # registry-only numbers.
+    # descending exponentials and `delay_aux_tempo` a labelled enum.
+    # P24 note (2026-10-12): the last four - `random_N_frequency`'s 2**16 ratio law -
+    # derive too, once the fit is judged at the sweep's sampled positions and the
+    # budget carries the float32 storage rounding. The set is now **empty**: every
+    # one of the 775 controls carries a law that converts.
+    # Read the counters below in the configuration they describe: this builds the
+    # profile from the *registry alone* (`PB.build_profile`), without the provider's
+    # calibration/boundary artifacts - a served profile (the provider loads them)
+    # carries a range for all 452 number controls and 12 weak-evidence rows. The
+    # pinned 157 documents the registry-only build, which is the fallback a machine
+    # with no preparation artifact gets.
     laws: dict[str, list[str]] = {}
     for control in controls:
         laws.setdefault(str((control.get("law") or {}).get("kind")), []).append(str(control["id"]))
-    assert sorted(laws.get("none", [])) == [
+    assert laws.get("none", []) == []
+    assert laws.get("unmeasured", []) == []
+    assert len(laws.get("exponential", [])) == 8, laws.get("exponential")
+    assert sorted(laws.get("exponential", []))[4:] == [
         "random_1_frequency",
         "random_2_frequency",
         "random_3_frequency",
         "random_4_frequency",
     ]
-    assert laws.get("unmeasured", []) == []
-    assert len(laws.get("exponential", [])) == 4, laws.get("exponential")
-    assert len([c for c in controls if c.get("range") is None]) == 162
+    assert len([c for c in controls if c.get("range") is None]) == 157
     assert len([c for c in controls if (c.get("evidence") or {}).get("strength") == "weak"]) == 36
-    # every refused row carries a named candidate instead of silence
+    # no row needs a candidate any more: a candidate is only recorded where a law is
+    # refused, and nothing is refused
     candidates = {c["id"]: c["law_candidate"] for c in controls if c.get("law_candidate")}
-    assert sorted(candidates) == sorted(laws.get("none", []))
-    for control_id, candidate in candidates.items():
-        assert candidate["kind"] == "exponential", (control_id, candidate)
-        assert candidate["direction"] == "descending", (control_id, candidate)
-        assert candidate["worst_state"]["ratio"] > 1.0, (control_id, candidate)
+    assert candidates == {}
 
 
 def test_registry_source_rows_equal_the_rows_load_registry_records():

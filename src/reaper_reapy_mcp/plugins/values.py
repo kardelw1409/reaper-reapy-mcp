@@ -67,6 +67,59 @@ def _enum_members(control: dict[str, Any]) -> list[str]:
     return [str(member.get("id")) for member in control.get("enum_values") or []]
 
 
+def _storage_step(control: dict[str, Any]) -> tuple[float, float] | None:
+    """``(step, origin)`` when a numeric law declares the engine's storage grid.
+
+    A provider that *measured* its plugin quantising (a parameter whose engine
+    rounds every set - two such controls exist in the provider this layer was
+    built against) declares ``law.params.quantization = {step, origin, rounding}``.
+    The core then snaps both directions onto that grid, so a value the plugin
+    cannot hold is never reported as if it could, and a write target is the number
+    the plugin will actually store. A malformed declaration is *ignored* rather
+    than approximated - the conversion then behaves exactly as it did before the
+    field existed.
+    """
+    raw = _law_params(control).get("quantization")
+    if not isinstance(raw, dict):
+        return None
+    step = raw.get("step")
+    origin = raw.get("origin", 0.0)
+    if isinstance(step, bool) or not isinstance(step, _NUMBER_TYPES):
+        return None
+    step = float(step)
+    if not math.isfinite(step) or step <= 0.0:
+        return None
+    if isinstance(origin, bool) or not isinstance(origin, _NUMBER_TYPES):
+        origin = 0.0
+    origin = float(origin)
+    if not math.isfinite(origin):
+        return None
+    return step, origin
+
+
+def _snap_to_grid(control: dict[str, Any], value: float) -> float:
+    """The nearest value the plugin can store: ``std::round`` onto the declared grid.
+
+    Halfway cases go *away from zero*, which is what the plugin's own
+    ``convertToEngineValue`` does (``std::round``); the result is clamped into the
+    grid the declared range spans (the largest step *below* the range's ends), because
+    the plugin's range is what its step was derived from and a clamped value has to
+    still be a value it can hold.
+    """
+    grid = _storage_step(control)
+    if grid is None:
+        return float(value)
+    step, origin = grid
+    index = (float(value) - origin) / step
+    snapped = origin + (math.floor(index + 0.5) if index >= 0.0 else math.ceil(index - 0.5)) * step
+    low, high = _range(control)
+    if low is not None and high is not None:
+        lowest = origin + math.ceil((low - origin) / step) * step
+        highest = origin + math.floor((high - origin) / step) * step
+        snapped = min(max(snapped, min(lowest, highest)), max(lowest, highest))
+    return float(snapped)
+
+
 def direction(control: dict[str, Any]) -> str:
     """The measured conversion direction of a numeric control's law.
 
@@ -107,13 +160,29 @@ def _enum_positions(control: dict[str, Any]) -> list[float] | None:
 
 
 def unit_trap(control: dict[str, Any], value: Any) -> None:
-    """A ``%``-unit control receiving ``1.0`` means 1 percent (05 §4.7)."""
-    if control.get("unit") == "%" and isinstance(value, _NUMBER_TYPES) and not isinstance(value, bool):
-        if float(value) == 1.0:
-            raise InvalidValue(
-                "a 1.0 on a percent-unit control means 1 percent; pass the value in percent",
-                detail={"control": control.get("id"), "unit": "%", "value": value, "trap": True},
-            )
+    """A ``%``-unit control receiving ``1.0`` means 1 percent (05 §4.7).
+
+    Narrowed 2026-10-12 (P25) to the controls whose *value space* is percent. The
+    trap's premise is that ``1.0`` sits at the bottom of a percent scale; where the
+    declared range proves a **fraction** space - every bound within 1.0, so the
+    ``%`` is the *display's* unit, not the value's (measured on 27 controls of the
+    provider this layer was built against: its own parameter table multiplies the
+    value by 100 for the display while declaring bounds of 0..1 or -1..1) - 1.0 is
+    the top of the range and a legitimate value. Refusing it made the last step of a
+    mix/pan control unwritable. A control with no range to prove either space keeps
+    the trap, exactly as before.
+    """
+    if control.get("unit") != "%" or not isinstance(value, _NUMBER_TYPES) or isinstance(value, bool):
+        return
+    low, high = _range(control)
+    if low is not None and high is not None and abs(low) <= 1.0 and abs(high) <= 1.0:
+        # a fraction space: its own 1.0 is the top of the range, not one percent
+        return
+    if float(value) == 1.0:
+        raise InvalidValue(
+            "a 1.0 on a percent-unit control means 1 percent; pass the value in percent",
+            detail={"control": control.get("id"), "unit": "%", "value": value, "trap": True},
+        )
 
 
 def validate(control: dict[str, Any], value: Any) -> None:
@@ -169,8 +238,11 @@ def to_native(control: dict[str, Any], value: Any) -> float:
     number = float(value)
     if kind == "affine":
         params = _law_params(control)
-        return float(params.get("scale", 1.0)) * number + float(params.get("offset", 0.0))
-    return number
+        converted = float(params.get("scale", 1.0)) * number + float(params.get("offset", 0.0))
+        # a law that declares the engine's storage grid converts to a value the
+        # plugin can actually hold (it rounds every set itself)
+        return _snap_to_grid(control, converted)
+    return _snap_to_grid(control, number)
 
 
 def to_normalized(control: dict[str, Any], native: Any) -> float:
@@ -289,10 +361,10 @@ def normalized_to_native(control: dict[str, Any], normalized: float) -> Any:
         )
     spine = (1.0 - float(normalized)) if descending else float(normalized)
     if kind == "exponential" and low and high and low > 0 and high != low:
-        return low * (high / low) ** spine
+        return _snap_to_grid(control, low * (high / low) ** spine)
     if low is not None and high is not None and high != low:
-        return low + spine * (high - low)
-    return float(normalized)
+        return _snap_to_grid(control, low + spine * (high - low))
+    return _snap_to_grid(control, float(normalized))
 
 
 def from_native(control: dict[str, Any], native: Any) -> Any:
