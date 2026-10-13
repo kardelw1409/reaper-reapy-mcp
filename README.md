@@ -185,6 +185,21 @@ Design and phase documentation lives in
 [`docs/universal-plugin-mcp-v3/`](docs/universal-plugin-mcp-v3/README.md), and the
 per-phase implementation journal in [`IMPLEMENTATION-STATUS.md`](IMPLEMENTATION-STATUS.md).
 
+#### Audiocpp Manifest Fill
+
+`apply_audiocpp_manifest` fills the **current** project from a self-contained bundle
+exported by `mcp-audiocpp` (`export_audiocpp_manifest`): tempo, time signature, the five
+`AI_*` tracks, the audio item, both MIDI items and the section regions — then verifies the
+result by an independent re-read and writes `apply_report.json` back into the bundle.
+
+- `bundle_dir`: `"latest"` (reads the pointer file) or an explicit bundle directory
+- `dry_run` (default `false`): returns the full plan with **zero** mutations
+- `clean`: replace a previous fill; a second apply without it is refused
+- `save_as`: `Main_SaveProjectEx` to that path
+
+The bundle contract (`audiocpp.manifest` v1) and the measured host limits are in
+[`docs/audiocpp_manifest.md`](docs/audiocpp_manifest.md).
+
 ### Item ID System
 All item operations use a sequential index system (0..n) for item identification. This makes it easier to work with items in scripts and automation:
 - Item IDs are zero-based indices

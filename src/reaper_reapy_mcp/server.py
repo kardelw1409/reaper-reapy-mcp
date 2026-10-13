@@ -17,6 +17,7 @@ from controllers.track_controller import TrackController
 from controllers.base_controller import BaseController
 from mcp_tools import setup_mcp_tools
 from reaper_reapy_mcp.plugins import setup_plugin_tools
+from reaper_reapy_mcp.manifest import setup_manifest_tools
 
 
 class ReaperController(
@@ -44,6 +45,9 @@ def create_server(debug: bool = True) -> FastMCP:
     # (AUD-013). It adds the 7 `plugin_*` tools and touches nothing else: with no
     # provider configured every plugin tool answers a typed `UnsupportedProvider`.
     setup_plugin_tools(mcp)
+    # Audiocpp manifest fill (E2): ONE line; adds apply_audiocpp_manifest and
+    # touches nothing else. The bodies live in reaper_reapy_mcp/manifest/.
+    setup_manifest_tools(mcp, controller)
     # Startup preload (09 §4; owner Decision 4): when a provider is configured,
     # the prepared profiles in the cache directory are loaded, validated and held
     # in memory - no host contact, no profile build, no writes, and no cost at all
