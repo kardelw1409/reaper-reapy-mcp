@@ -103,20 +103,35 @@ def test_plugin_prepare_says_it_runs_before_the_others(plugin_descriptions):
 def test_add_midi_note_warns_against_one_call_per_note(classic_descriptions):
     _assert_needles(
         classic_descriptions["add_midi_note"],
-        ("add_midi_notes", "insert_midi_item", "do not call this tool once"),
+        ("add_midi_notes", "insert_midi_item", "do not call this tool once",
+         "mcp-midi-writer"),
     )
 
 
 def test_add_midi_notes_is_the_whole_part_call(classic_descriptions):
     _assert_needles(
         classic_descriptions["add_midi_notes"],
-        ("whole part", "one call", "insert_midi_item", "entire batch is refused"),
+        ("whole part", "one call", "insert_midi_item", "entire batch is refused",
+         "mcp-midi-writer"),
     )
 
 
 def test_the_file_path_and_the_item_path_name_each_other(classic_descriptions):
-    _assert_needles(classic_descriptions["insert_midi_item"], ("add_midi_notes", "create_midi_item"))
-    _assert_needles(classic_descriptions["create_midi_item"], ("add_midi_notes", "insert_midi_item"))
+    _assert_needles(classic_descriptions["insert_midi_item"],
+                    ("add_midi_notes", "create_midi_item", "mcp-midi-writer"))
+    _assert_needles(classic_descriptions["create_midi_item"],
+                    ("add_midi_notes", "insert_midi_item", "mcp-midi-writer"))
+
+
+def test_many_note_parts_point_at_the_writer_recommendation(classic_descriptions):
+    """P37: the recommendation must be actionable - server AND tool named.
+
+    The agent picks its server among several registered MCP servers; a bare
+    "use a MIDI-writing tool" cannot resolve to a call. Every entry point into
+    the note path carries the concrete `mcp-midi-writer :: generate_midi` pair.
+    """
+    for name in ("add_midi_note", "add_midi_notes", "insert_midi_item", "create_midi_item"):
+        _assert_needles(classic_descriptions[name], ("mcp-midi-writer", "generate_midi"))
 
 
 # ---------------------------------------------------------------------------
