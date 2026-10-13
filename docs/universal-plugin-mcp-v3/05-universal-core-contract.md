@@ -203,6 +203,16 @@ class PluginProvider(Protocol):
     def verification_policy(self) -> VerificationPolicy: ...      # tolerances/comparators/timing
     def capture_scope(self) -> CaptureScope: ...                  # mutable channels an op may touch
 
+# Optional hooks Core recognizes when a provider declares them (not part of the protocol,
+# because Core's callers must work without them):
+#   profile_source_rows(identity) -> list[{"file","sha256"}]   # cache-key material without a build
+#   adopt_profile(profile) -> None                              # take the served profile
+#   state_view(document) -> dict                                # P30: read-only descriptor view,
+#       attached to `plugin_state` data as `state_view`. It answers content a generic summary
+#       cannot express (for the first provider: which table each oscillator reads, by content
+#       digest and frame count). A provider without it answers exactly what it did before; a
+#       failure inside it is reported as a warning row, never as an error on a readable state.
+
 class StateCodec(Protocol):
     def decode(self, slice: TargetedStateSlice) -> DocumentView: ...
         # operates ON THE SELECTED SLICE, never on an undifferentiated track chunk (AUD-001)

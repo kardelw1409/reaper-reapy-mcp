@@ -182,23 +182,23 @@ def test_the_read_leg_resolves_every_measured_grid_point_of_the_host(registry_an
     2026-10-11 found that inverting an enum by *nearest midpoint* mis-resolves the
     values at a measured switch point (the host labels 0.0625 as "24dB"; the
     midpoint distance called it the member below). The grid below is the host's
-    own labelling of that parameter, recorded live in
-    `evidence/p19_enum_bands_through_host__*.json` - the layer's inversion is
-    compared against it point by point, with the counter-example (nearest
-    midpoint) recomputed here so the reason for `switch_points` stays a
-    measurement."""
+    own labelling of that parameter, recorded live and extracted **verbatim** into
+    `fixtures/vital_host_bands/filter_1_style_grid.json` (the three P19 recordings
+    agree point for point and the fixture carries all three digests). Since P32 the
+    test reads that deterministic fixture, never the newest file in the recorded
+    run archive - the layer's inversion is compared against the measurement point
+    by point, with the counter-example (nearest midpoint) recomputed here so the
+    reason for `switch_points` stays a measurement."""
     from pathlib import Path
 
     import json
 
-    evidence = Path(__file__).resolve().parent / "live" / "evidence"
-    candidates = sorted(evidence.glob("p19_enum_bands_through_host__*.json"))
-    if not candidates:
-        pytest.skip("the live band-map evidence is not present (live probes are optional)")
-    host_labels = {
-        point["normalized"]: point["display"]
-        for point in json.loads(candidates[-1].read_text(encoding="utf-8"))["controls"]["filter_1_style"]["grid"]
-    }
+    fixture = Path(__file__).resolve().parent / "fixtures" / "vital_host_bands" / "filter_1_style_grid.json"
+    document = json.loads(fixture.read_text(encoding="utf-8"))
+    assert document["control"] == "filter_1_style"
+    assert document["recorded_by"]["grids_agree"] is True, document["recorded_by"]
+    assert document["counts"]["points"] == len(document["grid"])
+    host_labels = {float(normalized): display for normalized, display in document["grid"]}
     assert len(host_labels) >= 33, len(host_labels)
     _registry, profile = registry_and_profile
     control = next(row for row in profile["controls"] if row["id"] == "filter_1_style")

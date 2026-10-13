@@ -52,6 +52,7 @@ from . import enum_boundaries as enum_boundaries_module
 from . import codec as codec_module
 from . import dependencies_rules as rules_module
 from . import depth as depth_module
+from . import wavetables as wavetables_module
 from .codec import VitalCodec
 from .profile_build import (
     DEFAULT_REGISTRY_DIR,
@@ -130,7 +131,14 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: in both conversion directions, and the percent-unit trap no longer fires on a
 #: **fraction** value space whose `%` is only the display's unit. Ranges are part of
 #: what a stored profile means, so the key must move (07 §3.4).
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r12"
+#: r13 (2026-10-13): the **wavetable channel** (`wavetables.py` + the codec's guard).
+#: A caller can now name a table by source (`wavetable` request -> `settings.wavetables.<i>`),
+#: and every write into a slot - semantic or raw `state` path - is guarded against the
+#: measured host-abort boundary (schema, no growth beyond what the engine holds, and
+#: `version` stamped from the live document, because the plugin restamps it). The write
+#: channel and the file it lives in are part of what the provider declares, so the key
+#: must move (07 §3.4).
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r13"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -141,10 +149,15 @@ _PROVIDER_FILES = (
     "calibration.py",
     "enum_boundaries.py",
     "source_facts.py",
+    "wavetables.py",
     "__init__.py",
 )
 
 _STATE_ROOT = codec_module.MUTABLE_ROOT
+
+#: The fields a `wavetable` request spec may carry. Closed on purpose: a typo
+#: (`fromPreset`, `slot`) must refuse rather than write a table nobody chose.
+_WAVETABLE_SPEC_KEYS = {"oscillator", "from_preset", "preset_slot", "table_id"}
 
 
 class VitalProvider:
@@ -621,6 +634,119 @@ class VitalProvider:
                 continue
             resolved.state[str(path)] = value
 
+        # Wavetable selection (P30): the table is document state and has NO host
+        # parameter (measured: the 775-control inventory holds only `*_wave_frame`,
+        # the position INSIDE a table). A caller therefore names a table by its
+        # SOURCE - a `.vital` preset on disk plus a slot - and this converts it into
+        # the same `settings.wavetables.<i>` path the raw state channel uses. The
+        # write itself stays one channel, and the guard that bounds it (schema, no
+        # growth, version stamping) lives in the codec, which is the only place that
+        # sees the LIVE document.
+        wavetable_specs = request.get("wavetable")
+        if wavetable_specs is not None and not isinstance(wavetable_specs, list):
+            wavetable_specs = [wavetable_specs]
+        for spec in wavetable_specs or []:
+            if not isinstance(spec, dict):
+                resolved.problems.append(
+                    {
+                        "wavetable": spec,
+                        "code": "InvalidValue",
+                        "message": "a wavetable spec must be an object",
+                        "detail": {"accepted_keys": sorted(_WAVETABLE_SPEC_KEYS)},
+                    }
+                )
+                continue
+            unknown = sorted(set(str(key) for key in spec) - _WAVETABLE_SPEC_KEYS)
+            if unknown:
+                resolved.problems.append(
+                    {
+                        "wavetable": dict(spec),
+                        "code": "InvalidValue",
+                        "message": f"unknown wavetable spec field(s): {', '.join(unknown)}",
+                        "detail": {
+                            "accepted_keys": sorted(_WAVETABLE_SPEC_KEYS),
+                            "example": {
+                                "oscillator": 1,
+                                "from_preset": "C:/path/to/some.vital",
+                                "preset_slot": 1,
+                                "table_id": "optional content check",
+                            },
+                        },
+                    }
+                )
+                continue
+            try:
+                slot = wavetables_module.check_slot(spec.get("oscillator"))
+            except InvalidValue as exc:
+                resolved.problems.append(
+                    {"wavetable": dict(spec), "code": exc.code, "message": exc.message, "detail": exc.detail}
+                )
+                continue
+            preset = spec.get("from_preset")
+            if not isinstance(preset, str) or not preset:
+                resolved.problems.append(
+                    {
+                        "wavetable": dict(spec),
+                        "code": "InvalidValue",
+                        "message": (
+                            "a wavetable spec needs `from_preset`: the table's content is what "
+                            "identifies it, and a preset file is the only source of one this "
+                            "layer can read (the plugin exposes no host-visible table list)"
+                        ),
+                        "detail": {"reason": "missing_from_preset", "accepted_keys": sorted(_WAVETABLE_SPEC_KEYS)},
+                    }
+                )
+                continue
+            slot_path = wavetables_module.path_for(slot)
+            if slot_path in resolved.state:
+                resolved.problems.append(
+                    {
+                        "wavetable": dict(spec),
+                        "code": "InvalidValue",
+                        "message": (
+                            f"two changes address the same wavetable slot ({slot_path!r}): the raw "
+                            "`state` request and this spec would race for it"
+                        ),
+                        "detail": {"reason": "duplicate_slot", "path": slot_path},
+                    }
+                )
+                continue
+            if any(row.get("path") == slot_path for row in resolved.wavetable):
+                resolved.problems.append(
+                    {
+                        "wavetable": dict(spec),
+                        "code": "InvalidValue",
+                        "message": f"two wavetable specs address the same slot ({slot_path!r})",
+                        "detail": {"reason": "duplicate_slot", "path": slot_path},
+                    }
+                )
+                continue
+            try:
+                found = wavetables_module.read_slot_from_preset(
+                    preset,
+                    oscillator=slot,
+                    preset_slot=spec.get("preset_slot"),
+                    expected_table_id=spec.get("table_id"),
+                )
+            except PluginError as exc:
+                resolved.problems.append(
+                    {"wavetable": dict(spec), "code": exc.code, "message": exc.message, "detail": exc.detail}
+                )
+                continue
+            resolved.state[slot_path] = found["value"]
+            resolved.wavetable.append(
+                {
+                    "oscillator": slot,
+                    "path": slot_path,
+                    "source": found["source"],
+                    "preset": found["preset"],
+                    "preset_slot": found["preset_slot"],
+                    "table_id": found["descriptor"]["table_id"],
+                    "n_frames": found["descriptor"]["n_frames"],
+                    "payload_bytes": found["descriptor"]["payload_bytes"],
+                }
+            )
+
         resolved.structural = bool(request.get("structural"))
         if resolved.structural:
             # The DISABLE set is a provider-side write on the caller's behalf, so
@@ -721,6 +847,17 @@ class VitalProvider:
     def codec(self) -> VitalCodec:
         return VitalCodec()
 
+    def state_view(self, document: Any) -> dict[str, Any]:
+        """The read view `plugin_state` attaches (optional hook, P30).
+
+        It answers the one question the parameter inventory cannot: **which table each
+        oscillator reads**. The table is document state (measured: no host parameter
+        selects it; the only wave-related controls are `*_wave_frame`, the position
+        INSIDE a table), so a caller needs the content ids and frame counts to know what
+        a write changed. Descriptors only - never the wave data.
+        """
+        return {"wavetables": wavetables_module.describe_slots(document or {})}
+
     def write_order(self) -> tuple[str, ...]:
         """Fixed document -> parameters (the measured ordering rule)."""
         return ("state", "parameters")
@@ -749,6 +886,10 @@ class VitalProvider:
             f"only the measured version(s) {sorted(SUPPORTED_VERSIONS)} are accepted",
             "one route per state write",
             "no line_mapping writes",
+            "a wavetable write replaces the table the engine holds and may not GROW it "
+            "(measured host-abort boundary: a larger payload does not land and once aborted "
+            "the host); the table is selected by content, and `*_wave_frame` only moves "
+            "INSIDE the selected table",
             "a control write is issued only when the host's parameter name at the declared "
             "index matches the control (verified live on every write; a mismatch refuses)",
         ]

@@ -61,6 +61,10 @@ def state_changes(resolved: ResolvedRequest) -> dict[str, Any]:
         "routes_create": [dict(spec) for spec in resolved.routes_create],
         "routes_update": [dict(spec) for spec in resolved.routes_update],
         "routes_remove": [dict(spec) for spec in resolved.routes_remove],
+        # Provenance for wavetable changes (P30): the value is already in `paths`, this
+        # names where it came from (oscillator, preset file, slot, content id) so the
+        # codec can report it and the dry run can show it. No write semantics of its own.
+        "wavetable": [dict(row) for row in resolved.wavetable],
     }
 
 

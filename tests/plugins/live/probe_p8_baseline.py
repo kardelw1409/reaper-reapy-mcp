@@ -43,8 +43,19 @@ from reaper_reapy_mcp.plugins.providers.vital import VitalProvider  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital import codec as VC  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-EVIDENCE_DIR = HERE / "evidence"
-RECOVERY_DIR = HERE / "recovery"
+if str(HERE) not in sys.path:  # so `live_harness` is importable when run as a script
+    sys.path.insert(0, str(HERE))
+
+from live_harness import (  # noqa: E402 - P32: run artifacts, never the repo
+    EVIDENCE_DIR,
+    RUN_DIR,
+    write_run_json,
+)
+
+#: A NEW recovery point goes to the run directory (class C, P32). The historical
+#: points were removed from the repository in P33 and live in the external research
+#: archive; `restore_p8.py` finds them through `REAPER_MCP_RECOVERY_SEARCH`.
+RECOVERY_DIR = RUN_DIR / "recovery"
 
 #: The controls whose write behaviour the live phase will use. Chosen from the
 #: pinned registry rows: affine (cutoff/volume/feedback/delay), enum (blend) and
@@ -68,16 +79,6 @@ def _utc() -> str:
 
 def _run_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def write_run_json(kind: str, payload: dict, directory: Path) -> Path:
-    """Per-run evidence: unique name + content hash, never overwrites a run."""
-    text = json.dumps(payload, indent=2, sort_keys=True)
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{kind}__{_run_stamp()}__{digest}.json"
-    path.write_text(text, encoding="utf-8")
-    return path
 
 
 def main() -> int:
@@ -257,7 +258,7 @@ def main() -> int:
     }
     recovery_path = write_run_json("p8_recovery", recovery_payload, RECOVERY_DIR)
     report["recovery_artifact"] = {
-        "path": str(recovery_path.relative_to(REPO_ROOT)),
+        "path": str(recovery_path),
         "sha256": hashlib.sha256(recovery_path.read_bytes()).hexdigest(),
     }
 
@@ -265,8 +266,8 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "evidence": str(path.relative_to(REPO_ROOT)),
-                "recovery": str(recovery_path.relative_to(REPO_ROOT)),
+                "evidence": str(path),
+                "recovery": str(recovery_path),
                 "identity": report["identity"],
                 "slice_lines": report["slice"]["lines"],
                 "outside_bytes_intact": report["slice"]["outside_bytes_intact"],

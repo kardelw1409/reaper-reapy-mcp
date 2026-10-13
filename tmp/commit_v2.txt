@@ -1,0 +1,40 @@
+Grid-aligned fill: stems, drums/bass MIDI, measured-grid alignment
+
+Companion of mcp-audiocpp's grid/grid_auto work (same day). The apply side now
+understands the v1.1 extension keys; a bundle without them behaves exactly as
+before.
+
+- manifest.py: loads grid / audio.source_offset_s / stems / midi.drums|bass /
+  midi_sources (fail-closed on unknown stem names, missing files, negative
+  offsets, non-positive grid.bar_s). clamp_regions now takes allow_overhang_s and
+  returns overhangs: a bar-aligned edge may poke up to half a bar past the audio
+  end and is KEPT (measured house case: bar 48 at 90.0 vs audio end 89.999)
+  instead of being clamped off the grid. A region that is skipped is no longer
+  also reported as a clamp.
+- apply.py: track layout is built from what the bundle carries - base five always,
+  vocals/instrumental FILL AI_VOCAL/AI_INSTR, drums/bass/other ADD
+  AI_DRUMS/AI_BASS/AI_OTHER and midi.drums/bass add MIDI_DRUMS/MIDI_BASS. Items all
+  sit at audio.start_s. Two measured REAPER behaviours are handled:
+  * item positions cannot be negative (SetMediaItemInfo_Value(...,'D_POSITION',
+    -0.42) returns 1 and changes NOTHING; +1.5 works), so the render's lead-in is
+    skipped with the take source offset (D_STARTOFFS) and the item is shortened by
+    the same amount;
+  * the controller inserts at the edit cursor and never sets the position, so
+    every item's position AND take offset are re-read and reported; a mismatch
+    becomes a warning instead of a silent lie.
+  project_duration for clamping is duration - source_offset (+ start_s).
+- __init__.py: the tool description documents the optional tracks and alignment.
+- tests: source-offset loading/defaults, negative-offset refusal, unknown stem,
+  missing stem/MIDI, bad bar_s, overhang tolerance (kept vs clamped vs skipped);
+  33/33 offline.
+- docs/audiocpp_manifest.md: synchronized copy updated with the v1.1 section
+  (grid/stems/MIDI rules + the E5/E6 verification records) and the local notes now
+  list four measured reapy/REAPER limits (marker names unreadable, no
+  TimeMap_SetTimeSigAtTime, no negative positions, cursor-based insertion).
+- README.md: the Audiocpp Manifest Fill section documents the stems/MIDI tracks and
+  the alignment.
+
+Live: house bundle -> 10 tracks / 10 items, every audio item with source_offset
+0.42, regions 0/31.875/61.875/76.875, drums enter at bar 9 (15.020 s), ok:true.
+DnB bundle -> 12/12 regions exactly on bars 0/8/36/44/64/80/96/104/124/128/145/159,
+MIDI_DRUMS 1176 notes, MIDI_BASS 614, ok:true.

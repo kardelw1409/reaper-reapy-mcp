@@ -1322,6 +1322,7 @@ def plugin_state(
     document = provider.codec().decode(slice_)
     routes = list(document.get("routes") or [])
     settings = document.get("settings") or {}
+    warnings: list[dict[str, Any]] = []
     structural_keys = list((resolution.profile.get("state") or {}).get("structural_keys") or [])
     wanted = [str(item) for item in (include or [])] or structural_keys
     inventory = {
@@ -1357,7 +1358,24 @@ def plugin_state(
             "block_chars": len(slice_.block_text),
         },
     }
-    return ok_envelope("plugin_state", data, meta=_meta(resolution, source=source))
+    # The provider's optional read view (P30). A provider that declares `state_view`
+    # answers with descriptor-shaped content a generic summary cannot express - which
+    # table each oscillator reads (content ids, frame counts) is document state with no
+    # parameter behind it, and the inventory does not carry it at all. Its failure must
+    # not turn a readable state into an error, so it is reported as a warning row and
+    # omitted.
+    view_hook = getattr(provider, "state_view", None)
+    if callable(view_hook):
+        try:
+            data["state_view"] = view_hook(document)
+        except Exception as exc:  # noqa: BLE001 - an additive view must not fail the read
+            warnings.append(
+                {
+                    "code": "state_view_failed",
+                    "message": f"the provider's state view raised {type(exc).__name__}: {exc}",
+                }
+            )
+    return ok_envelope("plugin_state", data, warnings=warnings, meta=_meta(resolution, source=source))
 
 
 # ---------------------------------------------------------------------------

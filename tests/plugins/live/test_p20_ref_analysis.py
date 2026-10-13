@@ -32,11 +32,24 @@ REFERENCE = Path(
     "E:/samples/download/Stickz - Future Bass Toolkit/Stickz - Future Bass Toolkit - Sample Pack/"
     "Stickz FBT - 808s/Stickz FBT - 808 10 - F#.wav"
 )
-PREVIOUS = H.EVIDENCE_DIR / "p19_808_patch__20261011T143226Z.wav"
+#: The P19 render this analysis compares against. It was removed from the repository
+#: in P33 (the research archive holds it): resolve it through the harness search and
+#: point `REAPER_MCP_EVIDENCE_SEARCH` at the archive when re-running this live test.
+PREV_PATTERN = "p19_808_patch__*.wav"
 #: The phrase's first note (E1) inside the P19 render, and the last note + tail.
 PREV_NOTE1 = (0.18, 1.16)
 PREV_TAIL = (2.58, None)
 E1_HZ = 41.2034446
+
+
+def _previous_render() -> Path:
+    previous = H.newest_evidence(PREV_PATTERN)
+    if previous is None:
+        pytest.skip(
+            "the recorded P19 render is not available: point REAPER_MCP_EVIDENCE_SEARCH at the "
+            "research archive (repo_cleanup/p33_*/archive/files/tests/plugins/live/evidence)"
+        )
+    return previous
 
 
 def _sha(path: Path) -> str:
@@ -52,7 +65,7 @@ def _row(name: str, reference: Any, previous: Any, note: str = "") -> dict[str, 
 
 def test_p20_reference_measured_and_previous_render_compared():
     assert REFERENCE.is_file(), f"the reference sample is missing at {REFERENCE}"
-    assert PREVIOUS.is_file(), f"the previous render is missing at {PREVIOUS}"
+    PREVIOUS = _previous_render()
     ref_sha_before, prev_sha_before = _sha(REFERENCE), _sha(PREVIOUS)
     stamp = H.run_stamp()
 

@@ -86,8 +86,9 @@ def test_live_vital_read_is_read_only_and_shape_checkable():
     rebuilt = VC.rebuild_block_text(framing, view["document"])
     assert rebuilt == slice_.block_text, "a no-op rebuild of the live block must be byte-identical"
 
-    # read-only evidence artifact, recorded beside the other live evidence
-    evidence_dir = Path(__file__).resolve().parent / "evidence"
+    # read-only evidence artifact: written to the run directory (outside the repo, P32)
+    from live_harness import EVIDENCE_DIR as evidence_dir  # noqa: PLC0415 - local by design
+
     evidence_dir.mkdir(parents=True, exist_ok=True)
     stamp = __import__("datetime").datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     payload = {

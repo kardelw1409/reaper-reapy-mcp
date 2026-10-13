@@ -31,7 +31,11 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-EVIDENCE_DIR = Path(__file__).resolve().parent / "evidence"
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # so `live_harness` is importable when run as a script
+    sys.path.insert(0, str(HERE))
+
+from live_harness import EVIDENCE_DIR  # noqa: E402 - run artifacts, never the repo (P32)
 
 REFUSAL = (
     "REFUSED: this probe removes and re-adds an FX (a live mutation). It requires "

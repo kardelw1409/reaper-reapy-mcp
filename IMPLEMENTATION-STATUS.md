@@ -4043,3 +4043,415 @@ Envelope *shapes* (`Convex`/`Linear`/`Concave`, `Digital`/`Analog`) were deliber
 alone: their display labels are measured, but their *meaning* is not, and a guessed shape is
 exactly the kind of claim this round refuses. The synonym table's provenance is still this
 repository's own judgement, and a discovery-path call still costs ~1.8-3.0 s.
+
+## 36. P30 - the wavetable channel, the control P29 never wrote, and a render path that
+carries only the older tracks (2026-10-13)
+
+### 36.1 What was asked, and what the phase produced
+
+P29 left two audible complaints: Surge XT "plays a plain sine" and Vital "still sounds like a
+saw". This round was asked to find the *reason* (not to guess one), to establish what the MCP
+can actually do about the waveform, to fix whatever is missing **inside the existing MCP**, and
+to verify the result on two **new** tracks - without touching the user's tracks, without saving
+the project, and without claiming anything that was not measured.
+
+The result in one line: **Vital's source was never changeable through the parameter channel at
+all** (it is document state, and the default is a one-frame *saw*), so P30 adds a guarded
+wavetable capability, applies a real sine through it, wires a real pitch drop as a modulation
+route, repairs the Surge patch's missing filter-envelope route, and reports the audio
+confirmation **as unavailable** with the measurement that shows why.
+
+### 36.2 Root cause of "Vital remained a saw" - three measured facts, none of them a guess
+
+1. **P29's patch never touched the source.** The recorded request is `env_1_*`,
+   `filter_1_cutoff: 60.0`, `filter_1_style: "24dB"`, `osc_1_level: 1.0`
+   (`p29_808__20261012T231050Z__b609207168e3.json`). `60.0` is the document-space value the
+   measured law maps to **261.6 Hz** (`Hz = 261.625565 * 2**((native - 60)/12)`), i.e. the
+   *neutral* position - not the ~50 Hz lowpass the P20 recipe used to turn a saw into a
+   near-sine. So the filter was wide open.
+2. **The default source is a one-frame sawtooth.** `plugin_state(op="inspect")` on the new
+   instance reports all three oscillator slots holding the plugin's INIT table
+   (`table_id 1e4f3dfee12a65b88d98`, `n_frames: 1`, 2048 samples/frame, `name: "Init"`). The
+   decoded frame is a **perfect saw**: h2 = 0.500, h3 = 0.3333, h4 = 0.25 (1/h), measured
+   offline from the registry resource the POC extracted from a preset file.
+3. **`osc_1_wave_frame` cannot help.** A one-frame table has no second frame to move to, so the
+   only wave-related host control is *inert* - and the 775-control inventory contains no
+   wavetable selector at all (independently confirmed against the plugin's own source by the
+   GLM pass: the parameter registry has no table selector; the UI's preset selector is not a
+   `vital::Parameter`; the table lives in `settings.wavetables`).
+
+### 36.3 The capability (minimal; the existing state channel does the writing)
+
+The state channel already existed (`plugin_write` `state` paths -> the Vital codec's
+document splice). What was missing was a **safe way to name a table** and a **guard** for the
+class of write that once aborted REAPER. Added:
+
+* `providers/vital/wavetables.py` - a verbatim port of the POC's measured table model plus the
+  rules: a table is identified by a **content digest** (never by its cosmetic `name`; the
+  corpus labels 112 distinct tables "Init"), a **growing** write is refused (frames, total
+  samples, wave-carrying content bytes; the label fields are free), `version` is stamped from
+  the live document because the plugin restamps it, and a slot must already exist in the live
+  document. The evidence travels in the refusal: an 8-frame / 87,855-byte payload did **not
+  land** and, with a mismatched `version`, **aborted `reaper.exe`** (ucrtbase.dll,
+  `0xc0000409`), while a non-growing single-frame replacement (11,159 -> 11,149) **committed
+  and verified** live in the 2026-09-29 proof run.
+* `request.wavetable` - a semantic spec (`{"oscillator": 1, "from_preset": "<file>.vital",
+  "preset_slot": 1, "table_id": "<content id>"}`) that the provider resolves into the same
+  `settings.wavetables.<i>` path; the guard runs on the **raw** state path too, because a
+  caller can reach the same slot directly.
+* `plugin_state` gains `state_view` (an optional provider hook) reporting, per slot, the
+  content digest, frame count, sample count and payload bytes - the read-back proof a formatter
+  text cannot give. A provider without the hook answers exactly what it did before.
+* Rollback: a slot is restored as **one whole-table change** (never its leaves, which the guard
+  refuses), and only when the live slot differs from the captured one.
+* Provider revision **r12 -> r13**; `wavetables.py` joins the hashed provider files.
+
+### 36.4 Live run (two new tracks, MCP only; project NOT saved)
+
+`tests/plugins/live/probe_p30_live_808.py` - 111 calls, 278.5 s wall, 0 transport errors,
+549,936 response bytes. Tracks created for this phase: **10** `P30 - Vital 808 Diagnostic`,
+**11** `P30 - Surge 808 Diagnostic`; a third (`P30 - Render Probe (ReaSynth)`) exists only as
+the render control described in 36.5. No pre-existing track was written to; `composite` FX
+order is verified (`get_fx_list`: instrument, ReaEQ, ReaComp on both).
+
+**Vital** (`fx_index 0`, provider path): state read -> **sine table installed** through the new
+capability (dry run 6.3 s, apply verified, `table_id 1e4f3dfee12a65b88d98 ->
+b200cf7c18768ff0f16c`, osc 2/3 untouched) -> 12 controls written in ONE batch
+(`filter_1_on/style/cutoff`, `osc_1_level`, `env_1_*`, `distortion_on/type/drive/mix`,
+`ALL_VERIFIED`, 21.5 s) -> `env_2` shaped to a 0.5 ms / 50 ms pitch blip -> route
+**`env_2 -> osc_1_transpose`, amount `0.20788991451263428`** (= 20.0000 st through the measured
+96.2048 st/unit law), `ALL_VERIFIED`, and read back from the plugin's own route table.
+`osc_1_wave_frame` is read and reported as inert (single-frame table), not written.
+
+**Surge XT** (providerless): the artifact's own list is searched with a query that **names**
+`feg mod amount`, and the control P29's query missed (`a_filter_1_feg_mod_amount`, index 321)
+is picked and written: `LP 24 dB` filter type + 600 Hz + **+36.00 semitones** FEG amount + FEG
+times, so the filter envelope is now routed to something. `voice_sine`, `amp_env_808` and the
+tone step are `ALL_VERIFIED` with 0/5, 0/4 and 0/10 display disagreements.
+
+### 36.5 The audio verification, and the honest reason it is NOT available
+
+`render_project` was **uncallable** before this round: it ended in `**kwargs`, which the
+transport models as one *required* field, so every client call failed validation before the
+body ran (`1 validation error for render_projectArguments / kwargs Field required`). Fixed
+(signature now matches the schema; the controller never used the extras).
+
+With the tool callable, every render returned a file of exactly the requested length, format
+and sample rate - and **all zeros**:
+
+| render window | content | result |
+|---|---|---|
+| 31.95-47.0 s | the two P30 tracks (MIDI verified: 4 notes each, items `muted: false`) | peak 0.0 |
+| 47.95-54.5 s | a built-in **ReaSynth** + the same phrase on a P30-created track | peak 0.0 |
+| 55.95-59.5 s | a plain **audio item** (1 kHz tone, verified peak 0.5) on a P30 track | peak 0.0 |
+| 0.0-5.0 s | the **P28/P29** tracks' items | **peak 1.0, rms 0.154** |
+| 0.0-5.0 s + a 1 kHz tone at 1.0 s on a P30 track | the above plus the tone | 1 kHz band energy *below* the 500 Hz band -> the tone is not in the mix |
+
+So the render path works, and **the material on the tracks created in this phase does not reach
+the rendered master mix**, while older tracks do - independent of the instrument (a built-in
+synth behaves the same) and of MIDI (a plain audio item does too). Track faders read 1.0
+(linear), the master is at 1.0 with no mute and no FX, and every item reports `muted: false`.
+What remains is a per-track/session state the tool surface can neither read nor change: there
+is no track mute/solo verb, `get_track_list` carries no such flags, and REAPER's render
+*source* selection is not among the project-info keys `render_project` sets (it sets file,
+pattern, bounds, sample rate and channels and then fires `42230`).
+
+**No audio claim is made.** The patches are verified by parameter read-back and by content
+identity (the wavetable digest), not by ear, and the tracks are left in the session so a human
+can listen. This is exactly the boundary the phase's own brief allows for - stated, not papered
+over.
+
+### 36.6 Separate findings (not fixed, named)
+
+1. **`create_track` tracks are not audible in this session's renders** (36.5). Whether the
+   cause is a solo left engaged on an older track, a per-track routing state, or REAPER's saved
+   render source is **not decidable through the tool surface**; the surface gap is the finding:
+   a track's mute/solo and routing are not exposed, and `render_project` cannot read or set the
+   render source.
+2. **`get_selected_items` reports the items of a track that are not selected** (`selected:
+   false` on every row it returns) - it behaves like "items of the selected track".
+3. **`get_midi_notes` takes `item_id` while `add_midi_notes`/`get_item_properties` take
+   `item`** - two spellings for the same handle across neighbouring tools; both are read from
+   the live schema now, and the mismatch costs a round-trip per mistake.
+4. **`add_midi_notes` positions must be `"<bar>:<beat>,<frac>"`**: a `"17:0:0,000"` position is
+   accepted as a *call* and answered `ok: false`, which the round's first attempt did - the
+   evidence recorded the failure honestly and the render came back silent, which is how it was
+   found (the *summary* print hid it, so sections now record per track).
+
+### 36.7 Tests
+
+`tests/plugins/test_p30_wavetable.py` (**18 tests**): the guard fires on the semantic op *and*
+on the raw path; a growing table is refused before any write with `write_calls_attempted == 0`
+and the abort evidence in the detail; a table without `Wave Source` frames, a write *inside* a
+slot, a slot the document does not hold and an unstampable write are each refused with typed
+detail; the version is stamped and a differing read-back **names the field** (`["version"]`);
+the rollback restores a slot as one whole-table change and leaves matching slots alone; the
+spec vocabulary refuses unknown keys, a missing source, a table-id mismatch and two specs on
+one slot; `plugin_state` attaches the view (and a provider without the hook is unchanged); the
+tool accepts the spec and reports `plan_summary.n_wavetables` + the preview.
+
+Offline suite: **895 passed / 1 skipped** (`py -3.11 -m pytest -q -p no:cacheprovider
+tests/plugins --ignore=tests/plugins/live`). Deliberate pin updates: `artifact_paths() 9 -> 10`,
+isolation `n_structs 9 -> 10`, provider revision r12 -> r13.
+
+### 36.8 Residuals (named, not fixed)
+
+* **Module-level wavetables are out of reach**: a multi-frame table is exactly the write class
+  that aborted the host, so `*_wave_frame` stays inert until a multi-frame table is loaded
+  through the plugin's own UI (the POC's settled experiment). The capability therefore selects
+  between *single-frame* tables only.
+* **No audio, no ear** (36.5). The pitch drop, the saturation and the envelopes are
+  read-back-verified values and a verified route, not a heard 808.
+* **The Surge patch has no pitch drop at all**: the artifact's 2,858 controls contain no
+  modulation matrix, so nothing can route an envelope to pitch; the filter-envelope attack is
+  the only transient available and it is now actually wired.
+* **The `wavetable` spec reads a file from disk.** It is a read-only local artifact (like the
+  calibration files), the source is named in the preview and in every verification row, and a
+  content id is required when the caller wants one - but a preset file is outside the
+  repository's own storage classes and that is worth a future decision, not a silent one.
+
+## 37. P31/P32 - the repository-cleanliness audit, and where a run's results live from now on
+
+### 37.1 What the audit found (P31, read-only, nothing changed)
+
+The index held **501 files against 479 in HEAD** (38 staged: +22,345/-15 lines, the P30 round),
+with one untracked file the owner marked protected (`composer_v1_2_lm_probe.md`, never committed,
+`git log --all` empty). The generated evidence was the whole story: `tests/plugins/live/evidence/`
+held **371 files - 212 JSON (19.92 MB) all tracked, 147 WAV (124.16 MB) all ignored, 12 PNG
+tracked** - and it was not noise: **49 files are cited by name** from `IMPLEMENTATION-STATUS.md`,
+the register, `src/` (`resolve.py` cites `p8_l3_identity__…`, `profile_build.py` cites
+`p18_calibration__…` and `p19_voice_transpose_space__…`) or a test/probe; 4 are **inputs**
+(`p19_enum_bands_through_host__*` was read by `test_p19_enum_positions.py` as "the newest file",
+`p29_table_refinement__…` by `probe_p29_refinement_live.py`, `p18_bass_patches.json` by seven live
+tests, `recovery/p8_recovery__*.json` by `restore_p8.py`).
+
+Measured duplicates (same content digest / `nDiff == {utc}`): `p27_reeq_third_subject` and
+`p27_track1_repair` byte-identical pairs; 19 timestamp-only `p7_vital_read` reruns; single reruns in
+`p18_cache_freshness`, `p20_baseline_read`, `p20_reanalysis`, `p19_patch_host_verification`,
+`p8_restore`. Two hazards were named: `pytest tests/plugins` **collects** the 35 live tests (30 carry
+`live_write`, no env gate) and with REAPER open they write to the P18-P20 workbench (the incident in
+§33), and `probe_p29_benchmark.py` hard-coded `C:\repos\reaper-reapy-mcp`.
+
+### 37.2 The policy (P32): four storage classes, one writer
+
+| class | what | where | in Git |
+|---|---|---|---|
+| A | source, tests, deterministic fixtures, docs, remediation records | the repository | yes |
+| B | runtime/prepared: profile cache, discovery artifacts, calibration, enum boundaries | `%LOCALAPPDATA%\reaper_reapy_mcp\{cache,discovery,calibration}` | no |
+| C | generated run evidence: evidence JSON, WAV/PNG, report, recovery points | `%LOCALAPPDATA%\reaper_reapy_mcp\run_artifacts\<stamp>__<task>__<pid>\` | no |
+| D | probes and live tests (reproducible tools) | `tests/plugins/**` | yes (output is C) |
+
+The rule is a property of the code, not a convention: `tests/plugins/live_harness.py` is the only
+writer, and it defaults outside the repository. `REAPER_MCP_EVIDENCE_DIR` writes **exactly** into a
+named directory, `REAPER_MCP_RUN_ARTIFACTS` moves the root (one directory per run still),
+`REAPER_MCP_RUN_TASK` names the task, and `REAPER_MCP_EVIDENCE_SEARCH` pins the roots a **reader**
+searches. The full statement is `docs/universal-plugin-mcp-v3/12-testing-strategy.md` §11; the
+agent-facing rules are the new `AGENTS.md`.
+
+### 37.3 What changed in the code (all measured offline)
+
+* `live_harness.py`: `LEGACY_EVIDENCE_DIR`/`LEGACY_RECOVERY_DIR` (inputs only), `run_dirs()`
+  (once per process), `new_run_dir()`, `RunReport` + `render_run_report()` + `write_run_report()`
+  (`report.md` + `run.json` with provenance and **relative** evidence links), `finalize_run()`
+  (status/cost/start derived from the payload), `newest_evidence()`/`evidence_candidates()`,
+  and an `atexit` summary so even an un-updated probe leaves a short report. `write_run_json` now
+  takes `directory=None` (default: this run's evidence dir), writes **LF bytes** (a digest over the
+  text must describe the file on disk - P23's trap), and on failure prints a loud warning and
+  returns `None` instead of raising. `EVIDENCE_DIR`/`RUN_DIR` resolve lazily (importing the harness
+  creates nothing).
+* **16 writer files** stopped defining their own in-repo directory (`probe_fxguid`, `probe_l3_read`,
+  `probe_p8_baseline`, `probe_p21_cache_timing`, `probe_p21_profile_completeness`,
+  `probe_p22_host_calibration`, `probe_p23_enum_boundaries`, `probe_p23_enum_gap_census`,
+  `probe_p23_read_agreement`, `probe_p24_continuous_agreement`, `probe_p24_warm_revision`,
+  `probe_p25_range_acceptance`, `probe_p26_live_inventory`, `probe_p23_preload_offline`,
+  `probe_p26_generic_discovery`, `test_live_vital_read`); the live tests were already harness users,
+  so they moved for free.
+* **Readers got an explicit input**: `p20_reanalysis`/`p20_final_plots`/`test_p20_ref_analysis`/
+  `test_p20_probe_a` read `LEGACY_EVIDENCE_DIR` (the pinned P19 WAV is an archive input);
+  `probe_p29_refinement_live` reads through `evidence_candidates()`; `probe_p29_benchmark` lost its
+  hard-coded path and prints every resolved input; `restore_p8` searches the archive and the run
+  directories (new recovery points are written to the run directory by `probe_p8_baseline`).
+* **The one test that read "the newest evidence file" now reads a fixture**:
+  `fixtures/vital_host_bands/filter_1_style_grid.json` (65 points, 36 labelled, extracted
+  **verbatim**; the three P19 recordings agree point for point and all three digests are recorded)
+  with a builder `fixtures/build_vital_host_bands_fixture.py` that refuses when recordings disagree.
+* Nine probes emit the rich report via `finalize_run` (P30 audit/live_808/render/audio_analysis,
+  P29 808, P28 live-musical, P27 808-bass, P22 calibration, P23 enum boundaries); every other probe
+  gets the exit-time summary.
+
+### 37.4 What the tests prove
+
+`tests/plugins/test_p32_evidence_policy.py` (**15**): the default root is outside the repository; the
+verbatim override; one directory per run (never shared); LF bytes and the digest-in-name;
+`report.md`/`run.json` fields and **relative** links; a failed save warns and returns `None`; an
+un-finalized run still leaves a summary (and a second call is a no-op); **a source guard that fails
+if any module under `tests/plugins` assigns a repository-local evidence directory again**; the P19
+test no longer names the archive; the fixture's provenance and the builder's byte-for-byte
+reproduction (into a temp target - the test never rewrites a tracked file).
+
+Offline suite: **909 passed / 2 skipped** (`py -3.11 -m pytest -q -p no:cacheprovider tests/plugins
+--ignore=tests/plugins/live`; 896 before this round + 15 new). The two skips are data-dependent and
+pre-existing: `test_p26_modules_and_replay.py:378` ("this fixture produced no unclassified control")
+and the live read path `test_p3_conformance.py:28` - REAPER is reachable right now and its first
+track has no FX, which is an environment fact, not a regression.
+
+### 37.5 Deferred to an owner-approved cleanup (nothing deleted or un-tracked here)
+
+**No file was deleted, moved, renamed or un-tracked, and the index was not touched.** Candidates are
+(1) the **25 provable duplicates** - 19 timestamp-only `p7_vital_read` reruns (content-identical to
+the cited `…20261011T033255Z`; `…201056Z` and `…20261012T175802Z` differ in
+`block_lines`/`n_active_routes` and are **not** candidates), the two byte-identical pairs
+(`p27_reeq_third_subject__…181926Z`, `p27_track1_repair__…182801Z`), and one each in
+`p18_cache_freshness__…180059Z`, `p19_patch_host_verification__…150556Z`,
+`p8_restore__…211154Z`/`…211216Z` - and (2) the **67 uncited members of families that have a cited
+canonical** (~7.5 MiB; the largest are `p26_generic_discovery_replay` x4 = 4.34 MiB,
+`p8_4_state_write` x6 = 2.73 MiB, `p23_enum_boundaries` x1 = 1.66 MiB, `p8_restore` x5 = 1.36 MiB,
+`p29_808` x6 = 0.70 MiB; two of them - `p20_baseline_read__…154723Z`, `p20_reanalysis__…164511Z` -
+are same-content reruns inside their own family), plus `tmp/commit_manifest.txt` (byte-equal to the
+message of HEAD `a8c6345`); the exact 92-path list was generated read-only into
+`%TEMP%\p32_cleanup_candidates.txt`. Exceptions that must **stay**: every cited file, the `p30_808`
+failure record and the P30 render diagnostics (the only raw evidence of §36.6 #1), the two
+`p25_range_acceptance` "retained as history" files, the three `p19_enum_bands_through_host`
+recordings (the fixture's provenance, and the builder test reproduces the fixture from that pinned
+root), `p29_table_refinement__…223508Z`, `p18_bass_patches.json`, `recovery/p8_recovery__*.json`, and
+`composer_v1_2_lm_probe.md`. `src/reaper_reapy_mcp.egg-info/` is untracked build output. Rewriting
+the 7 commits that carry the evidence (`c6e76b9`…`cd737a6`) is a separate, explicitly approved
+operation with a mirror clone as the safety net. `.gitignore` stays as it is: outputs no longer land
+in the tree, so a new rule is unnecessary, and a broad one would hide the next evidence instead of
+fixing its path.
+
+
+
+## 38. P33 - the evidence purge: working tree, history and the published branch
+
+**Brief.** Execute the cleanup P32 only planned, and do it for real: (1) an external, verified backup
+first; (2) decouple tests and production code from generated run evidence; (3) remove the generated
+evidence and the one-off research scripts from the working tree **and from Git history**; (4) update
+the published branch (`origin/feature/vst-bridge`) with `--force-with-lease` if that is safe;
+(5) preserve every uncommitted P28-P32 change and the protected files (`composer_v1_2_lm_probe.md`,
+`tmp/e5_house.py`, `tmp/list_tabs.py`); no commits, and no `reset`/`stash`/`checkout`/`restore`/`clean`.
+
+### 38.1 What left the repository
+
+| subject | files | in Git history? | now |
+|---|---|---|---|
+| `tests/plugins/live/evidence/*.json` | 200 | yes (tracked) | archive |
+| `tests/plugins/live/evidence/*.png` | 12 | yes (tracked) | archive |
+| `tests/plugins/live/evidence/*.wav` | 147 | **no** - ignored by the pre-existing `*.wav` rule | archive |
+| `tests/plugins/live/recovery/p8_recovery__*.json` | 2 | yes (tracked) | archive |
+| one-off probes / plot scripts (`tests/plugins/live/probe_*.py`, `p20_*.py`, `tests/plugins/probe_p2x_*.py`) | 36 (32 tracked + 4 staged-only) | partly | archive |
+| `tmp/commit_manifest.txt`, `tmp/e3a_dry.py`, `tmp/e3b_apply.py`, `tmp/e3c_full.py` | 4 | no | archive |
+
+**246 paths left history** (the exact `literal:` list is `state/filter_paths.txt`): 212 evidence
+(200 JSON + 12 PNG), 2 recovery points, 32 probes. **167 further files left the working tree only**:
+the 147 WAV, 16 staged-but-never-committed (12 evidence + 4 `probe_p30_*.py`), and the 4 `tmp/` files.
+The whole set is **413 files / 146.0 MiB** in the archive, each one SHA-256-verified after the copy
+(`archive/manifest.json` carries path, bytes, sha256, class, `git_status`, `in_refs`, reason, and a
+`sha256_verified_after_copy` flag per file; `archive/README.md` holds the restore commands).
+The 36 removed tools are gone as *scripts* only: their measurements live in this journal, in
+`18-remediation-register.md`, in the tests they produced, and - where a product input depended on them
+(host calibration, enum boundaries) - the probe **stayed**.
+
+### 38.2 The decoupling that had to land first
+
+Removing evidence from history is only safe once nothing needs it, and two things did:
+
+* the **Vital host-bands fixture** was extracted through
+  `tests/plugins/fixtures/build_vital_host_bands_fixture.py`, which now separates the pinned host
+  facts (`CONTROL`, `HOST_CALL`, `PROBE_ID`) from the pure grid functions
+  (`grid_points()`, `extract_grids()`, `assemble()`, `serialize()`, `provenance_rows()`) and refuses
+  (`ExtractionRefused`) when recordings disagree. `test_p32_evidence_policy.py` proves the committed
+  fixture (`vital_host_bands/filter_1_style_grid.json`, 65 points / 36 labelled, 4192 bytes) is
+  **reproduced from the pure functions alone**, with the archive absent;
+* the **P20 re-analysis** and the **P8 restore** read *recordings*, so they now resolve them through
+  the harness (`H.newest_evidence`, `H.recovery_search_roots()`) and **skip / refuse with a named
+  reason** when the archive is not mounted: `REAPER_MCP_EVIDENCE_SEARCH` and the new
+  `REAPER_MCP_RECOVERY_SEARCH` (both `os.pathsep`-separated) are the explicit roots. No default root
+  points at the archive, so a hermetic run cannot depend on it silently.
+
+A record name stays valid **as an id**: `resolve.py`, `profile_build.py`, the journal and the register
+cite ids, `test_p11_force_and_identity.py` / `test_p12_safety_gates.py` assert the id *string*, and
+**no code opens a file under the removed directories** (the only remaining users of
+`LEGACY_EVIDENCE_DIR` / `LEGACY_RECOVERY_DIR` are the two search-root helpers).
+
+### 38.3 The rewrite, measured
+
+`git filter-repo` rewrote every ref. Of the 44 commits on the branch, **16 kept their sha and 28 were
+rewritten** - the first is `665608c` (the commit that introduced evidence) -> `d6c9bf3`; everything
+after it moved because its ancestor changed.
+
+| ref | before | after |
+|---|---|---|
+| `feature/vst-bridge` (local, `08fb0a3`) | `08fb0a3` | `16e677e` |
+| `refs/remotes/origin/feature/vst-bridge` (published tip `a8c6345e`) | `a8c6345e0a3b4426b0fa4e2b81cca1d29e68000b` | `231ffa559cdf5757284ab07d427913a3b52d7704` |
+| `main` / `origin/main` (`b638dc9`) | `b638dc9` | unchanged (its history never held evidence) |
+
+**Tree-level proof that nothing else changed** (mirror vs rewritten): `git diff --name-status` between
+the old and new published tips is **246 `D` entries, 0 modifications, 0 additions**, and the same
+comparison for the unpublished commit (`08fb0a3` vs `16e677e`) gives 0 additions and 0 content
+differences - every surviving path has the **same blob sha** in both trees. `git ls-tree -r` over both
+tips: 479 -> 233 paths, difference exactly the declared removal set.
+
+**Reachability after the rewrite:** `git rev-list --objects --all` (631 objects) reaches **0** of the
+246 removed paths; `refs/original/*` was not recreated, and the `refs/codex/…` checkpoint ref holds
+no path under `tests/plugins/live/`.
+
+### 38.4 Verification of the *uncommitted* work (the recovery was byte-checked, not assumed)
+
+The round's own uncommitted changes were reconstructed from the pre-surgery backup and checked twice:
+per file (each reconstruction reproduced the new-blob sha of its patch header, `sha_ok=True` for all
+30) and in aggregate - `git patch-id --stable` over the backup patch **minus the removal sections**
+equals `git patch-id` over the restored diff: staged `00931d16d2423e76e499c8c0ece056e2f9d886fa`,
+worktree `a8cf2ce7530fd91c6c8ba17ee23c675125875332`. The staged set is 18 files (+1746/-15) and the
+unstaged set 12 files (+696/-60), i.e. exactly the P28-P32 work.
+
+| check | result |
+|---|---|
+| `py -3.11 -m pytest -q -p no:cacheprovider tests/plugins --ignore=tests/plugins/live` | **911 passed, 2 skipped** |
+| the same with `REAPER_MCP_EVIDENCE_SEARCH` / `REAPER_MCP_RECOVERY_SEARCH` on an **empty** directory | **911 passed, 2 skipped** (hermetic) |
+| `tests/manifest tests/test_midi_mock.py` | **35 passed** |
+| `tests/plugins/test_p32_evidence_policy.py` | **17 passed** |
+| `composer_v1_2_lm_probe.md` sha256 | `81A9093E…4DD69` - unchanged |
+
+### 38.5 The published branch
+
+`git ls-remote origin refs/heads/feature/vst-bridge` still equalled the recorded
+`a8c6345e…` immediately before the push, so the lease was satisfied:
+`git push --force-with-lease=refs/heads/feature/vst-bridge:a8c6345e… origin 231ffa5…:refs/heads/feature/vst-bridge`
+-> `+ a8c6345...231ffa5 (forced update)`. The remote now advertises `231ffa5…`; the **owner's
+unpublished commit was not published** (`231ffa5` is its parent, and the local branch stays exactly
+one commit ahead, as before the rewrite). `main` was not touched: it is identical on both sides.
+
+### 38.6 Incident and recovery (recorded because it is part of the round's cost)
+
+A `git filter-repo` invocation targeted a clone but executed in the **main repository's** working
+directory, so P33's own history rewrite happened in place: 44 commits rewritten, the `origin` remote
+removed, `refs/remotes/origin/*` converted into local branches, the index reset and the worktree
+reset to the rewritten tip. Two things made this survivable and neither was luck: the **mirror taken
+before the surgery** (`repo_cleanup/p33_*/mirror.git`, plus `mirror2.git` and `state/`: staged and
+unstaged patches, LF-normalised copies, `index_ls_files_stage.txt` with blob shas, the untracked
+copies), and the fact that the *content* of every commit survived the rewrite (proved in 38.3).
+
+What had to be rebuilt: the 30 files whose content lived **only in the index or the working tree**
+(their blobs had been pruned and the files zeroed by the reset) - reconstructed from the backup patch
+and verified per blob; the `origin` remote; `refs/heads/main`, the three
+`refs/remotes/origin/*` caches and `refs/remotes/origin/HEAD`; and the index itself (`git hash-object -w
+--path=…` for the 30 reconstructed blobs). The lesson is in `AGENTS.md`: back up the **index content**,
+not just the refs - staged work is unreachable and therefore prunable, and a patch is the only copy
+that survives a prune.
+
+### 38.7 Residuals, stated plainly
+
+1. The archive is now the **only** copy of the recorded evidence (WAV renders, PNG plots, the 36
+   one-off probes, the P8 recovery points). The repository keeps the tools, the ids and the journal.
+2. `refs/remotes/origin/develop` (`c2c0bd5`) was restored to its pre-incident value, but the remote
+   does not advertise a `develop` branch: it is a **stale cache**, clean of removed paths, and any
+   future `git fetch --prune` will drop it again.
+3. `.gitignore` was not changed. Its pre-existing `*.wav` (and `samples/`, `peaks/`) rules are what
+   kept the 147 WAV invisible to `git status`; they are inert for evidence now, because the writer
+   cannot place a file inside the repository. No rule was added, and no broad rule was extended.
+4. Historical citations of `tests/plugins/live/evidence/…` in this journal (§<=37), in docs 12/14/18
+   and in three source docstrings are **record ids**; 12 §11 and `AGENTS.md` rule 1 say where those
+   files are. 12 §11 carries the corrected counts; doc 14 §5 now points at the current policy.
+5. No commits were made in this round: the P28-P32 work is still staged/unstaged, exactly as the
+   brief required.

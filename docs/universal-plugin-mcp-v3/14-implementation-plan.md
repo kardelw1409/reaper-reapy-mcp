@@ -1086,7 +1086,9 @@ why the decision does not move a contract.
 5. **The live read validation that did run:** the read conformance suite and the read-only probe ran
    against the running REAPER and recorded identity (`fx_name`, `class_id`, `module`, `param_count`),
    the located slice span, byte-intactness outside the span and a batched parameter read; the evidence
-   artifact is named per run under `tests/plugins/live/evidence/`.
+   artifact is named per run under `tests/plugins/live/evidence/` in this round's transcript — since
+   P33 a run's artifact is written **outside** the repository and the transcript path is a record id
+   (12 §11, `AGENTS.md` rule 1).
 
 
 

@@ -15,13 +15,38 @@ things a live mutation must never assume (AUD-015, [19 Decision 1]):
 The harness itself performs no host call at import time and knows nothing about
 a specific plugin: it talks to a `PluginProvider`, a `StateCodec` and a
 `HostBridge`, exactly like the transaction engine.
+
+**Storage policy (P32/P33).** This module is also the single place where a live run
+*stores* its results, and since P32 that place is **outside the repository**:
+
+* ``run_artifacts/<UTC stamp>__<task>__<pid>/evidence/`` holds the raw JSON (and,
+  when a probe renders, the WAV/PNG beside it);
+* ``run_artifacts/<run>/report.md`` is the short human-readable result and
+  ``run.json`` its provenance manifest;
+* ``LEGACY_EVIDENCE_DIR`` (``tests/plugins/live/evidence``) names the **historical
+  corpus layout**. In P33 that corpus was removed from the repository and moved to
+  the external research archive (``%LOCALAPPDATA%\reaper_reapy_mcp\repo_cleanup\
+  p33_*\archive``); the constant survives so a record id can still be resolved when
+  the archive is mounted at its original relative path.
+
+The default can be pointed elsewhere with ``REAPER_MCP_EVIDENCE_DIR`` (exactly
+that directory) or ``REAPER_MCP_RUN_ARTIFACTS`` (a root that still gets one
+sub-directory per run); a *reader* of recorded runs points
+``REAPER_MCP_EVIDENCE_SEARCH`` (or ``REAPER_MCP_RECOVERY_SEARCH`` for P8 recovery
+points) at the archive. See `docs/universal-plugin-mcp-v3/12-testing-strategy.md` §11.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import os
+import platform
+import subprocess
+import sys
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,12 +82,45 @@ __all__ = [
     "run_stamp",
     "write_run_json",
     "EVIDENCE_DIR",
+    "RUN_DIR",
     "RECOVERY_DIR",
+    "LEGACY_EVIDENCE_DIR",
+    "LEGACY_RECOVERY_DIR",
+    "user_data_root",
+    "default_run_artifacts_root",
+    "run_artifacts_root",
+    "run_dirs",
+    "run_task_id",
+    "new_run_dir",
+    "RunReport",
+    "render_run_report",
+    "write_run_report",
+    "finalize_run",
+    "provenance",
+    "evidence_search_roots",
+    "newest_evidence",
+    "evidence_candidates",
+    "recovery_search_roots",
 ]
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 LIVE_DIR = Path(__file__).resolve().parent / "live"
-EVIDENCE_DIR = LIVE_DIR / "evidence"
-RECOVERY_DIR = LIVE_DIR / "recovery"
+
+#: The historical, repository-local evidence archive layout. Since P33 the corpus
+#: lives OUTSIDE the repository (the external research archive); this constant is
+#: where a reader looks if the archive was mounted at its original relative path.
+LEGACY_EVIDENCE_DIR = LIVE_DIR / "evidence"
+#: The recorded P8 recovery points. `restore_p8.py` restores FROM them; a *new*
+#: recovery point is written to the run directory by `probe_p8_baseline.py`.
+LEGACY_RECOVERY_DIR = LIVE_DIR / "recovery"
+#: Kept as an alias: `RECOVERY_DIR` was the write path before P32.
+RECOVERY_DIR = LEGACY_RECOVERY_DIR
+
+RUN_ARTIFACTS_ENV = "REAPER_MCP_RUN_ARTIFACTS"
+EVIDENCE_DIR_ENV = "REAPER_MCP_EVIDENCE_DIR"
+RUN_TASK_ENV = "REAPER_MCP_RUN_TASK"
+EVIDENCE_SEARCH_ENV = "REAPER_MCP_EVIDENCE_SEARCH"
+RECOVERY_SEARCH_ENV = "REAPER_MCP_RECOVERY_SEARCH"
 
 
 def utc_now() -> str:
@@ -73,20 +131,436 @@ def run_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def write_run_json(kind: str, payload: dict, directory: Path) -> Path:
+# ---------------------------------------------------------------------------
+# Run artifacts: generated evidence lives outside the repository by default
+# ---------------------------------------------------------------------------
+#
+# Storage classes (P32):
+#   A  tracked source, tests, fixtures, docs          -> in Git
+#   B  runtime / prepared artifacts                   -> %LOCALAPPDATA%\reaper_reapy_mcp\
+#                                                        {cache,discovery,calibration}
+#   C  generated run evidence (JSON/WAV/PNG + report) -> %LOCALAPPDATA%\reaper_reapy_mcp\
+#                                                        run_artifacts\<run>\
+#   D  reproducible probes and live tests             -> in Git; their OUTPUT is C
+
+
+def user_data_root(environ: Mapping[str, str] | None = None) -> Path:
+    """The user-local base directory (same meaning as ``discovery/store.py``)."""
+    env = os.environ if environ is None else environ
+    local = env.get("LOCALAPPDATA") or env.get("XDG_CACHE_HOME")
+    if local:
+        return Path(local)
+    return Path.home() / ".cache"
+
+
+def default_run_artifacts_root(environ: Mapping[str, str] | None = None) -> Path:
+    """Where runs store their artifacts when no override is set (pure: no mkdir)."""
+    return user_data_root(environ) / "reaper_reapy_mcp" / "run_artifacts"
+
+
+def run_artifacts_root(environ: Mapping[str, str] | None = None) -> Path:
+    """Artifact root: ``REAPER_MCP_RUN_ARTIFACTS`` if set, else the user-local default."""
+    env = os.environ if environ is None else environ
+    override = env.get(RUN_ARTIFACTS_ENV)
+    if override and str(override).strip():
+        return Path(override).expanduser()
+    return default_run_artifacts_root(env)
+
+
+def _slug(text: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in str(text)).strip("-_")
+
+
+def run_task_id(environ: Mapping[str, str] | None = None, argv: Sequence[str] | None = None) -> str:
+    """The run's task id: the probe/test script stem (override ``REAPER_MCP_RUN_TASK``)."""
+    env = os.environ if environ is None else environ
+    explicit = env.get(RUN_TASK_ENV)
+    if explicit and str(explicit).strip():
+        return _slug(explicit)
+    args = list(sys.argv) if argv is None else list(argv)
+    stem = Path(args[0]).stem if args and args[0] else "run"
+    if "pytest" in stem:
+        return "pytest-live-suite"
+    return _slug(stem) or "run"
+
+
+def new_run_dir(
+    root: Path | None = None,
+    *,
+    task: str | None = None,
+    when: datetime | None = None,
+) -> Path:
+    """A fresh, never-reused run directory: ``<UTC stamp>__<task>__<pid>`` (+``__2``...)."""
+    base = Path(root) if root is not None else run_artifacts_root()
+    stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{stamp}__{task or run_task_id()}__{os.getpid()}"
+    candidate = base / name
+    counter = 2
+    while candidate.exists():
+        candidate = base / f"{name}__{counter}"
+        counter += 1
+    return candidate
+
+
+def _ensure_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"WARNING: cannot create the run-artifacts directory {path}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+_RUN_DIRS: tuple[Path, Path] | None = None
+
+
+def run_dirs(*, refresh: bool = False) -> tuple[Path, Path]:
+    """``(run_dir, evidence_dir)`` for THIS process - resolved once, then cached.
+
+    ``REAPER_MCP_EVIDENCE_DIR``, when set, is used verbatim for both (no run
+    sub-directory: the caller asked for exactly that path); otherwise a new run
+    directory is made under the artifacts root.
+    """
+    global _RUN_DIRS
+    if _RUN_DIRS is not None and not refresh:
+        return _RUN_DIRS
+    override = os.environ.get(EVIDENCE_DIR_ENV)
+    if override and str(override).strip():
+        base = Path(override).expanduser()
+        _RUN_DIRS = (base, base)
+    else:
+        run = new_run_dir()
+        _RUN_DIRS = (run, run / "evidence")
+    _ensure_dir(_RUN_DIRS[0])
+    _ensure_dir(_RUN_DIRS[1])
+    return _RUN_DIRS
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562: ``EVIDENCE_DIR``/``RUN_DIR`` resolve lazily, so importing this
+    module never creates a run directory - only using it (or writing) does."""
+    if name in ("RUN_DIR", "EVIDENCE_DIR"):
+        run, evidence = run_dirs()
+        return run if name == "RUN_DIR" else evidence
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+_run_state: dict[str, Any] = {"evidence": []}
+
+
+def write_run_json(kind: str, payload: dict, directory: Path | None = None) -> Path | None:
     """Per-run evidence: unique name + content hash, never overwrites a run.
 
     Two runs of the same case produce two files, and the hash makes the artifact
     self-verifying: a re-run cannot silently replace a previous measurement.
+    The default ``directory`` is THIS run's evidence directory (outside the
+    repository); an explicit directory stays possible for a caller that must
+    place a record somewhere chosen on purpose (a fixture-like input, an owner's
+    archive). A failed save is reported and returns ``None`` - a measurement is
+    never silently lost.
     """
+    target = Path(directory) if directory is not None else run_dirs()[1]
     text = json.dumps(payload, indent=2, sort_keys=True, default=str)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{kind}__{run_stamp()}__{digest}.json"
-    if path.exists():  # same second, same content: keep both runs distinguishable
-        path = directory / f"{kind}__{run_stamp()}__{digest}__2.json"
-    path.write_text(text, encoding="utf-8")
+    path = target / f"{kind}__{run_stamp()}__{digest}.json"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if path.exists():  # same second, same content: keep both runs distinguishable
+            path = target / f"{kind}__{run_stamp()}__{digest}__2.json"
+        # LF bytes: a digest taken over the text must describe the file on disk
+        # (the default Windows text writer would translate \n into \r\n).
+        path.write_text(text, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        print(f"WARNING: could not save run evidence ({kind}) to {target}: {exc}", file=sys.stderr)
+        return None
+    _run_state["evidence"].append(path)
     return path
+
+
+def _git_read(args: Sequence[str]) -> str | None:
+    """A read-only git query; tolerant (no repo / no binary is not an error)."""
+    if os.environ.get("REAPER_MCP_NO_GIT"):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def provenance() -> dict[str, Any]:
+    """What a later reader needs to place the run: commit, branch, interpreter."""
+    info: dict[str, Any] = {
+        "cwd": os.getcwd(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
+    if (REPO_ROOT / ".git").exists():
+        info["commit"] = _git_read(["rev-parse", "--short", "HEAD"])
+        info["branch"] = _git_read(["branch", "--show-current"])
+    return info
+
+
+@dataclass
+class RunReport:
+    """The short human-readable result every diagnostic run leaves behind."""
+
+    task: str
+    purpose: str = ""
+    status: str = "unknown"  # ok | failed | partial | unknown
+    started_utc: str | None = None
+    duration_s: float | None = None
+    tests: dict[str, Any] | None = None
+    findings: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    cost: dict[str, Any] | None = None
+
+
+def _relative(target: Path, base: Path) -> str:
+    try:
+        return target.relative_to(base).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
+def render_run_report(
+    report: RunReport,
+    *,
+    run_dir: Path,
+    evidence_dir: Path,
+    files: Sequence[Path],
+    info: Mapping[str, Any],
+) -> str:
+    """Render the short Markdown result (pure: no filesystem access beyond `files`)."""
+    lines: list[str] = [f"# Run `{run_dir.name}`", ""]
+    lines.append("| field | value |")
+    lines.append("|---|---|")
+    lines.append(f"| task | `{report.task}` |")
+    if report.purpose:
+        lines.append(f"| purpose | {report.purpose} |")
+    lines.append(f"| status | **{report.status}** |")
+    started = report.started_utc or "unknown"
+    duration = f"{report.duration_s:.3f} s" if isinstance(report.duration_s, (int, float)) else "unknown"
+    lines.append(f"| started / duration | {started} / {duration} |")
+    lines.append(f"| commit | `{info.get('commit') or 'unknown'}` ({info.get('branch') or 'unknown'}) |")
+    if report.tests:
+        lines.append(
+            "| tests | {passed} passed / {failed} failed / {skipped} skipped |".format(
+                passed=report.tests.get("passed", "?"),
+                failed=report.tests.get("failed", "?"),
+                skipped=report.tests.get("skipped", "?"),
+            )
+        )
+    if report.cost:
+        cost = ", ".join(f"{key}={value}" for key, value in report.cost.items())
+        lines.append(f"| cost | {cost} |")
+    lines.append("")
+    lines.append("## Findings")
+    if report.findings:
+        lines.extend(f"- {row}" for row in report.findings)
+    else:
+        lines.append("- (none recorded)")
+    lines.append("")
+    lines.append("## Evidence")
+    if files:
+        lines.append("| file | bytes |")
+        lines.append("|---|---|")
+        for path in files:
+            link = _relative(path, run_dir)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = "?"
+            lines.append(f"| [{link}]({link}) | {size} |")
+    else:
+        lines.append("- (no artifact was recorded)")
+    lines.append("")
+    lines.append("## Limitations / not verified")
+    if report.limitations:
+        lines.extend(f"- {row}" for row in report.limitations)
+    else:
+        lines.append("- (none stated)")
+    lines.append("")
+    lines.append(f"Full artifacts: `{run_dir}`  ·  evidence directory: `{evidence_dir}`")
+    lines.append("")
+    lines.append("<!-- generated by tests/plugins/live_harness.py (P32 policy) -->")
+    return "\n".join(lines) + "\n"
+
+
+def write_run_report(
+    report: RunReport,
+    *,
+    run_dir: Path | None = None,
+    directory: Path | None = None,
+) -> Path | None:
+    """Write ``report.md`` + ``run.json`` beside the evidence (never in the repo)."""
+    run = Path(run_dir) if run_dir is not None else run_dirs()[0]
+    evidence = Path(directory) if directory is not None else run_dirs()[1]
+    files = sorted(path for path in evidence.glob("*") if path.is_file()) if evidence.is_dir() else []
+    info = provenance()
+    text = render_run_report(report, run_dir=run, evidence_dir=evidence, files=files, info=info)
+    manifest = {
+        "run": run.name,
+        "task": report.task,
+        "purpose": report.purpose,
+        "status": report.status,
+        "started_utc": report.started_utc,
+        "duration_s": report.duration_s,
+        "tests": report.tests,
+        "cost": report.cost,
+        "findings": list(report.findings),
+        "limitations": list(report.limitations),
+        "provenance": info,
+        "evidence": [_relative(path, evidence) for path in files],
+        "report": "report.md",
+    }
+    if not _ensure_dir(run):
+        return None
+    try:
+        (run / "report.md").write_text(text, encoding="utf-8", newline="\n")
+        (run / "run.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError as exc:
+        print(f"WARNING: could not write the run report to {run}: {exc}", file=sys.stderr)
+        return None
+    _run_state["report"] = run / "report.md"
+    return _run_state["report"]
+
+
+def finalize_run(
+    kind: str,
+    payload: dict,
+    *,
+    purpose: str = "",
+    status: str | None = None,
+    findings: Sequence[str] | None = None,
+    limitations: Sequence[str] | None = None,
+    tests: dict[str, Any] | None = None,
+    duration_s: float | None = None,
+    started_utc: str | None = None,
+    directory: Path | None = None,
+    run_dir: Path | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Write the evidence JSON **and** the short report/manifest for this run.
+
+    Status, cost and start time are derived from the payload when not given:
+    ``exception``/``fatal`` means failed, ``totals`` becomes the cost row.
+    """
+    evidence_path = write_run_json(kind, payload, directory)
+    if status is None:
+        status = "failed" if (payload.get("exception") or payload.get("fatal")) else "ok"
+    if started_utc is None:
+        for key in ("started_utc", "utc", "generated_utc"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                started_utc = value
+                break
+    cost: dict[str, Any] | None = None
+    totals = payload.get("totals")
+    if isinstance(totals, Mapping):
+        cost = {key: totals[key] for key in ("mcp_calls", "mcp_seconds", "wall_seconds", "response_bytes") if key in totals}
+        if not cost:
+            cost = None
+    report = RunReport(
+        task=run_task_id(),
+        purpose=purpose,
+        status=status,
+        started_utc=started_utc,
+        duration_s=duration_s,
+        tests=tests,
+        findings=list(findings or []),
+        limitations=list(limitations or []),
+        cost=cost,
+    )
+    report_path = write_run_report(report, run_dir=run_dir, directory=directory)
+    return evidence_path, report_path
+
+
+def evidence_search_roots() -> list[Path]:
+    """Where a *reader* looks for recorded artifacts (archive layout, then run dirs).
+
+    ``REAPER_MCP_EVIDENCE_SEARCH`` (``os.pathsep``-separated) replaces the search
+    list when a caller must read recordings from an explicit location - the external
+    research archive after P33. The archive is deliberately NOT a default root, so a
+    test cannot depend on it silently.
+    """
+    override = os.environ.get(EVIDENCE_SEARCH_ENV)
+    if override and str(override).strip():
+        return [Path(part).expanduser() for part in str(override).split(os.pathsep) if part.strip()]
+    roots = [LEGACY_EVIDENCE_DIR]
+    runtime = run_artifacts_root()
+    if runtime.is_dir():
+        roots.append(runtime)
+    return roots
+
+
+def recovery_search_roots() -> list[Path]:
+    """Where a reader looks for a P8 recovery point (explicit archive, then run dirs).
+
+    ``REAPER_MCP_RECOVERY_SEARCH`` (``os.pathsep``-separated) replaces the default,
+    which is the historical `recovery/` layout plus every run directory.
+    """
+    override = os.environ.get(RECOVERY_SEARCH_ENV)
+    if override and str(override).strip():
+        return [Path(part).expanduser() for part in str(override).split(os.pathsep) if part.strip()]
+    roots = [LEGACY_RECOVERY_DIR]
+    runtime = run_artifacts_root()
+    if runtime.is_dir():
+        roots.append(runtime)
+    return roots
+
+
+def newest_evidence(pattern: str, roots: Sequence[Path] | None = None) -> Path | None:
+    """Newest recorded artifact matching ``pattern`` across the search roots.
+
+    Deterministic (newest mtime wins, then path) and explicit: a reader of
+    recorded runs names the pattern; it never guesses the newest *file in a
+    directory* and never depends on a timestamp baked into a test.
+    """
+    candidates = evidence_candidates(pattern, roots)
+    return candidates[0] if candidates else None
+
+
+def evidence_candidates(pattern: str, roots: Sequence[Path] | None = None) -> list[Path]:
+    """Every recorded artifact matching ``pattern``, newest first (then by path)."""
+    found: list[Path] = []
+    for root in roots if roots is not None else evidence_search_roots():
+        if not Path(root).is_dir():
+            continue
+        found.extend(path for path in Path(root).glob(f"**/{pattern}") if path.is_file())
+    return sorted(set(found), key=lambda path: (path.stat().st_mtime, str(path)), reverse=True)
+
+
+def _finalize_at_exit() -> None:
+    """A run that wrote evidence but never finalized still leaves a short report.
+
+    Deliberately quiet: an exit-time failure must never mask a measurement.
+    """
+    try:
+        if _run_state.get("report") is not None or not _run_state.get("evidence"):
+            return
+        first = _run_state["evidence"][0]
+        kind = first.name.split("__", 1)[0]
+        write_run_report(
+            RunReport(
+                task=run_task_id(),
+                purpose=f"(auto-summary for {kind}; the probe did not call finalize_run)",
+                status="unknown",
+                started_utc=utc_now(),
+            )
+        )
+    except Exception:  # noqa: BLE001 - never raise at interpreter exit
+        pass
+
+
+atexit.register(_finalize_at_exit)
 
 
 @dataclass

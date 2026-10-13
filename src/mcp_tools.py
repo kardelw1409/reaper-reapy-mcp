@@ -1535,8 +1535,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
                       start_measure: Optional[str] = None,
                       end_measure: Optional[str] = None,
                       samplerate: int = 44100,
-                      channels: int = 2,
-                      **kwargs) -> Dict[str, Any]:
+                      channels: int = 2) -> Dict[str, Any]:
         """Render project to audio file.
         
         Args:
@@ -1547,7 +1546,14 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             end_measure: End position as "measure:beat,fraction" (optional if end_time is provided)
             samplerate: Sample rate in Hz (default: 44100)
             channels: Number of channels (default: 2)
-            **kwargs: Additional render settings
+
+        NOTE (P30): this signature used to end in `**kwargs`. A `**kwargs` parameter is
+        modelled by the transport as ONE **required** field called `kwargs`, so every
+        real client call failed validation before the body ran - the tool was
+        unreachable from the chat surface and from a raw MCP client alike (measured:
+        `1 validation error for render_projectArguments / kwargs Field required`). The
+        controller never used the extra keywords, so dropping them changes nothing
+        about the render itself.
         """
         try:
             # Convert measure positions to time if provided
@@ -1570,7 +1576,7 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
             
             # Perform render
             if controller.render_project(output_file, render_start, render_end, 
-                                      samplerate, channels, **kwargs):
+                                      samplerate, channels):
                 response = {
                     "status": "success",
                     "message": f"Project rendered to {output_file}",

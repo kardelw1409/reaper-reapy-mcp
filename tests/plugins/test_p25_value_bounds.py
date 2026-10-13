@@ -662,5 +662,8 @@ def test_a_widening_record_that_its_range_contradicts_is_refused(fixture_profile
     assert cache.status.quarantined
 
 
-def test_the_revision_is_r12():
-    assert VitalProvider.implementation_revision == "vital-provider-2026.10-r12"
+def test_the_revision_is_r13():
+    # r12 -> r13 (P30): the wavetable channel (`wavetables.py` + the codec's guard for
+    # every write into `settings.wavetables.<i>`). The revision is a pin on purpose:
+    # the semantics changed, so the key must move with them (07 §3.4).
+    assert VitalProvider.implementation_revision == "vital-provider-2026.10-r13"

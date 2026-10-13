@@ -40,6 +40,7 @@ from ...model import (
     VerificationPolicy,
     VerificationReport,
 )
+from . import wavetables as wavetables_module
 
 __all__ = [
     "VITAL_CODEC_NAME",
@@ -619,10 +620,22 @@ class VitalCodec:
         paths = dict(changes.get("paths") or {})
         units: list[StateWriteUnit] = []
         if paths:
+            provenance = {
+                str(row.get("path")): row for row in (changes.get("wavetable") or [])
+            }
+            wavetable_notes: list[dict[str, Any]] = []
+            document = doc["document"] if isinstance(doc, dict) and "document" in doc else doc
             for path in paths:
                 _check_root(str(path))
                 _check_not_derived(str(path))
-            units.append(StateWriteUnit(order_index=0, kind="state", payload={"paths": paths}))
+                note = self._check_wavetable_change(document, str(path), paths[path], provenance)
+                if note is not None:
+                    paths[str(path)] = note.pop("normalized_value")
+                    wavetable_notes.append(note)
+            payload: dict[str, Any] = {"paths": paths}
+            if wavetable_notes:
+                payload["wavetable"] = wavetable_notes
+            units.append(StateWriteUnit(order_index=0, kind="state", payload=payload))
         route_ops = (
             [{"op": "create", **spec} for spec in (changes.get("routes_create") or [])]
             + [{"op": "update", **spec} for spec in (changes.get("routes_update") or [])]
@@ -685,8 +698,43 @@ class VitalCodec:
         routes = {row["slot"]: row for row in list_routings(document, include_empty=True).values()}
         payload = unit.payload or {}
         rows: list[dict[str, Any]] = []
+        notes = {str(row.get("path")): row for row in (payload.get("wavetable") or [])}
         for path, value in (payload.get("paths") or {}).items():
             actual = dig(document, str(path))
+            note = notes.get(str(path))
+            if note is not None:
+                # A wavetable row reports CONTENT IDENTITIES, not two 11 KB blobs: the
+                # outcome must stay readable, and the identity (a digest over the frame
+                # data) is what a caller can compare. `agrees` is still exact equality
+                # of the whole value, with the numeric tolerance applied field-wise.
+                differing = _differing_fields(value, actual, tolerance)
+                rows.append(
+                    {
+                        "path": str(path),
+                        "kind": "wavetable",
+                        "oscillator": note.get("oscillator"),
+                        "table_id_before": note.get("table_id_before"),
+                        "table_id_written": note.get("table_id_after"),
+                        "table_id_read_back": wavetables_module.table_id(actual)
+                        if isinstance(actual, dict)
+                        else None,
+                        "n_frames": note.get("n_frames"),
+                        "payload_bytes": note.get("payload_bytes"),
+                        "rule": note.get("rule"),
+                        "source": note.get("source"),
+                        "stamped_version_to": note.get("stamped_version_to"),
+                        "differing_fields": differing[:12],
+                        "written": {
+                            "table_id": note.get("table_id_after"),
+                            "n_frames": note.get("n_frames"),
+                            "payload_bytes": note.get("payload_bytes"),
+                        },
+                        "read_back": wavetables_module.describe(actual),
+                        "agrees": not differing,
+                        "channel": "state",
+                    }
+                )
+                continue
             rows.append(
                 {
                     "path": str(path),
@@ -715,7 +763,8 @@ class VitalCodec:
         return {"document": copy.deepcopy(document), "root": MUTABLE_ROOT}
 
     def restore_changes(self, doc: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
-        """Restoration as document changes: every captured settings leaf.
+        """Restoration as document changes: every captured settings leaf, and every
+        wavetable slot as a WHOLE table.
 
         Expressed as `paths` executed through `plan_state_writes`, never as a blob
         write (08 §3), so the rollback travels the same verified unit path as any
@@ -727,6 +776,14 @@ class VitalCodec:
         never writable. The excluded paths are returned alongside the change set
         so Core can name them in the outcome instead of claiming more than it
         restored.
+
+        **Wavetable slots are a second exception, and for the same reason shape-wise:**
+        a slot's *leaves* (`...wavetables.0.groups.0.components.0.keyframes.0.wave_data`)
+        are refused as write targets - a slot is written as a whole table, which is the
+        shape the plugin's own channel accepts (measured) and the only shape the growth
+        guard can bound. A slot is therefore restored as ONE path whose value is the
+        captured table, and only when the live slot **differs** from the captured one
+        (a rollback of an unrelated change must not rewrite three tables).
         """
         document = snap["document"]
         settings = document.get("settings") or {}
@@ -734,9 +791,98 @@ class VitalCodec:
         excluded = [path for path in DERIVED_LEAVES if path in leaves]
         for path in excluded:
             leaves.pop(path, None)
+        live = doc if isinstance(doc, dict) else {}
+        live_settings = live.get("settings") if isinstance(live.get("settings"), dict) else {}
+        for path in [key for key in leaves if wavetables_module.parse_wavetable_path(key)]:
+            leaves.pop(path, None)
+        tables = settings.get(wavetables_module.SETTINGS_KEY)
+        if isinstance(tables, list):
+            for index, captured in enumerate(tables):
+                slot_path = f"{MUTABLE_ROOT}.{wavetables_module.SETTINGS_KEY}.{index}"
+                current = dig(live, slot_path)
+                if current is None or current != captured:
+                    leaves[slot_path] = captured
         return {"paths": leaves, "derived_excluded": excluded}
 
     # -- internals ----------------------------------------------------------
+
+    def _check_wavetable_change(
+        self,
+        document: Any,
+        path: str,
+        value: Any,
+        provenance: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Guard + normalize a write that addresses a wavetable slot.
+
+        ``None`` when the path is not one. The guard lives here - not only in the
+        semantic operation - because a caller can reach the same slot by writing the raw
+        state path: a guard that only watched the operation would be bypassable (the same
+        reasoning as the route-pair guard above). What it enforces, against the LIVE
+        document (which request normalization never sees):
+
+        1. the slot belongs to one of the three oscillators;
+        2. the value is a WHOLE table carrying `Wave Source` frames (a partial write into
+           `settings.wavetables.0.groups...` is not a way to select a table);
+        3. the write does not GROW the payload (frames or serialized bytes) beyond what
+           the engine holds - the measured host-abort boundary;
+        4. `version` is stamped with the live plugin's own, because the plugin restamps it
+           on re-serialisation and an unstamped value cannot be verified.
+        """
+        parsed = wavetables_module.parse_wavetable_path(path)
+        if parsed is None:
+            return None
+        oscillator = parsed["oscillator"]
+        if oscillator is None:
+            raise InvalidValue(
+                f"state path {path!r} addresses wavetable slot {parsed['index']}, which belongs "
+                "to no oscillator: the document's table list is positional and this build has "
+                f"three oscillators",
+                detail={"path": path, "slots": list(wavetables_module.SLOTS)},
+            )
+        if parsed["suffix"]:
+            raise InvalidValue(
+                f"state path {path!r} writes *inside* a wavetable slot; a slot is written as a "
+                "whole table (the plugin replaces the table it holds, it does not merge into it)",
+                detail={"path": path, "slot_path": wavetables_module.path_for(oscillator)},
+            )
+        slot_path = wavetables_module.path_for(oscillator)
+        tables = dig(document, f"{MUTABLE_ROOT}.{wavetables_module.SETTINGS_KEY}")
+        if not isinstance(tables, list) or len(tables) <= parsed["index"]:
+            raise InvalidValue(
+                f"the live document does not address wavetable slot {parsed['index']}: the write "
+                "would CREATE a slot instead of replacing one, and a slot the engine does not "
+                "hold has no measured safe write",
+                detail={
+                    "path": slot_path,
+                    "slot_index": parsed["index"],
+                    "present": isinstance(tables, list),
+                    "slots_in_document": len(tables) if isinstance(tables, list) else None,
+                },
+            )
+        current = dig(document, slot_path)
+        live_version = wavetables_module.live_version(document)
+        verdict = wavetables_module.check_writable(
+            value, current=current, live_version=live_version
+        )
+        stamped, stamp_note = wavetables_module.stamp_version(value, live_version)
+        row = provenance.get(path) or provenance.get(slot_path) or {}
+        note: dict[str, Any] = {
+            "path": slot_path,
+            "oscillator": oscillator,
+            "table_id_before": wavetables_module.table_id(current) if isinstance(current, dict) else None,
+            "table_id_after": verdict["table_id"],
+            "n_frames": verdict["n_frames"],
+            "payload_bytes": verdict["payload_bytes"],
+            "current_n_frames": (verdict.get("current") or {}).get("n_frames"),
+            "current_payload_bytes": (verdict.get("current") or {}).get("payload_bytes"),
+            "rule": verdict.get("rule"),
+            "source": row.get("source"),
+            "preset": row.get("preset"),
+            "normalized_value": stamped,
+        }
+        note.update(stamp_note)
+        return note
 
     def _apply_route_op(
         self, document: dict[str, Any], route_op: dict[str, Any], payload: dict[str, Any]
@@ -889,3 +1035,34 @@ def _agrees(written: Any, read_back: Any, tolerance: float) -> bool:
     if isinstance(written, (int, float)) and isinstance(read_back, (int, float)):
         return abs(float(written) - float(read_back)) <= tolerance
     return written == read_back
+
+
+def _differing_fields(written: Any, read_back: Any, tolerance: float, prefix: str = "") -> list[str]:
+    """The dotted fields of a structured value that do not agree (bounded by callers).
+
+    A whole-value ``==`` is the first test (that is what the pointer-based comparison
+    does, and it is O(1) when the values agree). Only a difference walks the structure,
+    so a *reported* difference names the field instead of dumping two 11 KB trees - the
+    POC's measured lesson was that one cosmetic field (`version`) made an exact
+    comparison report a landed write as a failure, and a row that had said **which**
+    field differed would have shown that in one line.
+    """
+    if isinstance(written, dict) and isinstance(read_back, dict):
+        out: list[str] = []
+        for key in sorted(set(written) | set(read_back)):
+            name = f"{prefix}.{key}" if prefix else str(key)
+            if key not in written:
+                out.append(f"{name} (absent in written)")
+            elif key not in read_back:
+                out.append(f"{name} (absent in read-back)")
+            else:
+                out.extend(_differing_fields(written[key], read_back[key], tolerance, name))
+        return out
+    if isinstance(written, list) and isinstance(read_back, list):
+        out = []
+        if len(written) != len(read_back):
+            return [f"{prefix} (length {len(written)} vs {len(read_back)})"]
+        for index, (left, right) in enumerate(zip(written, read_back)):
+            out.extend(_differing_fields(left, right, tolerance, f"{prefix}.{index}"))
+        return out
+    return [] if _agrees(written, read_back, tolerance) else [prefix or "<value>"]

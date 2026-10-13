@@ -676,4 +676,9 @@ class ResolvedRequest:
     routes_update: list[dict[str, Any]] = field(default_factory=list)
     routes_remove: list[dict[str, Any]] = field(default_factory=list)
     state: dict[str, Any] = field(default_factory=dict)
+    #: Provenance for wavetable changes (P30). The VALUE rides `state` like every other
+    #: document change - this records what a caller cannot see from the value itself:
+    #: which oscillator, which preset file, which slot, which content id. It carries no
+    #: write semantics of its own.
+    wavetable: list[dict[str, Any]] = field(default_factory=list)
     problems: list[dict[str, Any]] = field(default_factory=list)

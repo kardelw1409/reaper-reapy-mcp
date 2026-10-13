@@ -1356,6 +1356,7 @@ class Transaction:
             "routes_create": changes["routes_create"],
             "routes_update": changes["routes_update"],
             "routes_remove": changes["routes_remove"],
+            "wavetable": changes.get("wavetable") or [],
             # The ident path's shape is untouched; the index path writes an
             # address that is a *pair* (index + the name the hop must find there),
             # so it is reported as rows instead of a bare pair.
@@ -1388,6 +1389,7 @@ class Transaction:
             "n_routes_create": len(resolved.routes_create),
             "n_routes_update": len(resolved.routes_update),
             "n_routes_remove": len(resolved.routes_remove),
+            "n_wavetables": len(resolved.wavetable),
             "n_state_paths": len(resolved.state) + sum(
                 1 for row in resolved.controls.values() if row.get("channel") == "state"
             ),

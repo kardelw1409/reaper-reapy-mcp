@@ -45,10 +45,20 @@ from reaper_reapy_mcp.plugins.transaction import Transaction  # noqa: E402
 
 
 def _latest_recovery() -> Path:
-    files = sorted(H.RECOVERY_DIR.glob("p8_recovery__*.json"))
-    if not files:
-        raise SystemExit("no recovery artifact exists under tests/plugins/live/recovery/")
-    return files[-1]
+    """Newest recovery point: an explicit archive, the historical layout, run dirs (P32/P33).
+
+    New recovery points go to the run directory (class C, outside the repository); the
+    historical ones live in the external research archive since P33. Point
+    `REAPER_MCP_RECOVERY_SEARCH` (os.pathsep-separated) at the archive, or pass
+    `--file` explicitly.
+    """
+    newest = H.newest_evidence("p8_recovery__*.json", roots=H.recovery_search_roots())
+    if newest is None:
+        raise SystemExit(
+            "no recovery artifact was found: point REAPER_MCP_RECOVERY_SEARCH at the research "
+            "archive (repo_cleanup/p33_*/archive/files/tests/plugins/live/recovery) or pass --file"
+        )
+    return newest
 
 
 def main() -> int:

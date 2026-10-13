@@ -128,7 +128,7 @@ SPEC: dict[str, dict[str, Any]] = {
         },
         "required": ("instance", "request"),
         "destructive": True,
-        "mutating_ops": ("controls", "routes_create", "routes_update", "routes_remove", "state"),
+        "mutating_ops": ("controls", "routes_create", "routes_update", "routes_remove", "state", "wavetable"),
         "returns": "committed, plan_summary, outcome",
     },
     "plugin_state": {
@@ -141,7 +141,7 @@ SPEC: dict[str, dict[str, Any]] = {
         "required": ("instance",),
         "destructive": False,
         "mutating_ops": (),
-        "returns": "state, structural_keys[], counts, slice",
+        "returns": "state, state_view?, structural_keys[], counts, slice",
     },
     "plugin_modulation": {
         "purpose": "Route lifecycle (list/create/update/remove) and semantic depth conversion.",

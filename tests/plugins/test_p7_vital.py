@@ -404,7 +404,7 @@ def test_profile_from_the_pinned_registry_is_schema_valid_and_cacheable():
     assert build.cacheable, build.validation.codes()
     assert build.source_digest and build.provider_artifact_digest
     assert build.provider_revision == IMPLEMENTATION_REVISION
-    assert len(provider.artifact_paths()) == 9
+    assert len(provider.artifact_paths()) == 10  # 9 -> 10 in P30: wavetables.py
 
     assert profile["provider"] == "vital"
     assert profile["identity"]["fingerprint"]["param_count"] == 8

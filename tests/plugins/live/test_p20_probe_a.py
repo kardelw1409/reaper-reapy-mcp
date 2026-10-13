@@ -158,9 +158,10 @@ def test_p20_probe_a_onset_and_source():
 
     # --- A0: the current patch, re-rendered, compared with the P19 WAV --------
     a0 = render_and_measure("a0_current")
-    previous = H.EVIDENCE_DIR / "p19_808_patch__20261011T143226Z.wav"
+    # The P19 render lives in the external research archive since P33 (see test_p20_ref_analysis).
+    previous = H.newest_evidence("p19_808_patch__*.wav")
     identical = None
-    if previous.is_file():
+    if previous is not None:
         import numpy as np
 
         fresh, fs_fresh = C.read_mono(Path(a0["render"]["file"]))

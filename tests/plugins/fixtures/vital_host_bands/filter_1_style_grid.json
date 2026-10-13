@@ -1,0 +1,296 @@
+{
+  "control": "filter_1_style",
+  "counts": {
+    "labelled": 36,
+    "points": 65,
+    "unlabelled": 29
+  },
+  "grid": [
+    [
+      0.0,
+      "12dB"
+    ],
+    [
+      0.015625,
+      "12dB"
+    ],
+    [
+      0.03125,
+      "12dB"
+    ],
+    [
+      0.046875,
+      "12dB"
+    ],
+    [
+      0.0625,
+      "24dB"
+    ],
+    [
+      0.078125,
+      "24dB"
+    ],
+    [
+      0.09375,
+      "24dB"
+    ],
+    [
+      0.109375,
+      "24dB"
+    ],
+    [
+      0.125,
+      "24dB"
+    ],
+    [
+      0.140625,
+      "24dB"
+    ],
+    [
+      0.15625,
+      "24dB"
+    ],
+    [
+      0.171875,
+      "24dB"
+    ],
+    [
+      0.1875,
+      "Notch Blend"
+    ],
+    [
+      0.203125,
+      "Notch Blend"
+    ],
+    [
+      0.21875,
+      "Notch Blend"
+    ],
+    [
+      0.234375,
+      "Notch Blend"
+    ],
+    [
+      0.25,
+      "Notch Blend"
+    ],
+    [
+      0.265625,
+      "Notch Blend"
+    ],
+    [
+      0.28125,
+      "Notch Blend"
+    ],
+    [
+      0.296875,
+      "Notch Blend"
+    ],
+    [
+      0.3125,
+      "Notch Spread"
+    ],
+    [
+      0.328125,
+      "Notch Spread"
+    ],
+    [
+      0.34375,
+      "Notch Spread"
+    ],
+    [
+      0.359375,
+      "Notch Spread"
+    ],
+    [
+      0.375,
+      "Notch Spread"
+    ],
+    [
+      0.390625,
+      "Notch Spread"
+    ],
+    [
+      0.40625,
+      "Notch Spread"
+    ],
+    [
+      0.421875,
+      "Notch Spread"
+    ],
+    [
+      0.4375,
+      "B/P/N"
+    ],
+    [
+      0.453125,
+      "B/P/N"
+    ],
+    [
+      0.46875,
+      "B/P/N"
+    ],
+    [
+      0.484375,
+      "B/P/N"
+    ],
+    [
+      0.5,
+      "B/P/N"
+    ],
+    [
+      0.515625,
+      "B/P/N"
+    ],
+    [
+      0.53125,
+      "B/P/N"
+    ],
+    [
+      0.546875,
+      "B/P/N"
+    ],
+    [
+      0.5625,
+      ""
+    ],
+    [
+      0.578125,
+      ""
+    ],
+    [
+      0.59375,
+      ""
+    ],
+    [
+      0.609375,
+      ""
+    ],
+    [
+      0.625,
+      ""
+    ],
+    [
+      0.640625,
+      ""
+    ],
+    [
+      0.65625,
+      ""
+    ],
+    [
+      0.671875,
+      ""
+    ],
+    [
+      0.6875,
+      ""
+    ],
+    [
+      0.703125,
+      ""
+    ],
+    [
+      0.71875,
+      ""
+    ],
+    [
+      0.734375,
+      ""
+    ],
+    [
+      0.75,
+      ""
+    ],
+    [
+      0.765625,
+      ""
+    ],
+    [
+      0.78125,
+      ""
+    ],
+    [
+      0.796875,
+      ""
+    ],
+    [
+      0.8125,
+      ""
+    ],
+    [
+      0.828125,
+      ""
+    ],
+    [
+      0.84375,
+      ""
+    ],
+    [
+      0.859375,
+      ""
+    ],
+    [
+      0.875,
+      ""
+    ],
+    [
+      0.890625,
+      ""
+    ],
+    [
+      0.90625,
+      ""
+    ],
+    [
+      0.921875,
+      ""
+    ],
+    [
+      0.9375,
+      ""
+    ],
+    [
+      0.953125,
+      ""
+    ],
+    [
+      0.96875,
+      ""
+    ],
+    [
+      0.984375,
+      ""
+    ],
+    [
+      1.0,
+      ""
+    ]
+  ],
+  "kind": "vital-host-band-map",
+  "note": "The host's own labelling of filter_1_style, extracted VERBATIM from the P19 live recordings below (no value was invented). A display of \"\" is the release's unnamed tail from 0.5625 (P25); the three recordings agree point for point, so this fixture replaces the test's former 'newest file in the evidence directory' dependency.",
+  "recorded_by": {
+    "archive": "the recordings were removed from the repository in P33 and live in the external research archive (repo_cleanup/p33_*/archive); re-derive with --search when needed",
+    "files": [
+      {
+        "file": "p19_enum_bands_through_host__20261011T142820Z__6f0e43baaff3.json",
+        "points": 65,
+        "sha256": "30e2215fd09e0bf430629b869b59cab937b89e9e407c3ca01247a9bc865a6e7e"
+      },
+      {
+        "file": "p19_enum_bands_through_host__20261011T143023Z__0f6794f11257.json",
+        "points": 65,
+        "sha256": "cc4f8ba5cc74556211d7f45f91c24d0ea63b87ed3cbd76ae08b0bb2eb47ef16c"
+      },
+      {
+        "file": "p19_enum_bands_through_host__20261012T180857Z__1c8e166ffaff.json",
+        "points": 65,
+        "sha256": "47618156cc50c569c889803d5270c4cae3dd679aac462f1523e0df95ccb03910"
+      }
+    ],
+    "grids_agree": true,
+    "host_call": "TrackFX_FormatParamValueNormalized",
+    "probe": "tests/plugins/live/test_p19_probe_j.py"
+  },
+  "value_kind": "normalized"
+}

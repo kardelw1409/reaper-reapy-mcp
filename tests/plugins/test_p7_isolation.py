@@ -91,7 +91,10 @@ def test_constructing_the_provider_still_reads_no_registry_until_first_use():
         "print(json.dumps({'n_structs': len(paths), 'json_reads': json_reads}))\n"
     )
     payload = _run(script)
-    assert payload["n_structs"] == 9
+    # 10 since P30: `wavetables.py` joined the provider's behaviour-affecting files
+    # (a new file changes the artifact digest whether or not it is listed, so the list
+    # must name it or the declared source rows would under-count the key material).
+    assert payload["n_structs"] == 10
     assert payload["json_reads"] == [], (
         "constructing the provider must not read the registry (08 §6.4)"
     )

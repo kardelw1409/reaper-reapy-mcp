@@ -240,3 +240,71 @@ Every phase in [14](14-implementation-plan.md) exits only when:
 - A cache key that omits a behaviour-affecting provider determinant (AUD-008).
 - An import of the legacy `_b4_lib` chain from Core or the provider (AUD-005).
 - Any new wall-clock sleep used to "fix" flakiness.
+
+## 11. Evidence and run artifacts (P32 policy — where a run's results live)
+
+The project's own history made this rule necessary: rounds P8–P30 committed every live-run JSON
+(212 files, ~20 MB) and WAV under `tests/plugins/live/evidence/`, so a routine probe turned the
+working tree dirty and a recorded run could not be told apart from a fixture. Since P32 the storage
+model is explicit. **It is a property of the code, not a convention**: the one writer
+(`tests/plugins/live_harness.py`) defaults to a directory outside the repository.
+
+| class | what | where | in Git? |
+|---|---|---|---|
+| **A** | source, tests, deterministic fixtures, contract docs, remediation records | the repository | yes — by design |
+| **B** | runtime / prepared data: profile cache, discovery artifacts, calibration, enum boundaries | `%LOCALAPPDATA%\reaper_reapy_mcp\{cache,discovery,calibration}` | no — regenerable, machine-local |
+| **C** | generated run evidence: evidence JSON, render WAV/PNG, run report, recovery points | `%LOCALAPPDATA%\reaper_reapy_mcp\run_artifacts\<stamp>__<task>__<pid>\` | no — the run's own output |
+| **D** | probes and live tests (reproducible tools) | `tests/plugins/**` | yes — but their **output** is class C |
+
+**One run = one directory.** `live_harness.run_dirs()` resolves `(run_dir, evidence_dir)` once per
+process: `run_dir` holds `report.md` + `run.json` (provenance: commit, branch, interpreter, evidence
+list) and `evidence_dir` (`run_dir/evidence`) holds the raw files with their existing
+`<kind>__<UTC stamp>__<sha256[:12]>.json` naming. Nothing is ever overwritten (the name carries the
+content hash and the run identity), and a failed save prints a loud warning and returns `None`
+instead of raising — a finished measurement must not be lost silently.
+
+**Every run leaves a short human-readable result.** `finalize_run(kind, payload, purpose=…, findings=…,
+limitations=…, tests=…, directory=…)` writes the evidence JSON *and* `report.md`/`run.json`; status,
+start time and cost are derived from the payload (`exception`/`fatal` ⇒ failed, `totals` ⇒ cost).
+A probe that only calls `write_run_json` still gets an automatic summary at interpreter exit, so the
+property holds even for scripts nobody updated.
+
+**Overrides (single mechanism, no second store):**
+
+- `REAPER_MCP_EVIDENCE_DIR` — write **exactly** into this directory (no run sub-directory);
+- `REAPER_MCP_RUN_ARTIFACTS` — a different artifacts root (one directory per run still);
+- `REAPER_MCP_RUN_TASK` — the task id used in the run-directory name;
+- `REAPER_MCP_EVIDENCE_SEARCH` — `os.pathsep`-separated roots a *reader* searches instead of the
+  default archive-plus-run-dirs order.
+
+**Reading recorded runs is explicit.** `newest_evidence(pattern)` / `evidence_candidates(pattern)`
+search the historical archive first and then every run directory, and name the file they resolved;
+`REAPER_MCP_EVIDENCE_SEARCH` pins the roots. A test must **not** read "the newest file in a
+recorded-run directory" (`test_p19_enum_positions.py` used to: it now reads the extracted
+deterministic fixture `fixtures/vital_host_bands/filter_1_style_grid.json`, whose builder
+`fixtures/build_vital_host_bands_fixture.py` refuses when the recordings disagree and records every
+source digest). A fixture extracted from a recording is allowed **only** with provenance, never
+invented; a large raw report is never a fixture.
+
+**The historical corpus is external, and it is explicit (P33).** The 200 recorded JSON, 12 PNG and
+147 WAV of P7–P30 were removed from the repository in P33; the **246 paths Git knew about** (those
+200 JSON, the 12 PNG, the 2 `recovery/p8_recovery__*.json`, 32 one-off probes, and 16 staged-only
+files of the same kinds) were removed **from history** as well — the 147 WAV were ignored by the
+pre-existing `*.wav` rule and had never been committed, so their removal is a working-tree act only.
+The original history and a verified working-tree copy are in the P33 backup
+(`%LOCALAPPDATA%\reaper_reapy_mcp\repo_cleanup\p33_<stamp>\mirror.git` and `…\archive\`, with a
+per-file `manifest.json`: path, size, SHA-256, class, git status, reason; the archive's `README.md`
+gives the exact commands). A record name (`p18_calibration__…json`) stays valid **as an id**: the
+journal, the register, `resolve.py`, `profile_build.py`, `api.py` and `errors.py` cite ids, and the
+offline tests assert the id strings — no code opens the files. `LEGACY_EVIDENCE_DIR` /
+`LEGACY_RECOVERY_DIR` name the archive's original layout and remain a search root only if you mount
+the archive there; the external location is reached through `REAPER_MCP_EVIDENCE_SEARCH` /
+`REAPER_MCP_RECOVERY_SEARCH` (never a default root, so no test can depend on it silently).
+`.gitignore` stayed narrow throughout: the fix was the output path, not a hiding rule — and a broad
+rule would have classified the *next* piece of evidence as disposable.
+
+**CI.** No test workflow exists in this repository (`.github/workflows/` ships only the publish
+workflow), so nothing was invented. When one is added, the policy maps to it directly: run the
+offline suite (`py -3.11 -m pytest -q -p no:cacheprovider tests/plugins --ignore=tests/plugins/live`),
+publish the run's `report.md` into `$GITHUB_STEP_SUMMARY`, upload `run_artifacts/<run>/` as a CI
+artifact with `retention-days` set, and never commit a report.

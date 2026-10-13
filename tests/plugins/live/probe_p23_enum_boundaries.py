@@ -65,7 +65,7 @@ from reaper_reapy_mcp.plugins.providers.vital import enum_boundaries as EB  # no
 from reaper_reapy_mcp.plugins.providers.vital import profile_build as PB  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital.provider import VitalProvider  # noqa: E402
 
-EVIDENCE_DIR = HERE / "evidence"
+from live_harness import EVIDENCE_DIR, finalize_run  # noqa: E402 - run artifacts, never the repo (P32)
 
 #: Rational grids a host is likely to quantize its parameters to. A candidate is
 #: only ever *tested* - never assumed - and a failed candidate costs 2 calls.
@@ -807,15 +807,18 @@ def main(argv: list[str]) -> int:
             for control_id, record in artifact["controls"].items()
         },
     }
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = _run_stamp()
-    evidence_path = EVIDENCE_DIR / f"p23_enum_boundaries__{stamp}__{digest[:12]}.json"
-    if evidence_path.exists():
-        evidence_path = EVIDENCE_DIR / f"p23_enum_boundaries__{stamp}__{digest[:12]}__2.json"
-    evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    evidence_path, report_path = finalize_run(
+        "p23_enum_boundaries",
+        evidence,
+        purpose="adaptive read-only enum-boundary discovery against the host formatter",
+        findings=[f"artifact counts: {json.dumps(artifact.get('counts') or {}, sort_keys=True)}"],
+        limitations=["read-only: the measurements refine the profile; no value is written"],
+        directory=EVIDENCE_DIR,
+    )
 
     print(f"artifact: {out_path}  sha256={digest[:16]}  {evidence['artifact']['bytes']:,} bytes")
     print(f"evidence: {evidence_path}")
+    print(f"report: {report_path}")
     print(f"counts:   {json.dumps(artifact['counts'], sort_keys=True)}")
     print(
         "read-only proof: {} {}".format(

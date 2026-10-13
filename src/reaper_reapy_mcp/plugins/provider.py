@@ -71,6 +71,13 @@ class PluginProvider(Protocol):
       serve. A provider whose other methods consult its own last-built profile
       (rules, limits, structural targets) needs this, because a cache hit builds
       nothing.
+    - ``state_view(document) -> dict``: a read-only, descriptor-shaped view of the
+      decoded document, attached to ``plugin_state`` data as ``state_view`` when the
+      provider declares it (P30). It exists for content a generic summary cannot
+      express - *which table each oscillator reads*, which is document state with no
+      parameter behind it. A provider without the hook answers the same summary it
+      always did, and a failure inside the hook is reported as a warning row rather
+      than turning a readable state into an error.
     """
 
     id: str

@@ -182,9 +182,27 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
     "routes_update": [ {"slot": 3, "destination": "filter_1_cutoff", "depth": -6} ],
     "routes_remove": [ {"slot": 7} ],
     "state": { "some.provider.path": value }        // provider-declared state fields only
+    "wavetable": [ { "oscillator": 1, "from_preset": "<file>.vital", "preset_slot": 1,
+                     "table_id": "<content id, optional check>" } ]   // P30, provider-declared
   },
   "dry_run": true }
 ```
+> **Note (2026-10-13, P30 - `wavetable`).** A provider may accept a **semantic wavetable spec**
+> when the selection is document state with no parameter behind it (measured for the first
+> provider: the 775-control inventory holds only `*_wave_frame`, the position INSIDE a table,
+> and a fresh instance's table is a single-frame saw, which makes that control inert). The
+> provider resolves the spec into the same `settings.wavetables.<i>` path the raw `state`
+> channel uses - one write channel, no second mechanism - and the **codec guards every write
+> into a table slot**, semantic or raw: the value must be a whole table with `Wave Source`
+> frames, the slot must already exist, the write may not **grow** the table (frames, total
+> samples, or wave-carrying content bytes; the label fields `name`/`author`/`version` are free,
+> and the raw payload is capped at the one measured-safe size), and `version` is stamped from
+> the live document because the plugin restamps it on re-serialisation. A refusal carries the
+> measurement that produced the bound (a growing payload did not land and, with a mismatched
+> `version`, once aborted the host). Wavetable verification rows report **content identities**
+> (`table_id` before/written/read back, frame counts, the source) and, when they disagree, the
+> differing field names - never two multi-kilobyte blobs. A rollback restores a slot as ONE
+> whole-table change, because a write *inside* a slot is refused by the same guard.
 > **Note (2026-10-11, P20 defect D1).** A semantic `depth` on a `routes_update` **needs the
 > destination**: the conversion hook is per-destination, and for an existing route the destination
 > lives in the live table (request normalization performs no host access). Until this round only
@@ -240,7 +258,15 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
   "plan_summary":{"n_controls":2,"n_routes_create":1,"n_disable_set":0}}`
 
 ## 8. `plugin_state` — V1 scope: inspect only (AUD-009)
-
+> **Note (2026-10-13, P30 - `state_view`).** When a provider declares the optional
+> `state_view(document)` hook, the tool's data gains a `state_view` block: descriptor-shaped
+> content a generic summary cannot express (for the first provider, per table slot: content
+> `table_id`, `n_frames`, frame positions, samples per frame, payload and wave-carrying byte
+> counts, whether a `Wave Source` component exists). Descriptors only - never wave data. A
+> provider without the hook answers exactly what it did before, and a failure inside the hook
+> is a `state_view_failed` **warning row**, never an error on a readable state. This is the
+> read-back proof a formatter text cannot give: it says *which table* the engine holds, by
+> content, not what a label prints.
 - **Purpose:** state/document **inspection**: provider-declared structural summary, structural-key
   inventory, targeted decode of the selected slice.
 - **Input:** `{ "instance": ..., "op": "inspect", "include": ["routes","wavetables",...]? }`

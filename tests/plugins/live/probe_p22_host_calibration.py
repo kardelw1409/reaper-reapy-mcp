@@ -47,7 +47,7 @@ from reaper_reapy_mcp.plugins.providers.vital import depth as D  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital import profile_build as PB  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital.provider import VitalProvider  # noqa: E402
 
-EVIDENCE_DIR = HERE / "evidence"
+from live_harness import EVIDENCE_DIR, finalize_run  # noqa: E402 - run artifacts, never the repo (P32)
 GRID_DIVISIONS = 16  # 17 points: the step that lands on 1/16 switch points exactly
 
 
@@ -332,16 +332,22 @@ def main(argv: list[str]) -> int:
         },
         "seconds": round(time.perf_counter() - started, 3),
     }
-    text = json.dumps(evidence, indent=2, sort_keys=True, default=str)
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    evidence_path = EVIDENCE_DIR / f"p22_host_calibration__{_run_stamp()}__{digest}.json"
-    if evidence_path.exists():
-        evidence_path = EVIDENCE_DIR / f"p22_host_calibration__{_run_stamp()}__{digest}__2.json"
-    evidence_path.write_text(text, encoding="utf-8")
+    evidence_path, report_path = finalize_run(
+        "p22_host_calibration",
+        evidence,
+        purpose="measure the host's own formatted values and step sizes; write the calibration artifact",
+        findings=[
+            "the artifact is measured host formatting; it is cache-key material, not a value cache",
+        ],
+        limitations=[
+            "read-only on parameters: a re-run regenerates the artifact and moves the cache key",
+        ],
+        directory=EVIDENCE_DIR,
+    )
 
     print(f"artifact: {out_path}  sha256={artifact_sha[:16]}  {evidence['artifact']['bytes']:,} bytes")
     print(f"evidence: {evidence_path}")
+    print(f"report: {report_path}")
     print(
         "timings:",
         timings,
