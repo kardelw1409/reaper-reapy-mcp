@@ -19,8 +19,26 @@ VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
 APPLY_REPORT_FILENAME = "apply_report.json"
 
-#: The tracks the fill creates; also the names the double-apply guard matches.
-AI_TRACKS: tuple[str, ...] = ("AI_MASTER", "AI_VOCAL", "AI_INSTR", "MIDI_VOCAL", "MIDI_INS")
+#: The five tracks a v1.0 bundle always creates (AI_VOCAL/AI_INSTR stay empty
+#: when the bundle carries no separated vocal/instrumental stem).
+BASE_AI_TRACKS: tuple[str, ...] = ("AI_MASTER", "AI_VOCAL", "AI_INSTR", "MIDI_VOCAL", "MIDI_INS")
+
+#: Extra tracks, created only when the bundle carries the matching artifact
+#: (contract extension: stems and transcribed MIDI are optional keys).
+STEM_TRACK_MAP: dict[str, str] = {
+    "vocals": "AI_VOCAL",       # fills the base track that v1.0 left empty
+    "instrumental": "AI_INSTR",  # ditto
+    "drums": "AI_DRUMS",
+    "bass": "AI_BASS",
+    "other": "AI_OTHER",
+}
+MIDI_TRACK_MAP: dict[str, str] = {
+    "drums": "MIDI_DRUMS",
+    "bass": "MIDI_BASS",
+}
+
+#: Every name the double-apply guard matches (base + all optional tracks).
+AI_TRACKS: tuple[str, ...] = BASE_AI_TRACKS + ("AI_DRUMS", "AI_BASS", "AI_OTHER", "MIDI_DRUMS", "MIDI_BASS")
 
 VALID_SOURCES = ("plan", "audio", "mixed")
 
@@ -156,12 +174,54 @@ def load_manifest(bundle_dir: str | Path) -> dict:
     if not isinstance(audio, dict):
         raise ManifestError("manifest is missing the audio object")
     audio_path = _require_file(bundle, audio.get("file"), what="audio")
+    audio_start_s = audio.get("start_s", 0.0)
+    if not isinstance(audio_start_s, (int, float)) or isinstance(audio_start_s, bool):
+        raise ManifestError("manifest audio.start_s must be a number")
+    source_offset_s = audio.get("source_offset_s", 0.0)
+    if not isinstance(source_offset_s, (int, float)) or isinstance(source_offset_s, bool):
+        raise ManifestError("manifest audio.source_offset_s must be a number")
+    if source_offset_s < 0:
+        raise ManifestError(
+            "manifest audio.source_offset_s must not be negative", detail=f"got {source_offset_s}"
+        )
 
     midi = doc.get("midi")
     if not isinstance(midi, dict):
         raise ManifestError("manifest is missing the midi object")
     vocal_path = _require_file(bundle, midi.get("vocal"), what="vocal MIDI")
     ins_path = _require_file(bundle, midi.get("ins"), what="instrumental MIDI")
+    extra_midi: dict[str, str] = {}
+    for key in MIDI_TRACK_MAP:
+        if midi.get(key):
+            extra_midi[key] = _require_file(bundle, midi[key], what=f"{key} MIDI")
+
+    stems_raw = doc.get("stems") or {}
+    if not isinstance(stems_raw, dict):
+        raise ManifestError("manifest stems must be an object")
+    stems: dict[str, str] = {}
+    for key, name in stems_raw.items():
+        if key not in STEM_TRACK_MAP:
+            raise ManifestError(
+                f"unknown stem {key!r} in the bundle",
+                detail=f"valid stems: {', '.join(STEM_TRACK_MAP)}",
+            )
+        stems[key] = _require_file(bundle, name, what=f"{key} stem")
+
+    grid_raw = doc.get("grid") or {}
+    if not isinstance(grid_raw, dict):
+        raise ManifestError("manifest grid must be an object")
+    bar_s = grid_raw.get("bar_s")
+    if bar_s is not None and (not isinstance(bar_s, (int, float)) or bar_s <= 0):
+        raise ManifestError("manifest grid.bar_s must be a positive number")
+    grid = {
+        "quantize": str(grid_raw.get("quantize") or "none"),
+        "bar_s": float(bar_s) if bar_s else None,
+        "aligned": bool(grid_raw.get("aligned")),
+        "first_downbeat_s": float(grid_raw.get("first_downbeat_s") or 0.0),
+        "max_shift_s": grid_raw.get("max_shift_s"),
+        "source": grid_raw.get("source"),
+        "bpm_measured": grid_raw.get("bpm_measured"),
+    }
 
     regions = _normalize_regions(doc)
 
@@ -174,26 +234,55 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         "meter": [int(meter[0]), int(meter[1])],
         "duration_s": duration_s,
         "audio_path": audio_path,
+        "audio_start_s": float(audio_start_s),
+        "audio_source_offset_s": float(source_offset_s),
         "vocal_midi_path": vocal_path,
         "ins_midi_path": ins_path,
+        "extra_midi": extra_midi,
+        "stems": stems,
+        "grid": grid,
+        "midi_sources": doc.get("midi_sources") or {},
         "regions": regions,
         "warnings": [str(w) for w in (doc.get("warnings") or [])],
     }
 
 
-def clamp_regions(regions: list[dict], duration_s: float) -> tuple[list[dict], list[dict], list[dict]]:
-    """Clamp region ends to the audio duration; drop regions that start past it.
+def clamp_regions(
+    regions: list[dict],
+    duration_s: float,
+    *,
+    allow_overhang_s: float = 0.0,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Clamp region ends to the audio end; drop regions that start past it.
 
-    Returns (kept, clamps, skipped). A clamp is recorded when the applied end is
-    earlier than the manifest's end; a region whose start_s is already at/past the
-    duration cannot sound its range and is skipped with a record.
+    Returns (kept, clamps, skipped, overhangs). `duration_s` is the end of the
+    audio in PROJECT time (audio.start_s + duration). A region whose end lands
+    INSIDE `allow_overhang_s` of that end keeps its end (a bar-aligned edge may
+    legitimately poke a little past the audio) and is listed in `overhangs`;
+    anything further is clamped and recorded in `clamps`. A region starting at
+    or past the end cannot sound and is skipped.
     """
     kept: list[dict] = []
     clamps: list[dict] = []
     skipped: list[dict] = []
+    overhangs: list[dict] = []
     for region in regions:
-        end = min(region["end_s"], duration_s)
+        end = region["end_s"]
+        if end > duration_s + 1e-9:
+            if end - duration_s <= allow_overhang_s + 1e-9:
+                overhangs.append(
+                    {
+                        "name": region["name"],
+                        "end_s": end,
+                        "audio_end_s": round(duration_s, 3),
+                        "overhang_s": round(end - duration_s, 3),
+                    }
+                )
+            else:
+                end = duration_s
         if region["start_s"] >= end - 1e-9:
+            # Cannot sound: skipped, and NOT reported as a clamp (a region that
+            # does not survive must not show up in two lists).
             skipped.append({**region, "applied_end_s": round(max(end, 0.0), 3)})
             continue
         if end < region["end_s"] - 1e-9:
@@ -201,4 +290,4 @@ def clamp_regions(regions: list[dict], duration_s: float) -> tuple[list[dict], l
                 {"name": region["name"], "end_s": region["end_s"], "applied_end_s": round(end, 3)}
             )
         kept.append({**region, "end_s": round(end, 3)})
-    return kept, clamps, skipped
+    return kept, clamps, skipped, overhangs

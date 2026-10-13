@@ -197,6 +197,14 @@ result by an independent re-read and writes `apply_report.json` back into the bu
 - `clean`: replace a previous fill; a second apply without it is refused
 - `save_as`: `Main_SaveProjectEx` to that path
 
+When the bundle carries the extension artifacts it also lands the separated stems
+(`AI_VOCAL`/`AI_INSTR` filled from `stems.vocals`/`stems.instrumental`, plus
+`AI_DRUMS`/`AI_BASS`/`AI_OTHER`) and the transcribed drum/bass MIDI
+(`MIDI_DRUMS`/`MIDI_BASS`), and it aligns the arrangement to the render's measured
+grid: regions sit bit-exactly on bar lines, the audio's lead-in is skipped through a
+take source offset, and the MIDI artifacts are shifted into project time. A bundle
+without those fields behaves exactly like the original five-track fill.
+
 The bundle contract (`audiocpp.manifest` v1) and the measured host limits are in
 [`docs/audiocpp_manifest.md`](docs/audiocpp_manifest.md).
 

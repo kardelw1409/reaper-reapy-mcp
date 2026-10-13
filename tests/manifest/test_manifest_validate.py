@@ -190,7 +190,7 @@ def test_clamp_regions_keeps_clamps_and_skips():
         {"name": "c", "start_s": 260.0, "end_s": 400.0, "source": "mixed"},
         {"name": "d", "start_s": 280.0, "end_s": 400.0, "source": "plan"},
     ]
-    kept, clamps, skipped = clamp_regions(regions, 270.0)
+    kept, clamps, skipped, overhangs = clamp_regions(regions, 270.0)
     assert [r["name"] for r in kept] == ["a", "b", "c"]
     assert kept[0]["end_s"] == 270.0
     assert kept[1]["end_s"] == 200.0
@@ -200,15 +200,156 @@ def test_clamp_regions_keeps_clamps_and_skips():
         {"name": "c", "end_s": 400.0, "applied_end_s": 270.0},
     ]
     assert [s["name"] for s in skipped] == ["d"]
+    assert overhangs == []
+
+
+def test_clamp_regions_keeps_a_bar_aligned_overhang_inside_the_tolerance():
+    # Measured case: bar-snapped edges may poke up to half a bar past the audio
+    # end (house take: audio ends at 89.999, bar 48 sits at 90.0).
+    regions = [
+        {"name": "chorus", "start_s": 76.875, "end_s": 90.0, "source": "plan"},
+        {"name": "tail", "start_s": 80.0, "end_s": 96.0, "source": "plan"},
+    ]
+    kept, clamps, _skipped, overhangs = clamp_regions(regions, 89.999, allow_overhang_s=0.9375)
+    assert [r["name"] for r in kept] == ["chorus", "tail"]
+    assert kept[0]["end_s"] == 90.0  # kept: the edge is a bar and only 1 ms past
+    assert kept[1]["end_s"] == 89.999  # 6 s overhang is still clamped
+    assert [c["name"] for c in clamps] == ["tail"]
+    assert overhangs == [
+        {"name": "chorus", "end_s": 90.0, "audio_end_s": 89.999, "overhang_s": 0.001}
+    ]
 
 
 def test_clamp_regions_skips_region_starting_past_duration():
     regions = [{"name": "ghost", "start_s": 400.0, "end_s": 500.0, "source": "plan"}]
-    kept, clamps, skipped = clamp_regions(regions, 270.0)
+    kept, clamps, skipped, overhangs = clamp_regions(regions, 270.0)
     assert kept == []
     assert clamps == []
+    assert overhangs == []
     assert skipped and skipped[0]["name"] == "ghost"
 
 
+def test_clamp_regions_region_that_starts_inside_the_overhang_is_skipped():
+    # Its whole range sits past the audio; keeping the bar must not resurrect it.
+    regions = [{"name": "late", "start_s": 89.9999, "end_s": 92.0, "source": "plan"}]
+    kept, clamps, skipped, overhangs = clamp_regions(regions, 89.999, allow_overhang_s=0.9375)
+    assert kept == []
+    assert clamps == []
+    assert [s["name"] for s in skipped] == ["late"]
+
+
 def test_ai_tracks_constant():
-    assert manifest.AI_TRACKS == ("AI_MASTER", "AI_VOCAL", "AI_INSTR", "MIDI_VOCAL", "MIDI_INS")
+    assert manifest.BASE_AI_TRACKS == ("AI_MASTER", "AI_VOCAL", "AI_INSTR", "MIDI_VOCAL", "MIDI_INS")
+    assert set(manifest.AI_TRACKS) == set(manifest.BASE_AI_TRACKS) | {
+        "AI_DRUMS",
+        "AI_BASS",
+        "AI_OTHER",
+        "MIDI_DRUMS",
+        "MIDI_BASS",
+    }
+
+
+def test_defaults_when_the_bundle_has_no_extensions(tmp_path, pointer):
+    """A v1.0 bundle (no grid/stems/audio.start_s) still loads with safe defaults."""
+    bundle = _write_bundle(tmp_path / "plain")
+    info = manifest.load_manifest(bundle)
+    assert info["audio_start_s"] == 0.0
+    assert info["stems"] == {}
+    assert info["extra_midi"] == {}
+    assert info["grid"] == {
+        "quantize": "none",
+        "bar_s": None,
+        "aligned": False,
+        "first_downbeat_s": 0.0,
+        "max_shift_s": None,
+        "source": None,
+        "bpm_measured": None,
+    }
+
+
+def test_grid_stems_and_extra_midi_are_loaded(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "rich")
+    (bundle / "stems").mkdir()
+    _write_wav(bundle / "stems" / "drums.wav")
+    _write_wav(bundle / "stems" / "vocals.wav")
+    _write_midi(bundle / "drums.mid")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["audio"]["start_s"] = 0.0
+    doc["audio"]["source_offset_s"] = 0.42
+    doc["grid"] = {
+        "bpm": 127.9869,
+        "bpm_measured": 127.9869,
+        "source": "muscriptor",
+        "bar_s": 1.875,
+        "first_downbeat_s": 0.42,
+        "aligned": True,
+        "quantize": "bar",
+        "max_shift_s": 0.2,
+        "audio_source_offset_s": 0.42,
+        "midi_time_shift_s": -0.42,
+    }
+    doc["stems"] = {"drums": "stems/drums.wav", "vocals": "stems/vocals.wav"}
+    doc["midi"]["drums"] = "drums.mid"
+    doc["midi_sources"] = {"vocal": "transcription", "ins": "score", "drums": "transcription"}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    info = manifest.load_manifest(bundle)
+    assert info["audio_start_s"] == 0.0
+    assert info["audio_source_offset_s"] == 0.42
+    assert info["grid"]["quantize"] == "bar"
+    assert info["grid"]["bar_s"] == 1.875
+    assert info["grid"]["aligned"] is True
+    assert set(info["stems"]) == {"drums", "vocals"}
+    assert Path(info["stems"]["drums"]).name == "drums.wav"
+    assert set(info["extra_midi"]) == {"drums"}
+    assert Path(info["extra_midi"]["drums"]).name == "drums.mid"
+    assert info["midi_sources"]["drums"] == "transcription"
+
+
+def test_unknown_stem_key_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "badstem")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["stems"] = {"mystery": "stems/mystery.wav"}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "unknown stem" in str(excinfo.value)
+
+
+def test_missing_stem_file_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "absentstem")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["stems"] = {"drums": "stems/drums.wav"}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "drums stem" in str(excinfo.value)
+
+
+def test_missing_extra_midi_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "absentmidi")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["midi"]["bass"] = "bass.mid"
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "bass MIDI" in str(excinfo.value)
+
+
+def test_bad_grid_bar_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "badgrid")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["grid"] = {"bar_s": -1.0}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ManifestError):
+        manifest.load_manifest(bundle)
+
+
+def test_negative_source_offset_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "negoffset")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["audio"]["source_offset_s"] = -0.5
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "source_offset_s" in str(excinfo.value)

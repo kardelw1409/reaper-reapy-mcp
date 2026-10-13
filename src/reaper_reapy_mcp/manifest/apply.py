@@ -31,6 +31,9 @@ from reapy import reascript_api as RPR
 from .manifest import (
     AI_TRACKS,
     APPLY_REPORT_FILENAME,
+    BASE_AI_TRACKS,
+    MIDI_TRACK_MAP,
+    STEM_TRACK_MAP,
     ManifestError,
     clamp_regions,
     load_manifest,
@@ -107,6 +110,43 @@ def _track_names(project) -> list[str]:
     return [str(track.name) for track in project.tracks]
 
 
+def _last_item_position(project, track_index: int) -> float | None:
+    """Position of the newest item on a track (measured, not assumed).
+
+    RPR.GetTrack is not usable here (reapy's dump has no such attribute); the
+    reapy Track object's id is what the ReaScript calls take.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return None
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    return float(RPR.GetMediaItemInfo_Value(item, "D_POSITION"))
+
+
+def _set_audio_source_offset(project, track_index: int, offset_s: float) -> float | None:
+    """Skip the render's lead-in inside the take (REAPER clamps positions at 0).
+
+    Measured: SetMediaItemInfo_Value(item, 'D_POSITION', -0.42) returns 1 and
+    changes NOTHING, so the arrival of the downbeat is expressed as a source
+    offset on the take, and the item is shortened so it does not play silence
+    past the source end. Returns the offset actually stored.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return None
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return None
+    RPR.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", float(offset_s))
+    length = float(RPR.GetMediaItemInfo_Value(item, "D_LENGTH"))
+    if length > offset_s:
+        RPR.SetMediaItemInfo_Value(item, "D_LENGTH", length - float(offset_s))
+    return float(RPR.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS"))
+
+
 def _same_span(mark: dict, region: dict) -> bool:
     """True when a project mark covers the manifest region's range (both ends)."""
     return (
@@ -148,7 +188,58 @@ def apply_bundle(
     bundle = resolve_bundle_dir(bundle_dir)
     info = load_manifest(bundle)
 
-    kept, clamps, skipped = clamp_regions(info["regions"], info["duration_s"])
+    # Times in the manifest are PROJECT time: the export shifted the arrangement
+    # so the render's first downbeat sits on bar 1. The audio keeps its lead-in in
+    # the file and skips it through a take source offset, so the sounding end of
+    # the audio in project time is duration - source_offset. A bar-aligned region
+    # edge may legitimately poke up to half a bar past that end, so that much
+    # overhang is kept instead of clamped.
+    audio_start_s = info["audio_start_s"]
+    audio_source_offset_s = info["audio_source_offset_s"]
+    project_duration_s = info["duration_s"] - audio_source_offset_s + audio_start_s
+    grid_info = info.get("grid") or {}
+    allow_overhang_s = 0.0
+    if grid_info.get("quantize") == "bar" and grid_info.get("bar_s"):
+        allow_overhang_s = float(grid_info["bar_s"]) / 2
+    kept, clamps, skipped, overhangs = clamp_regions(
+        info["regions"], project_duration_s, allow_overhang_s=allow_overhang_s
+    )
+
+    # Track layout: the five base tracks always exist; every artifact the bundle
+    # carries adds its track (vocals/instrumental FILL base tracks, drums/bass/
+    # other ADD tracks). Items all sit at the arrangement origin.
+    tracks_to_create: list[str] = list(BASE_AI_TRACKS)
+    for stem_key, track_name in STEM_TRACK_MAP.items():
+        if stem_key in info["stems"] and track_name not in tracks_to_create:
+            tracks_to_create.append(track_name)
+    for midi_key, track_name in MIDI_TRACK_MAP.items():
+        if midi_key in info["extra_midi"] and track_name not in tracks_to_create:
+            tracks_to_create.append(track_name)
+
+    item_actions: list[dict] = [
+        {"track": "AI_MASTER", "kind": "audio", "file": info["audio_path"], "start_s": audio_start_s}
+    ]
+    for stem_key, track_name in STEM_TRACK_MAP.items():
+        if stem_key in info["stems"]:
+            item_actions.append(
+                {"track": track_name, "kind": "audio", "file": info["stems"][stem_key], "start_s": audio_start_s}
+            )
+    item_actions.append(
+        {"track": "MIDI_VOCAL", "kind": "midi", "file": info["vocal_midi_path"], "start_s": audio_start_s}
+    )
+    item_actions.append(
+        {"track": "MIDI_INS", "kind": "midi", "file": info["ins_midi_path"], "start_s": audio_start_s}
+    )
+    for midi_key, track_name in MIDI_TRACK_MAP.items():
+        if midi_key in info["extra_midi"]:
+            item_actions.append(
+                {
+                    "track": track_name,
+                    "kind": "midi",
+                    "file": info["extra_midi"][midi_key],
+                    "start_s": audio_start_s,
+                }
+            )
 
     project = reapy.Project()
     before = {
@@ -170,22 +261,22 @@ def apply_bundle(
         )
 
     plan = {
-        "tracks_to_create": list(AI_TRACKS),
+        "tracks_to_create": tracks_to_create,
         "tracks_to_delete": sorted(set(existing_ai)) if clean else [],
         "regions_to_delete": [
             {"name": m["name"], "start_s": m["start_s"], "index": m["index"]} for m in regions_to_delete
         ],
         "regions_to_create": kept,
         "region_clamps": clamps,
+        "region_overhangs": overhangs,
         "region_skipped": skipped,
-        "audio_item": {"track": "AI_MASTER", "file": Path(info["audio_path"]).name, "start_s": 0.0},
-        "midi_items": [
-            {"track": "MIDI_VOCAL", "file": Path(info["vocal_midi_path"]).name, "start_s": 0.0},
-            {"track": "MIDI_INS", "file": Path(info["ins_midi_path"]).name, "start_s": 0.0},
+        "items": [
+            {**action, "file": Path(action["file"]).name} for action in item_actions
         ],
         "tempo": info["bpm"],
         "meter": info["meter"],
         "title_marker": info["title"],
+        "grid": grid_info,
         "save_as": save_as,
     }
 
@@ -205,6 +296,7 @@ def apply_bundle(
         "deleted_regions": [],
         "deleted_tracks": [],
         "tracks": [],
+        "items": [],
         "audio_items": 0,
         "midi_items": 0,
         "regions": 0,
@@ -238,25 +330,59 @@ def apply_bundle(
     applied["meter_how"] = meter_how
     RPR.AddProjectMarker(project.id, False, 0.0, 0.0, info["title"], -1)
 
-    # --- tracks
+    # --- tracks (base five, then one per extra artifact the bundle carries)
     track_index: dict[str, int] = {}
-    for name in AI_TRACKS:
+    for name in tracks_to_create:
         track_index[name] = controller.create_track(name)
         applied["tracks"].append(name)
 
-    # --- items
-    if controller.insert_audio_item(track_index["AI_MASTER"], info["audio_path"], 0.0) in (-1, None):
-        warnings.append("audio item insert failed (insert_audio_item returned -1)")
-    else:
-        applied["audio_items"] += 1
-    if controller.insert_midi_item(track_index["MIDI_VOCAL"], info["vocal_midi_path"], 0.0) in (-1, None):
-        warnings.append("vocal MIDI insert failed")
-    else:
-        applied["midi_items"] += 1
-    if controller.insert_midi_item(track_index["MIDI_INS"], info["ins_midi_path"], 0.0) in (-1, None):
-        warnings.append("instrumental MIDI insert failed")
-    else:
-        applied["midi_items"] += 1
+    # --- items (audio stems and MIDI performances, all at the arrangement origin)
+    # The controller inserts at the edit cursor, and REAPER does not allow a
+    # negative cursor - so a negative origin (the render's lead-in) needs the
+    # position written afterwards. Measured on the house take: without this the
+    # items sat at 0.0 while the regions were shifted, i.e. 0.42 s out of sync.
+    applied["items"] = []
+    for action in item_actions:
+        track = track_index[action["track"]]
+        if action["kind"] == "audio":
+            outcome = controller.insert_audio_item(track, action["file"], action["start_s"])
+        else:
+            outcome = controller.insert_midi_item(track, action["file"], action["start_s"])
+        if outcome in (-1, None):
+            warnings.append(f"{action['kind']} insert failed on {action['track']} ({Path(action['file']).name})")
+            continue
+        if action["start_s"] != 0.0:
+            controller.set_item_position(track, outcome, action["start_s"])
+        source_offset = None
+        if action["kind"] == "audio" and audio_source_offset_s > 0:
+            source_offset = _set_audio_source_offset(project, track, audio_source_offset_s)
+            if source_offset is None or abs(source_offset - audio_source_offset_s) > 1e-4:
+                warnings.append(
+                    f"{action['track']}: take source offset "
+                    f"{('unknown' if source_offset is None else f'{source_offset:.3f}')} s does not match "
+                    f"the manifest's {audio_source_offset_s:.3f} s"
+                )
+        position = _last_item_position(project, track)
+        if position is None or abs(position - action["start_s"]) > 1e-3:
+            warnings.append(
+                f"{action['track']}: item position "
+                f"{('unknown' if position is None else f'{position:.3f}')} s does not match "
+                f"the arrangement origin {action['start_s']:.3f} s"
+            )
+        if action["kind"] == "audio":
+            applied["audio_items"] += 1
+        else:
+            applied["midi_items"] += 1
+        applied["items"].append(
+            {
+                "track": action["track"],
+                "kind": action["kind"],
+                "file": Path(action["file"]).name,
+                "start_s": action["start_s"],
+                "position_s": position,
+                "source_offset_s": source_offset,
+            }
+        )
 
     # --- regions (validated AddProjectMarker path)
     for region in kept:
@@ -275,23 +401,27 @@ def apply_bundle(
 
     # --- verify by re-reading
     after_names = _track_names(project)
-    tracks_ok = all(name in after_names for name in AI_TRACKS)
+    tracks_ok = all(name in after_names for name in tracks_to_create)
     marks_after = _enumerate_marks(project)
     regions_after = [m for m in marks_after if m["is_region"]]
     # Matching is by time range: marker names are unreadable through reapy
     # (measured - see _enumerate_marks), so a name comparison would always read 0.
     regions_matched = sum(1 for region in kept if any(_same_span(m, region) for m in regions_after))
-    items_ok = (
-        project.tracks[track_index["AI_MASTER"]].n_items >= 1
-        and project.tracks[track_index["MIDI_VOCAL"]].n_items >= 1
-        and project.tracks[track_index["MIDI_INS"]].n_items >= 1
-    )
+    missing_items = [
+        action["track"]
+        for action in item_actions
+        if project.tracks[track_index[action["track"]]].n_items < 1
+    ]
+    items_ok = not missing_items
+    if missing_items:
+        warnings.append("tracks without the expected item: " + ", ".join(missing_items))
     tempo_after = controller.get_tempo()
     meter_after = _read_time_signature(project)
     meter_applied_ok = [meter_after[0], meter_after[1]] == info["meter"]
     verification = {
         "tracks_ok": tracks_ok,
         "items_ok": items_ok,
+        "items_expected": len(item_actions),
         "regions_expected": len(kept),
         "regions_matched": regions_matched,
         "regions_read_back": len(regions_after),
@@ -299,6 +429,8 @@ def apply_bundle(
         "tempo_after": tempo_after,
         "meter_after": [meter_after[0], meter_after[1]],
         "meter_ok": meter_applied_ok,
+        "audio_start_s": audio_start_s,
+        "grid": grid_info,
     }
     ok = bool(tracks_ok and items_ok and regions_matched == len(kept) and meter_applied_ok)
     if not ok:
@@ -323,7 +455,11 @@ def apply_bundle(
         },
         "applied": applied,
         "region_clamps": clamps,
+        "region_overhangs": overhangs,
         "regions_skipped": skipped,
+        "stems": {key: Path(value).name for key, value in info["stems"].items()},
+        "midi_sources": info["midi_sources"],
+        "grid": grid_info,
         "deletion_order": "regions_then_tracks",
         "warnings": warnings,
         "verification": verification,
@@ -339,6 +475,7 @@ def apply_bundle(
         "project_after": report["project_after"]["project_name"],
         "applied": applied,
         "region_clamps": clamps,
+        "region_overhangs": overhangs,
         "regions_skipped": skipped,
         "verification": verification,
         "warnings": warnings,
