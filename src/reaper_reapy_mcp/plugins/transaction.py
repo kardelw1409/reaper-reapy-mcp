@@ -688,10 +688,16 @@ class Transaction:
         self._check_cancel(write_issued=True)
 
         self.stage = Stage.VERIFY
+        # ONE fresh post-write read serves BOTH the read-back comparison and the
+        # revision basis. A separate second read would observe the same state
+        # (no write happens between them) while opening a window where an
+        # external change lands after the comparison but before the digest --
+        # merged, the row the caller verifies IS the state the tracker advances
+        # from, so the two can never describe different moments.
         readback = (
             self._read_planned_vector()
             if self.index_addressed
-            else self._read_full_parameter_vector(ident_filter=[ident for ident, _v in pairs])
+            else self._read_full_parameter_vector()
         )
         rows, mismatched = self._verify_parameters(sent, readback)
         self._rows["parameters"].extend(rows)
@@ -702,7 +708,7 @@ class Transaction:
                 "the parameter read-back does not agree in the space that was written",
                 detail={"mismatched": mismatched, "space": "normalized"},
             )
-        full = self._read_planned_vector() if self.index_addressed else self._read_full_parameter_vector()
+        full = readback
         self._last_vector = full
         self._last_verified["parameters"] = _vector_digest(full)
         if self._last_slice is not None:
@@ -927,22 +933,17 @@ class Transaction:
         )
         return facts.param_count
 
-    def _read_full_parameter_vector(self, *, ident_filter: Sequence[str] | None = None) -> dict[str, float]:
+    def _read_full_parameter_vector(self) -> dict[str, float]:
         if self.index_addressed:
             # The index path's capture scope is the planned set (see `capture_scope`),
-            # so "the vector" means that set - read in one hop. A filter argument is
-            # meaningless here (there are no idents to filter by) and is ignored with
-            # the planned scope documented in the outcome instead.
+            # so "the vector" means that set - read in one hop.
             return self._read_planned_vector()
-        if ident_filter is not None:
-            indices = self._indices_for(ident_filter)
-        else:
-            count = self._param_count()
-            if count is None:
-                raise SnapshotUnavailable(
-                    "the host does not report a parameter count", detail={"field": "param_count"}
-                )
-            indices = list(range(count))
+        count = self._param_count()
+        if count is None:
+            raise SnapshotUnavailable(
+                "the host does not report a parameter count", detail={"field": "param_count"}
+            )
+        indices = list(range(count))
         idents = self._read(self.bridge.param_idents, self.ref, indices)
         if any(ident is None for ident in idents):
             raise SnapshotUnavailable(
@@ -958,18 +959,35 @@ class Transaction:
         return {str(ident): float(value) for ident, value in zip(idents, values)}
 
     def _indices_for(self, idents: Sequence[str]) -> list[int]:
-        """Index lookup through one ident read (idents are the durable binding)."""
-        count = self._param_count()
-        if count is None:
-            raise SnapshotUnavailable("the host does not report a parameter count", detail={})
-        all_idents = self._read(self.bridge.param_idents, self.ref, list(range(count)))
-        index_by_ident = {ident: index for index, ident in enumerate(all_idents) if ident}
-        missing = [ident for ident in idents if ident not in index_by_ident]
+        """Index lookup resolved **at use time**, one host call per ident.
+
+        The host answers the ident's current index directly (the same rule the
+        write hop uses inside its own hop), instead of reading the whole ident
+        table to build a map first: measured live 2026-10-13, one ident sweep
+        costs ~1 ms per index (~2.8 s over a 2858-parameter table) and every
+        lookup paid for it; the direct answer cannot disagree with the write
+        hop's own resolution either. An absent ident refuses exactly as the
+        sweep-based lookup did.
+        """
+        if not idents:
+            return []
+        resolved = self._read(
+            self.bridge.param_index_from_idents, self.ref, [str(ident) for ident in idents]
+        )
+        if len(resolved) != len(idents):
+            # the same rule every sibling read enforces: a short answer is not
+            # evidence, and a truncated map would silently drop planned params
+            raise SnapshotUnavailable(
+                "the ident-to-index resolution returned fewer answers than asked; "
+                "a short read is not evidence",
+                detail={"expected": len(idents), "read": len(resolved)},
+            )
+        missing = [str(ident) for ident, index in zip(idents, resolved) if index is None]
         if missing:
             raise SnapshotUnavailable(
                 "the parameter ident is not present in the live parameter table", detail={"missing": missing}
             )
-        return [index_by_ident[ident] for ident in idents]
+        return [int(index) for index in resolved]
 
     def _read_planned_parameters(self, resolved: ResolvedRequest) -> dict[str, float]:
         if self.index_addressed:

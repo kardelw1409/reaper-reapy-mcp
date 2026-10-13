@@ -694,6 +694,28 @@ class ReaperHostBridge:
 
         return self.call_read(_read, timeout=self.timeout, label="param_names")
 
+    def param_index_from_idents(self, ref: PluginInstanceRef, idents: list[str]) -> list[int | None]:
+        """Resolve parameter idents to their **current** indices, one call per ident.
+
+        The host answers the ident's index directly (negative when unknown), the
+        same rule the write hop already uses inside its own held hop - so the
+        read side resolves at use time instead of building a full-table map:
+        measured live 2026-10-13, a full ident sweep costs ~1 ms per index
+        (~2.8 s over 2858 parameters) while one direct resolution costs one
+        call, and a map's own duplicate-ident policy cannot disagree with the
+        write hop's answer when both ask the host the same question.
+        """
+        self.ensure()
+        R = self._api()
+        track_index, fx_index = _location(ref)
+
+        def _read() -> list[int | None]:
+            with self._hold():
+                track = self._track(R, track_index)
+                return [_ident_index(R, track, fx_index, str(ident)) for ident in idents]
+
+        return self.call_read(_read, timeout=self.timeout, label="param_index_from_idents")
+
     def read_params(self, ref: PluginInstanceRef, indices: list[int]) -> list[float]:
         """ONE batched host hop for the whole index list (never per control)."""
         self.ensure()

@@ -99,6 +99,7 @@ def test_bridge_exposes_the_full_host_contract():
         "list_tracks",
         "fx_facts",
         "param_idents",
+        "param_index_from_idents",
         "read_params",
         "read_state_chunk",
         "locate_state_slice",

@@ -45,6 +45,15 @@ class HostBridge(Protocol):
         """Durable parameter idents for indices; ``None`` where unavailable."""
         ...
 
+    def param_index_from_idents(self, ref: PluginInstanceRef, idents: list[str]) -> list[int | None]:
+        """The current index of each ident; ``None`` where the ident is unknown.
+
+        Additive read verb (P36): resolution **at use time**, the same rule the
+        index-addressed write hop applies inside its own held hop, instead of a
+        whole-table ident sweep per lookup.
+        """
+        ...
+
     def param_names(self, ref: PluginInstanceRef, indices: list[int]) -> list[str | None]:
         """Host-reported parameter names for indices; ``None`` where unavailable.
 

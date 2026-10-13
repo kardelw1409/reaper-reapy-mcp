@@ -201,14 +201,25 @@ def _existing_tool_names() -> list[str]:
     return re.findall(r'@mcp\.tool\("([^"]+)"\)', source)
 
 
+def _manifest_tool_names() -> list[str]:
+    """The E2 manifest tool registers from its own package, not mcp_tools.py."""
+    source = (SRC / "reaper_reapy_mcp" / "manifest" / "__init__.py").read_text(encoding="utf-8")
+    return re.findall(r'@mcp\.tool\("([^"]+)"\)', source)
+
+
 def test_tool_names_disjoint_from_existing_host_tools():
-    """P0-3: the 7 plugin names intersect the existing tool set in NOTHING."""
+    """P0-3: the plugin names intersect the existing tool set in NOTHING."""
     existing = _existing_tool_names()
     assert len(existing) == 57, f"expected 57 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
-    # 57 classic + 8 plugin_* (7 until P26 added `plugin_prepare`), which is what
-    # the VS Code workspace cache reports for this server.
-    assert len(set(existing) | set(TOOL_NAMES)) == 65
+    # 57 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
+    # manifest package since E2) + 8 plugin_* (7 until P26 added plugin_prepare)
+    # = the 66 tools the running server advertises (P34 measured that count on
+    # tools/list). The pin now names every group; the earlier "57 + 8 = 65"
+    # comment silently excluded the manifest tool and went stale (P34 finding).
+    manifest = _manifest_tool_names()
+    assert manifest == ["apply_audiocpp_manifest"], manifest
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 66
 
 
 def test_every_mutating_tool_declares_dry_run_true():

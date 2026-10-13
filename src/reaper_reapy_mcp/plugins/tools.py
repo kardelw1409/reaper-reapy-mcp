@@ -93,7 +93,12 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": "identity, profile, modules[], counts, routes, warnings[]",
     },
     "plugin_find": {
-        "purpose": "Search controls/modules by name or group; detail for one group.",
+        "purpose": (
+            "Find WRITABLE/readable control ids of one instance by name, group or module: the "
+            "ids plugin_read and plugin_write accept (they are the profile vocabulary, not the "
+            "host's display names). Start here when a control id is unknown; for a providerless "
+            "FX run plugin_prepare first so an artifact exists to search."
+        ),
         "args": {
             "instance": {"type": "object", "required": True, "default": None},
             "query": {"type": "string", "required": False, "default": None},
@@ -108,7 +113,13 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": "matches[], suggestions[], groups[]",
     },
     "plugin_read": {
-        "purpose": "Targeted, batched current-value reads for named controls.",
+        "purpose": (
+            "Batched VALUE READ for named controls of one instance: pass every control id you "
+            "need and get the normalized/native/display value per control in one response - "
+            "prefer it over one read per control. Control ids are the profile vocabulary "
+            "(see plugin_find; for a providerless FX run plugin_prepare first). Reads live "
+            "values; use get_fx_param/get_fx_param_list for FX the plugin layer does not cover."
+        ),
         "args": {
             "instance": {"type": "object", "required": True, "default": None},
             "controls": {"type": "array", "required": True, "default": None},
@@ -120,7 +131,19 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": "values{}, problems[]",
     },
     "plugin_write": {
-        "purpose": "Batch-first verified plugin write; dry-run by default, explicit apply required.",
+        "purpose": (
+            "THE batch write for plugin controls: change several controls (and/or routes) of ONE "
+            "FX instance in one request, verified with read-back. Prefer it over repeated single "
+            "writes - one request carries the whole set. `request.controls` maps control ids to "
+            "values (display units, or a single-value object naming the space explicitly: "
+            "{'normalized': 0..1} or {'native': x}); ids come from plugin_find/plugin_read. "
+            "Dry-run by default; it applies only with dry_run=false. Refuses the whole set "
+            "before writing when any control is "
+            "unknown (no partial apply); a failed write is rolled back and reported. "
+            "On a providerless FX run plugin_prepare first (its artifact is the addressing basis). "
+            "'state'/'routes_*' need a plugin WITH a provider; 'controls' works on both paths. "
+            "For a single precise tweak, set_fx_param is the lighter call."
+        ),
         "args": {
             "instance": {"type": "object", "required": True, "default": None},
             "request": {"type": "object", "required": True, "default": None},
@@ -171,7 +194,10 @@ SPEC: dict[str, dict[str, Any]] = {
     "plugin_prepare": {
         "purpose": (
             "Inventory and prepare any FX instance for discovery: read-only host metadata plus a "
-            "budgeted display sweep, stored as a reusable prepared artifact."
+            "budgeted display sweep, stored as a reusable prepared artifact. Run it BEFORE "
+            "plugin_read/plugin_find/plugin_write on an FX that has no provider (they refuse "
+            "without an artifact); mode='reuse' (default) serves the stored artifact and only "
+            "measures when none exists, so a repeat call is cheap."
         ),
         "args": {
             "instance": {"type": "object", "required": True, "default": None},

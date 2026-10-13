@@ -43,7 +43,16 @@ HERE = Path(__file__).resolve().parent
 
 @pytest.fixture(autouse=True)
 def _isolated_run_state(monkeypatch):
-    """No test may leak a run-directory resolution or a written-file record."""
+    """No test may leak a run-directory resolution, a written-file record, or the
+    ambient harness environment.
+
+    P34 measured the trap: with ``REAPER_MCP_EVIDENCE_DIR`` exported by the
+    operator, three tests of THIS module changed outcome (the verbatim override
+    beats a test's own artifacts root) and six artifacts were written into the
+    operator's directory. The ambient variables are removed here so every test
+    starts from the default state and sets exactly what it needs; the nested
+    subprocess test at the bottom pins both environment states end to end.
+    """
     saved_dirs = H._RUN_DIRS
     saved_state = {
         key: (list(value) if isinstance(value, list) else value) for key, value in H._run_state.items()
@@ -51,6 +60,8 @@ def _isolated_run_state(monkeypatch):
     H._run_state.clear()
     H._run_state.update({"evidence": []})
     monkeypatch.setenv("REAPER_MCP_NO_GIT", "1")  # provenance must not need a repo
+    for name in ("REAPER_MCP_EVIDENCE_DIR", "REAPER_MCP_RUN_ARTIFACTS", "REAPER_MCP_RUN_TASK"):
+        monkeypatch.delenv(name, raising=False)
     yield
     H._RUN_DIRS = saved_dirs
     H._run_state.clear()
@@ -352,3 +363,43 @@ def test_the_fixture_builder_cli_says_so_when_there_is_no_recording(tmp_path):
     assert completed.returncode == 2, completed.stdout + completed.stderr
     assert "no recording" in completed.stdout
     assert not target.exists()
+
+
+# ---------------------------------------------------------------------------
+# 9. the ambient-environment trap (P34)
+# ---------------------------------------------------------------------------
+
+
+def test_the_suite_is_green_with_an_exported_evidence_dir(tmp_path):
+    """P34's trap, pinned end to end, in BOTH environment states.
+
+    P34 recorded that exporting ``REAPER_MCP_EVIDENCE_DIR`` (the harness env a
+    probe run uses) made three of these tests fail and wrote six artifacts into
+    the operator's directory. The nested run below reproduces that exact
+    environment: the module must stay green AND leave the operator's directory
+    empty - which is only true because the autouse fixture removes the ambient
+    variables (the same tests with the variable set by monkeypatch inside a test
+    cover the other state).
+    """
+    import subprocess
+    import sys
+
+    if os.environ.get("REAPER_MCP_P36_NESTED"):
+        pytest.skip("nested policy-suite run (the outer run asserts its exit code)")
+    ambient = tmp_path / "operator-archive"
+    ambient.mkdir()
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(Path(__file__))],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=str(HERE.parents[1]),
+        env={
+            **os.environ,
+            "REAPER_MCP_EVIDENCE_DIR": str(ambient),
+            "REAPER_MCP_P36_NESTED": "1",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout[-3000:] + completed.stderr[-2000:]
+    leftover = sorted(path.name for path in ambient.iterdir())
+    assert leftover == [], f"the nested run wrote into the operator's directory: {leftover}"

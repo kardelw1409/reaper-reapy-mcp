@@ -354,6 +354,19 @@ class MockHostBridge:
             for index in indices
         ]
 
+    def param_index_from_idents(self, ref: PluginInstanceRef, idents: list[str]) -> list[int | None]:
+        """P36: resolution at use time, mirroring the real verb's direct rule."""
+        mode = self._next_mode("param_index_from_idents")
+        slot = self._slot_for(ref)
+        self._record("param_index_from_idents", n=len(idents))
+        if mode == "store-nothing":
+            return []
+        table = slot.index_by_ident
+        return [
+            None if str(ident) in slot.missing_idents else table.get(str(ident))
+            for ident in idents
+        ]
+
     def param_names(self, ref: PluginInstanceRef, indices: list[int]) -> list[str | None]:
         self._next_mode("param_names")
         slot = self._slot_for(ref)

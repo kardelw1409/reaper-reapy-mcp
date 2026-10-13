@@ -76,11 +76,19 @@ def test_read_conformance_against_the_mock_bridge():
 def test_read_conformance_against_the_real_bridge_when_reachable():
     bridge = R.ReaperHostBridge(timeout=10.0)
     try:
-        bridge.list_tracks()
+        tracks = bridge.list_tracks()
     except NotConnected as exc:
         pytest.skip(f"REAPER is not reachable, so the live read suite did not run: {exc.message}")
     except Unreadable as exc:
         pytest.skip(f"the live host answered with an unreadable contract: {exc.message}")
+    if not tracks:
+        # Reached-but-empty is a live-state precondition, not a defect: the suite
+        # reads a track's FX and has nothing to read. P34 ran this module while
+        # the open project had no tracks and the non-empty assertion inside
+        # _read_suite failed - a measurement of the project, not of the code.
+        # The mock variant above keeps the "the host must report at least one
+        # track" assertion unconditionally, so the logic stays pinned offline.
+        pytest.skip("the live project has no tracks; the live read suite needs one to read")
     _read_suite(bridge, counts_exposed=False)
 
 

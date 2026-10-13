@@ -134,6 +134,12 @@ class FakeDiscoveryBridge:
             for index in indices
         ]
 
+    def param_index_from_idents(self, ref: Any, idents: Sequence[str]) -> list[int | None]:
+        """P36: resolution at use time (the real verb's direct rule)."""
+        self.calls["param_index_from_idents"] = self.calls.get("param_index_from_idents", 0) + 1
+        by_ident = {control.ident: index for index, control in self.controls.items()}
+        return [by_ident.get(str(ident)) for ident in idents]
+
     def read_params(self, ref: Any, indices: Sequence[int]) -> list[float]:
         self.calls["read_params"] += 1
         return [float(self.values.get(int(index), 0.0)) for index in indices]
