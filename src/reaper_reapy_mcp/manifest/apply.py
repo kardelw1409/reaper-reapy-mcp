@@ -32,10 +32,13 @@ from .manifest import (
     AI_TRACKS,
     APPLY_REPORT_FILENAME,
     BASE_AI_TRACKS,
+    MIDI_ARTIFACT_TRACK,
     MIDI_TRACK_MAP,
     STEM_TRACK_MAP,
     ManifestError,
     clamp_regions,
+    compare_note_spans,
+    expected_note_spans,
     load_manifest,
     resolve_bundle_dir,
 )
@@ -153,6 +156,45 @@ def _same_span(mark: dict, region: dict) -> bool:
         abs(mark["start_s"] - region["start_s"]) <= _MATCH_TOLERANCE_S
         and abs(mark["end_s"] - region["end_s"]) <= _MATCH_TOLERANCE_S
     )
+
+
+def _take_note_span(project, track_index: int) -> dict | None:
+    """Note count plus first/last note of the newest item on a track, in PROJECT seconds.
+
+    Measured against REAPER 7.53 through reapy 0.10: these ReaScript calls return a
+    LIST whose first element is the return value and whose remaining elements are the
+    pass-through arguments followed by the outputs - `MIDI_CountEvts(take, 0, 0, 0)`
+    gives [retval, take, notesOut, ccsOut, textsOut] and `MIDI_GetNote(...)` gives
+    [retval, take, idx, selected, muted, startppq, endppq, chan, pitch, vel].
+
+    Times come from MIDI_GetProjTimeFromPPQPos, which is what makes this check able to
+    see a tempo defect at all: it converts through the PROJECT tempo, so a file written
+    at 120 bpm inside a 172 bpm project reports its notes 1.43x too early.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return None
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return None
+    counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
+    if not isinstance(counted, (list, tuple)) or len(counted) < 3:
+        return None
+    notes = int(counted[2])
+    if notes < 1:
+        return {"notes": 0, "first_s": None, "last_s": None}
+    first_s: float | None = None
+    last_s: float | None = None
+    for index in range(notes):
+        got = RPR.MIDI_GetNote(take, index, 0, 0, 0, 0, 0, 0, 0)
+        if not isinstance(got, (list, tuple)) or len(got) < 6:
+            continue
+        project_s = float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(got[5])))
+        first_s = project_s if first_s is None else min(first_s, project_s)
+        last_s = project_s if last_s is None else max(last_s, project_s)
+    return {"notes": notes, "first_s": first_s, "last_s": last_s}
 
 
 def _matching_regions(marks: list[dict], regions: list[dict]) -> list[dict]:
@@ -418,6 +460,27 @@ def apply_bundle(
     tempo_after = controller.get_tempo()
     meter_after = _read_time_signature(project)
     meter_applied_ok = [meter_after[0], meter_after[1]] == info["meter"]
+
+    # --- notes: the check that counting cannot do. A MIDI artifact written at a tempo
+    # other than the project's is inserted without complaint and holds the same NUMBER
+    # of notes; only their POSITIONS reveal it (measured: an 80.9 s deficit).
+    expected_spans = expected_note_spans(info)
+    actual_spans: dict[str, dict] = {}
+    for key, track_name in MIDI_ARTIFACT_TRACK.items():
+        if track_name not in track_index:
+            continue
+        span = _take_note_span(project, track_index[track_name])
+        if span is not None:
+            actual_spans[key] = span
+    note_warnings, note_report = compare_note_spans(expected_spans, actual_spans)
+    warnings.extend(note_warnings)
+    if not expected_spans:
+        note_report = {
+            "_checked": False,
+            "reason": ("the manifest carries no midi_time block (exported before note verification "
+                       "existed), so the note positions were NOT verified"),
+        }
+
     verification = {
         "tracks_ok": tracks_ok,
         "items_ok": items_ok,
@@ -429,14 +492,16 @@ def apply_bundle(
         "tempo_after": tempo_after,
         "meter_after": [meter_after[0], meter_after[1]],
         "meter_ok": meter_applied_ok,
+        "midi_notes": note_report,
         "audio_start_s": audio_start_s,
         "grid": grid_info,
     }
-    ok = bool(tracks_ok and items_ok and regions_matched == len(kept) and meter_applied_ok)
+    notes_ok = all(entry.get("ok") for key, entry in note_report.items() if key != "_checked") if expected_spans else True
+    ok = bool(tracks_ok and items_ok and regions_matched == len(kept) and meter_applied_ok and notes_ok)
     if not ok:
         warnings.append(
             f"verification shortfall: tracks_ok={tracks_ok}, items_ok={items_ok}, "
-            f"regions {regions_matched}/{len(kept)}, meter {verification['meter_after']}"
+            f"regions {regions_matched}/{len(kept)}, meter {verification['meter_after']}, notes_ok={notes_ok}"
         )
 
     report = {
@@ -459,6 +524,7 @@ def apply_bundle(
         "regions_skipped": skipped,
         "stems": {key: Path(value).name for key, value in info["stems"].items()},
         "midi_sources": info["midi_sources"],
+        "midi_time": expected_spans,
         "grid": grid_info,
         "deletion_order": "regions_then_tracks",
         "warnings": warnings,

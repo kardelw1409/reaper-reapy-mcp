@@ -195,6 +195,11 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         if midi.get(key):
             extra_midi[key] = _require_file(bundle, midi[key], what=f"{key} MIDI")
 
+    midi_time: dict[str, dict] = {}
+    for key, value in (doc.get("midi_time") or {}).items():
+        if isinstance(value, dict) and "notes" in value:
+            midi_time[str(key)] = value
+
     stems_raw = doc.get("stems") or {}
     if not isinstance(stems_raw, dict):
         raise ManifestError("manifest stems must be an object")
@@ -242,9 +247,96 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         "stems": stems,
         "grid": grid,
         "midi_sources": doc.get("midi_sources") or {},
+        "midi_time": midi_time,
         "regions": regions,
         "warnings": [str(w) for w in (doc.get("warnings") or [])],
     }
+
+
+#: Which track each MIDI artifact goes to (the base two live outside this map).
+MIDI_ARTIFACT_TRACK: dict[str, str] = {
+    "vocal": "MIDI_VOCAL",
+    "ins": "MIDI_INS",
+    **MIDI_TRACK_MAP,
+}
+
+#: A note in REAPER is placed on a PPQ grid, so an exact match is not available.
+#: 20 ms covers the tick rounding of a 220-ppq file at 172 bpm (~1.6 ms per tick)
+#: plus the report's own 4-decimal rounding, and still catches a tempo error - the
+#: defect this check exists for put the last drum note 80.9 s early.
+NOTE_TIME_TOLERANCE_S = 0.02
+
+
+def expected_note_spans(info: dict) -> dict[str, dict]:
+    """Per MIDI artifact: the note count and first/last note in PROJECT seconds.
+
+    The exporting side writes this into `manifest.midi_time`, and it is the only
+    place that knows both the tempo the file was WRITTEN at and the project's. A
+    bundle exported before that block existed has no expectations, so the caller
+    must be told that nothing was checked instead of being handed a pass.
+    """
+    out: dict[str, dict] = {}
+    for key, value in (info.get("midi_time") or {}).items():
+        notes = value.get("notes")
+        if not isinstance(notes, int):
+            continue
+        out[key] = {
+            "notes": notes,
+            "first_s": value.get("first_note_project_s"),
+            "last_s": value.get("last_note_project_s"),
+            "file_bpm": value.get("file_bpm"),
+            "source": value.get("bar_offset_source"),
+        }
+    return out
+
+
+def compare_note_spans(
+    expected: dict[str, dict],
+    actual: dict[str, dict],
+    *,
+    tolerance_s: float = NOTE_TIME_TOLERANCE_S,
+) -> tuple[list[str], dict]:
+    """Compare what the project HOLDS against what the manifest says it should.
+
+    This is the check that would have caught a 120 bpm artifact in a 172 bpm
+    project at apply time: the note count matches either way (1176 notes are 1176
+    notes), but the last note lands at 186.7 s instead of 267.7 s. Counting notes
+    alone, which is what the first version did, cannot see that.
+
+    Returns (warnings, report). A missing measurement is reported as "not
+    checked", never as a pass.
+    """
+    warnings: list[str] = []
+    report: dict[str, dict] = {}
+    for key in sorted(expected):
+        want = expected[key]
+        got = actual.get(key)
+        if got is None:
+            report[key] = {"checked": False, "reason": "no measurement from the project"}
+            warnings.append(f"MIDI '{key}': could not read the notes back - not checked")
+            continue
+        entry: dict = {"checked": True, "expected_notes": want["notes"], "notes": got.get("notes")}
+        problems: list[str] = []
+        if got.get("notes") != want["notes"]:
+            problems.append(f"notes {got.get('notes')} != {want['notes']}")
+        for label, field in (("first", "first_s"), ("last", "last_s")):
+            want_s, got_s = want.get(field), got.get(field)
+            entry[f"{label}_s"] = got_s
+            entry[f"expected_{label}_s"] = want_s
+            if want_s is None or got_s is None:
+                continue
+            delta = float(got_s) - float(want_s)
+            entry[f"{label}_delta_s"] = round(delta, 4)
+            if abs(delta) > tolerance_s:
+                problems.append(f"{label} note {got_s:.3f} s vs {want_s:.3f} s (delta {delta:+.3f} s)")
+        if problems:
+            entry["ok"] = False
+            entry["problems"] = problems
+            warnings.append(f"MIDI '{key}' does not match the manifest: " + "; ".join(problems))
+        else:
+            entry["ok"] = True
+        report[key] = entry
+    return warnings, report
 
 
 def clamp_regions(
