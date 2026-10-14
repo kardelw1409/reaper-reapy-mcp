@@ -32,6 +32,7 @@ from .manifest import (
     AI_TRACKS,
     APPLY_REPORT_FILENAME,
     BASE_AI_TRACKS,
+    DRUM_PART_TRACK_MAP,
     MIDI_ARTIFACT_TRACK,
     MIDI_TRACK_MAP,
     STEM_TRACK_MAP,
@@ -40,7 +41,9 @@ from .manifest import (
     compare_note_spans,
     expected_note_spans,
     load_manifest,
+    note_report_ok,
     resolve_bundle_dir,
+    summarize_note_phase,
 )
 
 _MATCH_TOLERANCE_S = 0.1
@@ -158,8 +161,14 @@ def _same_span(mark: dict, region: dict) -> bool:
     )
 
 
-def _take_note_span(project, track_index: int) -> dict | None:
-    """Note count plus first/last note of the newest item on a track, in PROJECT seconds.
+def _take_note_phases(project, track_index: int, step_s: float) -> tuple[dict, list[float]]:
+    """The newest item's note span AND how far its notes sit from the project grid.
+
+    Returns (span, deviations) where a deviation is the distance from the nearest
+    multiple of `step_s`, in [-step/2, +step/2]. The median of those deviations is the
+    whole item's phase: measured on a real bundle, the drum part sat 6.4 ms off the
+    1/16 grid and the score-derived parts 21 ms - the reason an arrangement could look
+    "almost right but not on the grid".
 
     Measured against REAPER 7.53 through reapy 0.10: these ReaScript calls return a
     LIST whose first element is the return value and whose remaining elements are the
@@ -174,27 +183,35 @@ def _take_note_span(project, track_index: int) -> dict | None:
     track = project.tracks[track_index]
     count = int(RPR.CountTrackMediaItems(track.id))
     if count < 1:
-        return None
+        return {}, []
     item = RPR.GetTrackMediaItem(track.id, count - 1)
     take = RPR.GetActiveTake(item)
     if not take:
-        return None
+        return {}, []
     counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
     if not isinstance(counted, (list, tuple)) or len(counted) < 3:
-        return None
+        return {}, []
     notes = int(counted[2])
     if notes < 1:
-        return {"notes": 0, "first_s": None, "last_s": None}
-    first_s: float | None = None
-    last_s: float | None = None
+        return {"notes": 0, "first_s": None, "last_s": None}, []
+    times: list[float] = []
     for index in range(notes):
         got = RPR.MIDI_GetNote(take, index, 0, 0, 0, 0, 0, 0, 0)
         if not isinstance(got, (list, tuple)) or len(got) < 6:
             continue
-        project_s = float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(got[5])))
-        first_s = project_s if first_s is None else min(first_s, project_s)
-        last_s = project_s if last_s is None else max(last_s, project_s)
-    return {"notes": notes, "first_s": first_s, "last_s": last_s}
+        times.append(float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(got[5]))))
+    if not times:
+        return {"notes": notes, "first_s": None, "last_s": None}, []
+    span = {"notes": notes, "first_s": min(times), "last_s": max(times)}
+    if step_s <= 0:
+        return span, []
+    deviations = [((t % step_s) + step_s / 2.0) % step_s - step_s / 2.0 for t in times]
+    return span, deviations
+
+
+def _take_note_span(project, track_index: int) -> dict | None:
+    span, _ = _take_note_phases(project, track_index, 0.0)
+    return span or None
 
 
 def _matching_regions(marks: list[dict], regions: list[dict]) -> list[dict]:
@@ -240,6 +257,9 @@ def apply_bundle(
     audio_source_offset_s = info["audio_source_offset_s"]
     project_duration_s = info["duration_s"] - audio_source_offset_s + audio_start_s
     grid_info = info.get("grid") or {}
+    # The ruler must run at the tempo the render actually has, not the score's: on the
+    # DnB take those differ by 78 ppm, which is 21 ms of drift by the end of the song.
+    project_bpm = float(grid_info.get("bpm_project") or info["bpm"])
     allow_overhang_s = 0.0
     if grid_info.get("quantize") == "bar" and grid_info.get("bar_s"):
         allow_overhang_s = float(grid_info["bar_s"]) / 2
@@ -256,6 +276,9 @@ def apply_bundle(
             tracks_to_create.append(track_name)
     for midi_key, track_name in MIDI_TRACK_MAP.items():
         if midi_key in info["extra_midi"] and track_name not in tracks_to_create:
+            tracks_to_create.append(track_name)
+    for part, track_name in DRUM_PART_TRACK_MAP.items():
+        if part in info.get("midi_parts", {}) and track_name not in tracks_to_create:
             tracks_to_create.append(track_name)
 
     item_actions: list[dict] = [
@@ -282,6 +305,17 @@ def apply_bundle(
                     "start_s": audio_start_s,
                 }
             )
+    # One item per drum class, each on its own track: kick separate from snare, etc.
+    # The combined drums.mid is dropped when parts are present, because inserting both
+    # would double every hit.
+    for part, track_name in DRUM_PART_TRACK_MAP.items():
+        source = info.get("midi_parts", {}).get(part)
+        if source:
+            item_actions.append(
+                {"track": track_name, "kind": "midi", "file": source, "start_s": audio_start_s}
+            )
+    if info.get("midi_parts"):
+        item_actions = [a for a in item_actions if a["track"] != "MIDI_DRUMS"]
 
     project = reapy.Project()
     before = {
@@ -361,11 +395,16 @@ def apply_bundle(
         applied["deleted_tracks"].append(name)
 
     # --- tempo / meter / title marker
-    if not controller.set_tempo(info["bpm"]):
+    if not controller.set_tempo(project_bpm):
         warnings.append("set_tempo returned False")
-    applied["tempo"] = info["bpm"]
+    applied["tempo"] = project_bpm
+    if abs(project_bpm - float(info["bpm"])) > 1e-6:
+        applied["tempo_note"] = (
+            f"project tempo is the MEASURED {project_bpm} bpm, not the score's {info['bpm']} "
+            "(the render's own tempo; using the score's would drift the music off the ruler)"
+        )
     meter_num, meter_den = info["meter"]
-    meter_ok, meter_how = _set_time_signature(project, meter_num, meter_den, info["bpm"])
+    meter_ok, meter_how = _set_time_signature(project, meter_num, meter_den, project_bpm)
     if not meter_ok:
         warnings.append(f"time signature write returned false ({meter_how})")
     applied["meter"] = info["meter"]
@@ -458,6 +497,9 @@ def apply_bundle(
     if missing_items:
         warnings.append("tracks without the expected item: " + ", ".join(missing_items))
     tempo_after = controller.get_tempo()
+    tempo_ok = abs(float(tempo_after) - project_bpm) < 1e-4
+    if not tempo_ok:
+        warnings.append(f"tempo is {tempo_after}, expected {project_bpm}")
     meter_after = _read_time_signature(project)
     meter_applied_ok = [meter_after[0], meter_after[1]] == info["meter"]
 
@@ -472,14 +514,93 @@ def apply_bundle(
         span = _take_note_span(project, track_index[track_name])
         if span is not None:
             actual_spans[key] = span
+    # When the bundle carries per-class parts, the combined drums.mid is deliberately
+    # NOT inserted (it would double every hit), so its expectation is dropped rather
+    # than reported as unverified.
+    superseded: list[str] = []
+    if info.get("midi_parts") and "drums" in expected_spans:
+        expected_spans.pop("drums")
+        superseded.append("drums")
     note_warnings, note_report = compare_note_spans(expected_spans, actual_spans)
     warnings.extend(note_warnings)
+
+    # --- grid phase: how far the notes of each item sit from the project's 1/16 grid.
+    # This is the number to look at when an arrangement "almost" lines up: measured on
+    # a real bundle, drums sat 6.4 ms and the score-derived parts 21 ms off the grid.
+    grid_alignment: dict[str, dict] = {}
+    bar_s = float(grid_info.get("bar_s") or 0.0)
+    step_s = bar_s / 16.0 if bar_s else 0.0
+    if step_s > 0:
+        for key, track_name in MIDI_ARTIFACT_TRACK.items():
+            if track_name not in track_index:
+                continue
+            _, deviations = _take_note_phases(project, track_index[track_name], step_s)
+            if not deviations:
+                continue
+            # `phase_is_an_offset` is False when the notes are spread over the whole step:
+            # then phase_ms is the median of a flat distribution, not a grid offset (see
+            # summarize_note_phase). Those are reported, never warned about as a problem.
+            entry = summarize_note_phase(deviations, step_s)
+            grid_alignment[key] = entry
+            if entry["phase_is_an_offset"] and abs(entry["phase_ms"]) > 10.0:
+                warnings.append(
+                    f"MIDI '{key}': notes sit {entry['phase_ms']:+.1f} ms off the project grid "
+                    f"({entry['share_on_grid']:.0%} of them on it)"
+                )
+        # THE ANCHOR RULE. The kick carries the placement of the whole drum part: a
+        # sampler on it has to trigger on the ruler, and every other class is heard
+        # relative to it. So it is held to a stricter standard than the rest - it must
+        # actually BE on the grid, not merely near it.
+        anchor_key = "drums_kick" if "drums_kick" in grid_alignment else ("drums" if "drums" in grid_alignment else None)
+        if anchor_key:
+            anchor = grid_alignment[anchor_key]
+            anchor["is_anchor"] = True
+            on_grid = anchor["share_on_grid"] >= 0.95 and abs(anchor["phase_ms"]) <= 5.0
+            anchor["on_grid"] = on_grid
+            if not on_grid:
+                warnings.append(
+                    f"the drum anchor ('{anchor_key}') is NOT cleanly on the grid: "
+                    f"phase {anchor['phase_ms']:+.2f} ms, {anchor['share_on_grid']:.0%} of notes on it "
+                    "(a sampler on this track would not trigger on the beat)"
+                )
+        # the audio side: the item plus its source offset must put the first downbeat that
+        # the MANIFEST recorded on a bar line of the project. Note what this can and cannot
+        # see: it checks that the two placement fields (audio.start_s and
+        # audio.source_offset_s) agree with the recorded downbeat - it does NOT re-measure
+        # the render, so a wrong downbeat estimate in the manifest would pass here. Where
+        # the estimate came from is in grid.origin_refined_by / grid.origin_refine.
+        downbeat = audio_start_s + float(grid_info.get("first_downbeat_s") or 0.0) - audio_source_offset_s
+        if bar_s > 0:
+            delta = downbeat - round(downbeat / bar_s) * bar_s
+            grid_alignment["audio"] = {
+                "downbeat_s": round(downbeat, 4),
+                "bar": round(downbeat / bar_s + 1, 3),
+                "delta_ms": round(delta * 1000.0, 2),
+                "source_offset_s": round(audio_source_offset_s, 5),
+                "recorded_downbeat_s": round(float(grid_info.get("first_downbeat_s") or 0.0), 5),
+                "basis": ("placement fields vs the downbeat recorded by the exporter; "
+                          "the render itself is not re-measured here"),
+            }
+            if abs(delta) > 0.005:
+                warnings.append(
+                    f"audio: the item placement puts the render's RECORDED first downbeat "
+                    f"{delta * 1000.0:+.1f} ms off a bar line"
+                )
+    if superseded:
+        note_report["_superseded"] = {
+            "artifacts": superseded,
+            "reason": "the bundle carries per-class drum parts, which are inserted instead",
+        }
     if not expected_spans:
         note_report = {
             "_checked": False,
-            "reason": ("the manifest carries no midi_time block (exported before note verification "
-                       "existed), so the note positions were NOT verified"),
+            "_reason": ("the manifest carries no midi_time block (exported before note verification "
+                        "existed), so the note positions were NOT verified"),
         }
+        warnings.append(
+            "note positions were NOT verified: the manifest carries no midi_time block "
+            "(re-export the bundle to get the check)"
+        )
 
     verification = {
         "tracks_ok": tracks_ok,
@@ -490,18 +611,46 @@ def apply_bundle(
         "regions_read_back": len(regions_after),
         "region_identity": "start_s/end_s within 0.1 s (reapy returns no marker names)",
         "tempo_after": tempo_after,
+        "tempo_expected": project_bpm,
+        "tempo_ok": tempo_ok,
         "meter_after": [meter_after[0], meter_after[1]],
         "meter_ok": meter_applied_ok,
         "midi_notes": note_report,
+        "grid_alignment": grid_alignment,
         "audio_start_s": audio_start_s,
         "grid": grid_info,
     }
-    notes_ok = all(entry.get("ok") for key, entry in note_report.items() if key != "_checked") if expected_spans else True
-    ok = bool(tracks_ok and items_ok and regions_matched == len(kept) and meter_applied_ok and notes_ok)
+    # Bookkeeping entries (`_checked`, `_superseded`) are not measurements - see
+    # note_report_ok. `checked: False` inside a real entry still fails.
+    notes_ok = note_report_ok(note_report)
+    notes_checked = bool(expected_spans)
+    # The two grid guarantees are things THIS apply controls (the anchor is snapped and the
+    # audio item is placed on the bar line by construction), so a miss there is a real
+    # shortfall. The other artifacts' phases are MEASUREMENTS of a loose performance and
+    # are reported, not judged.
+    anchor_on_grid = (
+        True if (step_s <= 0 or anchor_key is None)
+        else bool(grid_alignment.get(anchor_key, {}).get("on_grid"))
+    )
+    audio_delta_ok = (
+        True if step_s <= 0
+        else abs(float(grid_alignment.get("audio", {}).get("delta_ms") or 0.0)) <= 5.0
+    )
+    grid_ok = anchor_on_grid and audio_delta_ok
+    verification["grid_ok"] = grid_ok
+    verification["anchor_on_grid"] = anchor_on_grid
+    verification["audio_on_bar_line"] = audio_delta_ok
+    verification["notes_checked"] = notes_checked
+    ok = bool(
+        tracks_ok and items_ok and regions_matched == len(kept) and meter_applied_ok
+        and notes_ok and tempo_ok and grid_ok
+    )
     if not ok:
         warnings.append(
             f"verification shortfall: tracks_ok={tracks_ok}, items_ok={items_ok}, "
-            f"regions {regions_matched}/{len(kept)}, meter {verification['meter_after']}, notes_ok={notes_ok}"
+            f"regions {regions_matched}/{len(kept)}, meter {verification['meter_after']}, "
+            f"notes_ok={notes_ok}, grid_ok={grid_ok} "
+            f"(anchor '{anchor_key}' on grid: {anchor_on_grid}; audio on a bar line: {audio_delta_ok})"
         )
 
     report = {

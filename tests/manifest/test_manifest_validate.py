@@ -246,7 +246,45 @@ def test_ai_tracks_constant():
         "AI_OTHER",
         "MIDI_DRUMS",
         "MIDI_BASS",
-    }
+    } | set(manifest.DRUM_PART_TRACK_MAP.values())
+
+
+def test_a_bundle_can_carry_one_midi_per_drum_class(tmp_path, pointer):
+    """Separate items per class: kick on its own track, snare on its own, etc."""
+    bundle = _write_bundle(tmp_path / "parts")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    for part in ("kick", "snare"):
+        _write_midi(bundle / f"drums_{part}.mid")
+    doc["midi_parts"] = {"drums": {part: f"drums_{part}.mid" for part in ("kick", "snare")}}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    info = manifest.load_manifest(bundle)
+    assert set(info["midi_parts"]) == {"kick", "snare"}
+    assert Path(info["midi_parts"]["kick"]).name == "drums_kick.mid"
+    # each part maps to its own track
+    assert manifest.DRUM_PART_TRACK_MAP["kick"] == "MIDI_DRUMS_KICK"
+    assert manifest.MIDI_ARTIFACT_TRACK["drums_kick"] == "MIDI_DRUMS_KICK"
+
+
+def test_an_unknown_drum_part_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "badpart")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    _write_midi(bundle / "drums_cowbell.mid")
+    doc["midi_parts"] = {"drums": {"cowbell": "drums_cowbell.mid"}}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(manifest.ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "cowbell" in str(excinfo.value)
+
+
+def test_a_missing_drum_part_file_refuses(tmp_path, pointer):
+    bundle = _write_bundle(tmp_path / "absentpart")
+    doc = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    doc["midi_parts"] = {"drums": {"kick": "drums_kick.mid"}}
+    (bundle / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(manifest.ManifestError) as excinfo:
+        manifest.load_manifest(bundle)
+    assert "kick MIDI" in str(excinfo.value)
 
 
 def test_defaults_when_the_bundle_has_no_extensions(tmp_path, pointer):
@@ -264,6 +302,8 @@ def test_defaults_when_the_bundle_has_no_extensions(tmp_path, pointer):
         "max_shift_s": None,
         "source": None,
         "bpm_measured": None,
+        "bpm_project": None,
+        "pre_roll_s": None,
     }
 
 

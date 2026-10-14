@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 from pathlib import Path
 
 SCHEMA = "audiocpp.manifest"
@@ -37,8 +38,24 @@ MIDI_TRACK_MAP: dict[str, str] = {
     "bass": "MIDI_BASS",
 }
 
+#: One track PER drum class, so the arrangement gets kick/snare/hihat/tom/cymbal as
+#: separate items instead of one merged drum part (the whole point of the per-class
+#: files mcp-stem-splitter :: drums_midi writes). Populated only when the bundle
+#: carries `midi_parts`.
+DRUM_PART_TRACK_MAP: dict[str, str] = {
+    "kick": "MIDI_DRUMS_KICK",
+    "snare": "MIDI_DRUMS_SNARE",
+    "hihat": "MIDI_DRUMS_HIHAT",
+    "tom": "MIDI_DRUMS_TOM",
+    "cymbal": "MIDI_DRUMS_CYMBAL",
+}
+
 #: Every name the double-apply guard matches (base + all optional tracks).
-AI_TRACKS: tuple[str, ...] = BASE_AI_TRACKS + ("AI_DRUMS", "AI_BASS", "AI_OTHER", "MIDI_DRUMS", "MIDI_BASS")
+AI_TRACKS: tuple[str, ...] = (
+    BASE_AI_TRACKS
+    + ("AI_DRUMS", "AI_BASS", "AI_OTHER", "MIDI_DRUMS", "MIDI_BASS")
+    + tuple(DRUM_PART_TRACK_MAP.values())
+)
 
 VALID_SOURCES = ("plan", "audio", "mixed")
 
@@ -200,6 +217,21 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         if isinstance(value, dict) and "notes" in value:
             midi_time[str(key)] = value
 
+    midi_parts: dict[str, str] = {}
+    parts_raw = doc.get("midi_parts") or {}
+    if not isinstance(parts_raw, dict):
+        raise ManifestError("manifest midi_parts must be an object")
+    for group, parts in parts_raw.items():
+        if not isinstance(parts, dict):
+            raise ManifestError(f"manifest midi_parts[{group!r}] must be an object of part -> file")
+        for part, name in parts.items():
+            if part not in DRUM_PART_TRACK_MAP:
+                raise ManifestError(
+                    f"unknown drum part {part!r} in the bundle",
+                    detail=f"valid parts: {', '.join(DRUM_PART_TRACK_MAP)}",
+                )
+            midi_parts[part] = _require_file(bundle, name, what=f"{part} MIDI")
+
     stems_raw = doc.get("stems") or {}
     if not isinstance(stems_raw, dict):
         raise ManifestError("manifest stems must be an object")
@@ -226,6 +258,11 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         "max_shift_s": grid_raw.get("max_shift_s"),
         "source": grid_raw.get("source"),
         "bpm_measured": grid_raw.get("bpm_measured"),
+        # The tempo the PROJECT must run at. The score's bpm and the render's measured
+        # tempo differ by ~78 ppm on the DnB take, which drags the music 21 ms off the
+        # ruler over 270 s if the score's value is used for the ruler as well.
+        "bpm_project": (float(grid_raw["bpm_project"]) if grid_raw.get("bpm_project") else None),
+        "pre_roll_s": (float(grid_raw["pre_roll_s"]) if grid_raw.get("pre_roll_s") else None),
     }
 
     regions = _normalize_regions(doc)
@@ -244,6 +281,7 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         "vocal_midi_path": vocal_path,
         "ins_midi_path": ins_path,
         "extra_midi": extra_midi,
+        "midi_parts": midi_parts,
         "stems": stems,
         "grid": grid,
         "midi_sources": doc.get("midi_sources") or {},
@@ -258,6 +296,7 @@ MIDI_ARTIFACT_TRACK: dict[str, str] = {
     "vocal": "MIDI_VOCAL",
     "ins": "MIDI_INS",
     **MIDI_TRACK_MAP,
+    **{f"drums_{part}": track for part, track in DRUM_PART_TRACK_MAP.items()},
 }
 
 #: A note in REAPER is placed on a PPQ grid, so an exact match is not available.
@@ -337,6 +376,69 @@ def compare_note_spans(
             entry["ok"] = True
         report[key] = entry
     return warnings, report
+
+
+GRID_PHASE_WINDOW_S = 0.025
+GRID_PHASE_MIN_SHARE = 0.8
+
+
+def summarize_note_phase(deviations: list[float], step_s: float) -> dict:
+    """How far a set of note deviations sits from the grid - and whether it can be said at all.
+
+    `phase_ms` is only a GRID OFFSET when the notes actually share a phase. Measured on the
+    real bundle's bass: its deviations are spread over the whole 1/16 step (a flat 10 ms
+    histogram), so the median is arbitrary - the SAME file shifted by 8.47 ms moved that
+    median by 4.4 ms (-3.58 -> -7.94), while every note had moved by exactly the shift.
+    Reporting that number as "the part sits 7.9 ms off the grid" would be inventing a fact
+    out of a median. Hence `phase_is_an_offset`, decided by the share of notes within the
+    window, and a `note` that says what the number is when it is not an offset.
+    """
+    n = len(deviations)
+    ordered = sorted(deviations)
+    phase = statistics.median(ordered)
+    share = sum(1 for d in ordered if abs(d - phase) <= GRID_PHASE_WINDOW_S) / n
+    p25 = ordered[int(0.25 * (n - 1))]
+    p75 = ordered[int(0.75 * (n - 1))]
+    on_a_grid = share >= GRID_PHASE_MIN_SHARE
+    entry: dict = {
+        "notes": n,
+        "phase_ms": round(phase * 1000.0, 2),
+        "share_on_grid": round(share, 3),
+        "spread_ms": round((p75 - p25) * 1000.0, 2),
+        "step_s": round(step_s, 6),
+        "phase_is_an_offset": on_a_grid,
+    }
+    if not on_a_grid:
+        entry["note"] = (
+            "these notes are spread across the whole step, so phase_ms is the median of a FLAT "
+            "distribution and is NOT how far the part sits off the grid (measured: the same "
+            "file moved by a rigid 8.5 ms changed this median by 4.4 ms)"
+        )
+    return entry
+
+
+def note_report_ok(note_report: dict) -> bool:
+    """Whether every MEASURED artifact matched, ignoring the bookkeeping entries.
+
+    Keys starting with "_" are notes *about* the report (`_checked`, `_superseded`),
+    not measurements: `_superseded` has no "ok" field at all, and `all()` reads an
+    absent value as False. That is how a fully successful apply reported
+    `ok: false` while every one of its eight artifacts said `ok: true`.
+
+    An entry that says `checked: False` still counts as a failure - a verification
+    that did not happen is not a pass, and it must not be possible to make this
+    return True by having nothing to compare.
+
+    Whether there was anything to check at all is a DIFFERENT question, answered by
+    `verification.notes_checked`: "every measurement matched" is not "a measurement
+    was made". Entries that are not measurement-shaped (a bare reason string) cannot
+    be judged, so they are skipped rather than crashing the caller.
+    """
+    return all(
+        entry.get("ok")
+        for key, entry in note_report.items()
+        if not key.startswith("_") and isinstance(entry, dict)
+    )
 
 
 def clamp_regions(
