@@ -347,6 +347,117 @@ class _PhaseTimer:
         }
 
 
+def _load_warp_markers(bundle: Path) -> tuple[list[dict], dict]:
+    """The warp plan of a bundle, written by mcp-audiocpp :: plan_warp as warp.json.
+
+    Why the plan is a FILE and not in the manifest: it can be recomputed without touching the
+    bundle, and a bundle that is already applied to a live project cannot be rewritten at all
+    (measured: REAPER holds song.wav open, so a re-export over it fails).
+    """
+    path = bundle / "warp.json"
+    if not path.is_file():
+        return [], {"present": False, "reason": "the bundle carries no warp.json"}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [], {"present": True, "markers": 0, "reason": f"warp.json is unreadable: {exc}"}
+    markers = [marker for marker in (document.get("markers") or []) if isinstance(marker, dict)]
+    return markers, {
+        "present": True,
+        "markers": len(markers),
+        "mode": document.get("mode"),
+        "source": document.get("source"),
+        "window_bars": document.get("window_bars"),
+        "hop_bars": document.get("hop_bars"),
+        "offset_ms": document.get("offset_ms"),
+        "residual_before_ms": document.get("residual_before_ms"),
+        "residual_after_warp_ms": document.get("residual_after_warp_ms"),
+        "worst_local_stretch": document.get("worst_local_stretch"),
+    }
+
+
+def _apply_stretch_markers(
+    project, track_index: int, markers: list[dict], *, source_end_s: float | None = None
+) -> dict:
+    """Set a warp plan's stretch markers on a track's newest item, then READ THEM BACK.
+
+    Measured (F42): a render's timing drifts - the kick element's attack sits -1.2 ms from the
+    1/16 lines in bars 35-42 and +10.2 ms in bars 179-186 (about 56 ppm) - while the transcribed
+    notes stay at +0.08 ms of the same lines. A constant item position cannot follow a drift, so
+    the audio itself is warped: each marker says "source second S sounds at project second P".
+
+    Three measured details this function exists for, each of which produced a wrong project:
+
+      * the list is CLEARED first. `DeleteTakeStretchMarkers(take, 0, 1000)` is the shape that
+        works (the singular `DeleteTakeStretchMarker` does not exist in reapy), and adding onto a
+        list that is already there is what made the first attempt's second half play at 0.7x;
+      * the item's LENGTH is written explicitly. Measured: after the markers were set the item
+        kept length 320.78 s for 269.87 s of audio, and nothing recomputed it - the end marker sat
+        at 320.78, so the last 16 s of source would play at 4x. Writing D_LENGTH fixes it and the
+        value sticks, while clearing the markers does NOT (the stale length is independent);
+      * the read-back compares EVERY marker, matched by INDEX. `GetTakeStretchMarker` returns
+        `[retval, take, idx, pos, srcpos]` through reapy, where retval is the marker's index and
+        -1 past the end - reading `got[0]` as a boolean makes marker 0 look like "not found",
+        which is how a fill reported "0 of 37 read back" while all 37 were in the project.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return {"markers": 0, "read_back": 0, "reason": "no item on the track"}
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return {"markers": 0, "read_back": 0, "reason": "the item has no take"}
+
+    RPR.DeleteTakeStretchMarkers(take, 0, 1000)
+    accepted = 0
+    refused: list[int] = []
+    for index, marker in enumerate(markers):
+        try:
+            pos = float(marker.get("project_s"))
+            source = float(marker.get("source_s"))
+        except (TypeError, ValueError):
+            refused.append(index)
+            continue
+        outcome = RPR.SetTakeStretchMarker(take, -1, pos, source)
+        if outcome in (-1, None, False, 0):
+            refused.append(index)
+        else:
+            accepted += 1
+
+    length_written = None
+    if source_end_s is not None and markers:
+        last = max(markers, key=lambda mark: float(mark.get("source_s") or 0.0))
+        # beyond the last marker the take plays at the item's own rate, so the sounding end is
+        # the last anchor plus the remaining source
+        length_written = float(last["project_s"]) + (float(source_end_s) - float(last["source_s"]))
+        RPR.SetMediaItemInfo_Value(item, "D_LENGTH", length_written)
+
+    stored: list[tuple[float, float]] = []
+    for probe in range(len(markers) + 16):
+        raw = RPR.GetTakeStretchMarker(take, probe, 0, 0)
+        if not isinstance(raw, (list, tuple)) or len(raw) < 5 or int(raw[0]) < 0:
+            break
+        stored.append((float(raw[3]), float(raw[4])))
+    worst_ms = 0.0
+    for index, marker in enumerate(markers):
+        if index >= len(stored):
+            break
+        worst_ms = max(
+            worst_ms,
+            abs(stored[index][0] - float(marker["project_s"])) * 1000.0,
+            abs(stored[index][1] - float(marker["source_s"])) * 1000.0,
+        )
+    return {
+        "markers": accepted,
+        "read_back": len(stored),
+        "refused": refused[:8],
+        "worst_position_ms": round(worst_ms, 4),
+        "length_s": round(length_written, 4) if length_written else None,
+        "reason": None if accepted == len(markers) else "REAPER refused some markers",
+    }
+
+
 def apply_bundle(
     bundle_dir: str | None,
     *,
@@ -354,15 +465,21 @@ def apply_bundle(
     dry_run: bool = False,
     clean: bool = False,
     save_as: str | None = None,
+    apply_warp: bool = True,
 ) -> dict:
     """Validate, (optionally preview), mutate, verify, report.
 
     Raises ManifestError for anything that must refuse before touching the host.
     Returns the report dict (ok is False when verification finds less than the
     requested count applied, even though the mutations ran).
+
+    `apply_warp` puts the bundle's warp.json (mcp-audiocpp :: plan_warp) onto every audio item as
+    stretch markers. It is on by default because the plan only exists when somebody deliberately
+    measured it, and off is available for a caller that wants the audio untouched.
     """
     bundle = resolve_bundle_dir(bundle_dir)
     info = load_manifest(bundle)
+    warp_markers, warp_info = _load_warp_markers(bundle) if apply_warp else ([], {"present": False, "reason": "warp was switched off"})
 
     # Times in the manifest are PROJECT time: the export shifted the arrangement
     # so the render's first downbeat sits on bar 1. The audio keeps its lead-in in
@@ -474,6 +591,7 @@ def apply_bundle(
         "meter": info["meter"],
         "title_marker": info["title"],
         "grid": grid_info,
+        "warp": {**warp_info, "first_marker": warp_markers[0] if warp_markers else None},
         "save_as": save_as,
     }
 
@@ -501,6 +619,7 @@ def apply_bundle(
         "meter": None,
         "meter_how": None,
         "saved_as": None,
+        "warp": [],
     }
 
     # --- clean (regions first: their recorded indices come from the pre-mutation state)
@@ -580,6 +699,22 @@ def apply_bundle(
                     f"{('unknown' if position is None else f'{position:.3f}')} s does not match "
                     f"the arrangement origin {action['start_s']:.3f} s"
                 )
+            warp_result = None
+            if action["kind"] == "audio" and warp_markers:
+                # Every audio item carries the SAME markers: the mix and its stems share one
+                # timeline, so the deviation measured on any of them is the deviation of all.
+                with phases.phase("warp"):
+                    warp_result = _apply_stretch_markers(
+                        project, track, warp_markers, source_end_s=info["duration_s"]
+                    )
+                phases.counted("warp")
+                applied["warp"].append({"track": action["track"], **warp_result})
+                if warp_result.get("read_back", 0) < len(warp_markers):
+                    warnings.append(
+                        f"{action['track']}: the take holds {warp_result.get('read_back')} of the "
+                        f"{len(warp_markers)} planned stretch markers - the audio is NOT fully warped "
+                        f"({warp_result.get('reason') or 'unstated'})"
+                    )
             if action["kind"] == "audio":
                 applied["audio_items"] += 1
             else:
@@ -768,6 +903,13 @@ def apply_bundle(
         "note_time_maps": note_time_maps,
         "audio_start_s": audio_start_s,
         "grid": grid_info,
+        "warp": {
+            **warp_info,
+            "applied": applied["warp"],
+            "read_back_total": sum(entry.get("read_back", 0) for entry in applied["warp"]),
+            "audio_tracks": len(applied["warp"]),
+            "expected_per_track": len(warp_markers),
+        },
     }
     # Where the fill's own time went, measured rather than guessed: one bridge call is ~32 ms and
     # the phase that touches every item dominates, which is exactly the kind of thing that gets

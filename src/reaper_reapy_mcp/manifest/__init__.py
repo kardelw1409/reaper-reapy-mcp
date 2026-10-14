@@ -28,6 +28,7 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
         dry_run: bool = False,
         clean: bool = False,
         save_as: str | None = None,
+        apply_warp: bool = True,
     ) -> Dict[str, Any]:
         """Fill the CURRENT REAPER project from an audiocpp.manifest v1 bundle.
 
@@ -49,6 +50,9 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
         the manifest-matching regions). dry_run returns the full plan with zero
         mutations. Writes apply_report.json back into the bundle.
         bundle_dir="latest" reads the pointer file (env AUDIOCPP_MANIFEST_POINTER).
+        `apply_warp=False` leaves the audio unwarped; by default, if the bundle carries a
+        warp.json (mcp-audiocpp :: plan_warp), every audio item gets its stretch markers - a
+        render's timing drifts by ~10 ms across a take, which no item position can follow.
         """
         try:
             result = apply_bundle(
@@ -57,6 +61,7 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
                 dry_run=dry_run,
                 clean=clean,
                 save_as=save_as,
+                apply_warp=apply_warp,
             )
         except ManifestError as exc:
             return {
