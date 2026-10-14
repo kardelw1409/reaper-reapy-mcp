@@ -262,9 +262,13 @@ def apply_bundle(
     project_bpm = float(grid_info.get("bpm_project") or info["bpm"])
     allow_overhang_s = 0.0
     if grid_info.get("quantize") == "bar" and grid_info.get("bar_s"):
-        allow_overhang_s = float(grid_info["bar_s"]) / 2
+        # A bar-aligned edge may poke past the audio by almost a whole bar (the exporter snaps
+        # an over-running end UP to the next bar line), so the tolerance is a bar, and a clamp
+        # - if one is ever needed - lands on a bar line too instead of cutting mid-bar.
+        allow_overhang_s = float(grid_info["bar_s"])
     kept, clamps, skipped, overhangs = clamp_regions(
-        info["regions"], project_duration_s, allow_overhang_s=allow_overhang_s
+        info["regions"], project_duration_s, allow_overhang_s=allow_overhang_s,
+        snap_s=float(grid_info.get("bar_s") or 0.0),
     )
 
     # Track layout: the five base tracks always exist; every artifact the bundle

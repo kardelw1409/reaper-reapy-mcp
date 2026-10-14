@@ -10,6 +10,7 @@ resolves them against the bundle directory and refuses anything malformed
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 from pathlib import Path
@@ -446,6 +447,7 @@ def clamp_regions(
     duration_s: float,
     *,
     allow_overhang_s: float = 0.0,
+    snap_s: float = 0.0,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Clamp region ends to the audio end; drop regions that start past it.
 
@@ -455,6 +457,12 @@ def clamp_regions(
     legitimately poke a little past the audio) and is listed in `overhangs`;
     anything further is clamped and recorded in `clamps`. A region starting at
     or past the end cannot sound and is skipped.
+
+    `snap_s` is the grid the clamp itself must land on (a bar). Clamping to the
+    audio's exact end is what put a region edge 572 ms off the ruler on the real
+    DnB take: the audio does not stop on a bar line, so a cut there is off the
+    grid by construction. With `snap_s` the clamped end is the first grid line at
+    or after the audio's end - still covering the audio, and still on the ruler.
     """
     kept: list[dict] = []
     clamps: list[dict] = []
@@ -474,6 +482,8 @@ def clamp_regions(
                 )
             else:
                 end = duration_s
+                if snap_s and snap_s > 0:
+                    end = math.ceil(end / snap_s - 1e-9) * snap_s
         if region["start_s"] >= end - 1e-9:
             # Cannot sound: skipped, and NOT reported as a clamp (a region that
             # does not survive must not show up in two lists).
@@ -481,7 +491,10 @@ def clamp_regions(
             continue
         if end < region["end_s"] - 1e-9:
             clamps.append(
-                {"name": region["name"], "end_s": region["end_s"], "applied_end_s": round(end, 3)}
+                {"name": region["name"], "end_s": region["end_s"], "applied_end_s": round(end, 6)}
             )
-        kept.append({**region, "end_s": round(end, 3)})
+        # MICROSECONDS, not milliseconds: a region edge is a BAR LINE, and rounding it to
+        # 0.001 s moves it off the ruler by up to 0.5 ms - which is what the live project
+        # showed (0.47 ms worst deviation) before this was found.
+        kept.append({**region, "end_s": round(end, 6)})
     return kept, clamps, skipped, overhangs

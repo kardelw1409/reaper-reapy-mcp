@@ -229,6 +229,30 @@ def test_clamp_regions_skips_region_starting_past_duration():
     assert skipped and skipped[0]["name"] == "ghost"
 
 
+def test_a_clamped_end_lands_on_the_grid_not_on_the_audio_end():
+    """MEASURED on the live project: the last region's end sat 572 ms off the ruler.
+
+    A region that outlives the audio used to be cut at the audio's exact end, and the audio
+    does not stop on a bar line, so the edge landed off the grid by construction.  With the
+    bar length given, the cut is made at the first bar line at or after the audio's end: the
+    region stays on the ruler and still covers every second of audio it covered before.
+    """
+    bar = 1.395239
+    regions = [{"name": "interlude", "start_s": 224.634, "end_s": 283.234, "source": "plan"}]
+    audio_end = 271.249
+
+    kept, clamps, _skipped, _over = clamp_regions(regions, audio_end, snap_s=bar)
+    assert kept[0]["end_s"] == pytest.approx(272.071, abs=1e-3)
+    assert kept[0]["end_s"] > audio_end, "the region must still cover the audio"
+    off_grid_ms = abs(kept[0]["end_s"] / bar - round(kept[0]["end_s"] / bar)) * bar * 1000
+    assert off_grid_ms < 0.01, off_grid_ms
+    assert clamps and clamps[0]["applied_end_s"] == pytest.approx(272.071, abs=1e-3)
+
+    # without a grid the old behaviour is unchanged - the parameter is opt-in
+    kept_plain, *_ = clamp_regions(regions, audio_end)
+    assert kept_plain[0]["end_s"] == audio_end
+
+
 def test_clamp_regions_region_that_starts_inside_the_overhang_is_skipped():
     # Its whole range sits past the audio; keeping the bar must not resurrect it.
     regions = [{"name": "late", "start_s": 89.9999, "end_s": 92.0, "source": "plan"}]
