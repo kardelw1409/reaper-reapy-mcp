@@ -22,6 +22,7 @@ clean=true, or missing artifacts refuse before any mutation.
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -161,7 +162,101 @@ def _same_span(mark: dict, region: dict) -> bool:
     )
 
 
-def _take_note_phases(project, track_index: int, step_s: float) -> tuple[dict, list[float]]:
+def _note_time_map(take, low_ppq: int, high_ppq: int, *, probes: int = 8) -> tuple[object, dict]:
+    """A calibrated PPQ -> project-seconds map, PROVEN on samples it did not use.
+
+    MEASURED, and this is the whole reason the function exists: one bridge call costs ~32 ms
+    (the reapy bridge is a JSON socket), and the old loop asked the bridge for every note AND
+    for every note's project time - 62.89 ms per note, measured on a live project. A fill with
+    4100 notes therefore spent ~260 s in verification alone, and the fill took 300 s.
+
+    A take's PPQ -> seconds map is affine when the tempo map does not change inside the item,
+    which is the normal case. `low`/`high` measure the line; `probes` further positions CHECK
+    it, and if any deviates the map is refused (`exact: False`) so the caller can fall back to
+    asking per note. The check is not decoration: without it, a tempo marker inside the item
+    would silently give every note a wrong time, which is exactly the defect the check exists
+    to find.
+    """
+    if high_ppq <= low_ppq:
+        return None, {"exact": False, "reason": "no PPQ span to interpolate"}
+    started = time.perf_counter()
+    low_s = float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(low_ppq)))
+    high_s = float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(high_ppq)))
+    seconds_per_tick = (high_s - low_s) / float(high_ppq - low_ppq)
+    worst_ms = 0.0
+    for step in range(1, probes + 1):
+        probe = low_ppq + (high_ppq - low_ppq) * step // (probes + 1)
+        if probe <= low_ppq or probe >= high_ppq:
+            continue
+        measured = float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(probe)))
+        predicted = low_s + (probe - low_ppq) * seconds_per_tick
+        worst_ms = max(worst_ms, abs(measured - predicted) * 1000.0)
+    report = {
+        "exact": worst_ms <= 0.05,
+        "probes": probes,
+        "worst_probe_ms": round(worst_ms, 6),
+        "calls": probes + 2,
+        "seconds": round(time.perf_counter() - started, 3),
+    }
+    if not report["exact"]:
+        report["reason"] = (
+            "the PPQ -> seconds map is NOT affine inside this item (a tempo/meter change): "
+            "every note time is asked for individually instead"
+        )
+
+    def resolve(ppq: int) -> float:
+        return low_s + (ppq - low_ppq) * seconds_per_tick
+
+    return resolve, report
+
+
+def _take_note_times(project, track_index: int) -> dict:
+    """Every note time of the newest item on a track, in one pass.
+
+    Returns {"notes", "times", "time_map"} - the PPQ of each note comes from
+    `MIDI_GetNote` (unavoidable: reapy cannot return `MIDI_GetAllEvts`' buffer, measured -
+    the call succeeds with bufSize 6964 and hands back an EMPTY string, the same limitation
+    that makes region names unreadable), while the PPQ -> seconds map is calibrated once for
+    the whole item instead of once per note.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return {"notes": 0, "times": [], "time_map": None, "reason": "no items"}
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return {"notes": 0, "times": [], "time_map": None, "reason": "no take"}
+    counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
+    if not isinstance(counted, (list, tuple)) or len(counted) < 3:
+        return {"notes": 0, "times": [], "time_map": None, "reason": "MIDI_CountEvts unreadable"}
+    notes = int(counted[2])
+    if notes < 1:
+        return {"notes": 0, "times": [], "time_map": None, "reason": "no notes"}
+
+    ppqs: list[int] = []
+    for index in range(notes):
+        got = RPR.MIDI_GetNote(take, index, 0, 0, 0, 0, 0, 0, 0)
+        if not isinstance(got, (list, tuple)) or len(got) < 6:
+            continue
+        ppqs.append(int(float(got[5])))
+    if not ppqs:
+        return {"notes": notes, "times": [], "time_map": None, "reason": "no readable notes"}
+
+    resolve, map_report = _note_time_map(take, min(ppqs), max(ppqs))
+    if resolve is None or not map_report.get("exact"):
+        # honest fallback: the calibrated map was refused, so ask per note (the slow path)
+        times = [float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs]
+        map_report = dict(map_report or {}, used="per_note", calls=len(ppqs))
+    else:
+        times = [resolve(ppq) for ppq in ppqs]
+        map_report = dict(map_report, used="calibrated", notes=notes)
+    return {"notes": notes, "times": times, "time_map": map_report}
+
+
+def _take_note_phases(
+    project, track_index: int, step_s: float, cache: dict | None = None
+) -> tuple[dict, list[float]]:
     """The newest item's note span AND how far its notes sit from the project grid.
 
     Returns (span, deviations) where a deviation is the distance from the nearest
@@ -170,47 +265,32 @@ def _take_note_phases(project, track_index: int, step_s: float) -> tuple[dict, l
     1/16 grid and the score-derived parts 21 ms - the reason an arrangement could look
     "almost right but not on the grid".
 
-    Measured against REAPER 7.53 through reapy 0.10: these ReaScript calls return a
-    LIST whose first element is the return value and whose remaining elements are the
-    pass-through arguments followed by the outputs - `MIDI_CountEvts(take, 0, 0, 0)`
-    gives [retval, take, notesOut, ccsOut, textsOut] and `MIDI_GetNote(...)` gives
-    [retval, take, idx, selected, muted, startppq, endppq, chan, pitch, vel].
+    `cache` shares ONE reading of an item between the span pass and the grid pass: the
+    verification used to read every note twice (measured: 62.89 ms per note over the bridge,
+    so 4100 notes cost ~260 s of a 300 s fill).
 
-    Times come from MIDI_GetProjTimeFromPPQPos, which is what makes this check able to
-    see a tempo defect at all: it converts through the PROJECT tempo, so a file written
-    at 120 bpm inside a 172 bpm project reports its notes 1.43x too early.
+    Times come from the PPQ->seconds map (see `_note_time_map`), which is what makes this
+    check able to see a tempo defect at all: it converts through the PROJECT tempo, so a file
+    written at 120 bpm inside a 172 bpm project reports its notes 1.43x too early.
     """
-    track = project.tracks[track_index]
-    count = int(RPR.CountTrackMediaItems(track.id))
-    if count < 1:
-        return {}, []
-    item = RPR.GetTrackMediaItem(track.id, count - 1)
-    take = RPR.GetActiveTake(item)
-    if not take:
-        return {}, []
-    counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
-    if not isinstance(counted, (list, tuple)) or len(counted) < 3:
-        return {}, []
-    notes = int(counted[2])
-    if notes < 1:
-        return {"notes": 0, "first_s": None, "last_s": None}, []
-    times: list[float] = []
-    for index in range(notes):
-        got = RPR.MIDI_GetNote(take, index, 0, 0, 0, 0, 0, 0, 0)
-        if not isinstance(got, (list, tuple)) or len(got) < 6:
-            continue
-        times.append(float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(got[5]))))
+    if cache is not None and track_index in cache:
+        reading = cache[track_index]
+    else:
+        reading = _take_note_times(project, track_index)
+        if cache is not None:
+            cache[track_index] = reading
+    times = list(reading["times"])
     if not times:
-        return {"notes": notes, "first_s": None, "last_s": None}, []
-    span = {"notes": notes, "first_s": min(times), "last_s": max(times)}
+        return {"notes": reading["notes"], "first_s": None, "last_s": None}, []
+    span = {"notes": int(reading["notes"]), "first_s": min(times), "last_s": max(times)}
     if step_s <= 0:
         return span, []
     deviations = [((t % step_s) + step_s / 2.0) % step_s - step_s / 2.0 for t in times]
     return span, deviations
 
 
-def _take_note_span(project, track_index: int) -> dict | None:
-    span, _ = _take_note_phases(project, track_index, 0.0)
+def _take_note_span(project, track_index: int, cache: dict | None = None) -> dict | None:
+    span, _ = _take_note_phases(project, track_index, 0.0, cache)
     return span or None
 
 
@@ -512,10 +592,13 @@ def apply_bundle(
     # of notes; only their POSITIONS reveal it (measured: an 80.9 s deficit).
     expected_spans = expected_note_spans(info)
     actual_spans: dict[str, dict] = {}
+    # ONE reading per item, shared by the span pass and the grid pass below. Reading them
+    # twice is what made the fill slow (measured: 62.89 ms per note over the reapy bridge).
+    note_cache: dict[int, dict] = {}
     for key, track_name in MIDI_ARTIFACT_TRACK.items():
         if track_name not in track_index:
             continue
-        span = _take_note_span(project, track_index[track_name])
+        span = _take_note_span(project, track_index[track_name], note_cache)
         if span is not None:
             actual_spans[key] = span
     # When the bundle carries per-class parts, the combined drums.mid is deliberately
@@ -534,11 +617,21 @@ def apply_bundle(
     grid_alignment: dict[str, dict] = {}
     bar_s = float(grid_info.get("bar_s") or 0.0)
     step_s = bar_s / 16.0 if bar_s else 0.0
+    # The PPQ -> seconds maps the note times came from, so a reader can see HOW the times
+    # were obtained: `calibrated` (a few calls, proven on probes) or `per_note` (the slow
+    # path, taken when the map was refused). A silent choice here would hide a two-minute
+    # difference, and more importantly it would hide a tempo change inside an item.
+    note_time_maps: dict[str, dict] = {}
+    for key, track_name in MIDI_ARTIFACT_TRACK.items():
+        index = track_index.get(track_name)
+        reading = note_cache.get(index) if index is not None else None
+        if reading and reading.get("time_map"):
+            note_time_maps[key] = reading["time_map"]
     if step_s > 0:
         for key, track_name in MIDI_ARTIFACT_TRACK.items():
             if track_name not in track_index:
                 continue
-            _, deviations = _take_note_phases(project, track_index[track_name], step_s)
+            _, deviations = _take_note_phases(project, track_index[track_name], step_s, note_cache)
             if not deviations:
                 continue
             # `phase_is_an_offset` is False when the notes are spread over the whole step:
@@ -621,6 +714,7 @@ def apply_bundle(
         "meter_ok": meter_applied_ok,
         "midi_notes": note_report,
         "grid_alignment": grid_alignment,
+        "note_time_maps": note_time_maps,
         "audio_start_s": audio_start_s,
         "grid": grid_info,
     }
