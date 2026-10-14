@@ -101,7 +101,7 @@ ENV_TIME_MODEL = {
 REQUEST_CONTROLS: dict[str, Any] = {
     "filter_1_on": "On",          # the sub must pass through the lowpass at all
     "filter_1_cutoff": 80.0,      # ~831 Hz, 12 dB: keeps 2nd/3rd harmonic, kills fizz
-    "filter_1_resonance": 0.2,    # low: no ringing ("без ненужного звона")
+    "filter_1_resonance": 0.2,    # low: no ringing
     "distortion_on": "On",        # the saturation stage
     "distortion_drive": 10.0,     # dB: dense but controlled
     "distortion_mix": 0.45,       # parallel blend: controllable harmonic content
