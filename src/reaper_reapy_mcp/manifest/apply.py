@@ -21,6 +21,7 @@ clean=true, or missing artifacts refuse before any mutation.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from datetime import datetime, timezone
@@ -310,6 +311,42 @@ def _matching_regions(marks: list[dict], regions: list[dict]) -> list[dict]:
     return out
 
 
+class _PhaseTimer:
+    """Seconds per phase of a fill, because "why is this slow?" was asked about the FILL.
+
+    Measured context: one bridge call costs ~32 ms (reapy is a JSON socket), so the phases that
+    touch every note item dominate everything else, and a phase that is quietly quadratic looks
+    like "REAPER is slow". The numbers land in the apply report beside the verification.
+    """
+
+    def __init__(self) -> None:
+        self.seconds: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.seconds[name] = round(self.seconds.get(name, 0.0) + time.perf_counter() - started, 2)
+
+    def counted(self, name: str, by: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + by
+
+    def report(self) -> dict:
+        # `seconds_total` sums only the TOP-LEVEL phases: a sub-phase (items:audio) runs INSIDE
+        # its parent, so adding every entry would count the items twice and report a total larger
+        # than the fill took. Per-phase numbers stay as measured either way.
+        top_level = {name: seconds for name, seconds in self.seconds.items() if ":" not in name}
+        return {
+            "seconds_by_phase": dict(sorted(self.seconds.items(), key=lambda item: -item[1])),
+            "counts": dict(sorted(self.counts.items())),
+            "seconds_total": round(sum(top_level.values()), 2),
+            "seconds_total_note": "top-level phases only; a colon in a name means a sub-phase inside one",
+        }
+
+
 def apply_bundle(
     bundle_dir: str | None,
     *,
@@ -467,16 +504,18 @@ def apply_bundle(
     }
 
     # --- clean (regions first: their recorded indices come from the pre-mutation state)
-    for mark in sorted(regions_to_delete, key=lambda m: m["index"], reverse=True):
-        RPR.DeleteProjectMarker(project.id, mark["index"], True)
-        applied["deleted_regions"].append({"name": mark["name"], "start_s": mark["start_s"]})
-    existing_indices = sorted(
-        (i for i, name in enumerate(track_names) if name in AI_TRACKS), reverse=True
-    )
-    for index in existing_indices:
-        name = track_names[index]
-        project.tracks[index].delete()
-        applied["deleted_tracks"].append(name)
+    phases = _PhaseTimer()
+    with phases.phase("clean"):
+        for mark in sorted(regions_to_delete, key=lambda m: m["index"], reverse=True):
+            RPR.DeleteProjectMarker(project.id, mark["index"], True)
+            applied["deleted_regions"].append({"name": mark["name"], "start_s": mark["start_s"]})
+        existing_indices = sorted(
+            (i for i, name in enumerate(track_names) if name in AI_TRACKS), reverse=True
+        )
+        for index in existing_indices:
+            name = track_names[index]
+            project.tracks[index].delete()
+            applied["deleted_tracks"].append(name)
 
     # --- tempo / meter / title marker
     if not controller.set_tempo(project_bpm):
@@ -497,9 +536,11 @@ def apply_bundle(
 
     # --- tracks (base five, then one per extra artifact the bundle carries)
     track_index: dict[str, int] = {}
-    for name in tracks_to_create:
-        track_index[name] = controller.create_track(name)
-        applied["tracks"].append(name)
+    with phases.phase("tracks"):
+        for name in tracks_to_create:
+            track_index[name] = controller.create_track(name)
+            applied["tracks"].append(name)
+            phases.counted("tracks")
 
     # --- items (audio stems and MIDI performances, all at the arrangement origin)
     # The controller inserts at the edit cursor, and REAPER does not allow a
@@ -507,52 +548,59 @@ def apply_bundle(
     # position written afterwards. Measured on the house take: without this the
     # items sat at 0.0 while the regions were shifted, i.e. 0.42 s out of sync.
     applied["items"] = []
-    for action in item_actions:
-        track = track_index[action["track"]]
-        if action["kind"] == "audio":
-            outcome = controller.insert_audio_item(track, action["file"], action["start_s"])
-        else:
-            outcome = controller.insert_midi_item(track, action["file"], action["start_s"])
-        if outcome in (-1, None):
-            warnings.append(f"{action['kind']} insert failed on {action['track']} ({Path(action['file']).name})")
-            continue
-        if action["start_s"] != 0.0:
-            controller.set_item_position(track, outcome, action["start_s"])
-        source_offset = None
-        if action["kind"] == "audio" and audio_source_offset_s > 0:
-            source_offset = _set_audio_source_offset(project, track, audio_source_offset_s)
-            if source_offset is None or abs(source_offset - audio_source_offset_s) > 1e-4:
+    with phases.phase("items"):
+        for action in item_actions:
+            phases.counted("items")
+            with phases.phase("items:" + action["kind"]):
+                track = track_index[action["track"]]
+                if action["kind"] == "audio":
+                    outcome = controller.insert_audio_item(track, action["file"], action["start_s"])
+                else:
+                    outcome = controller.insert_midi_item(track, action["file"], action["start_s"])
+            if outcome in (-1, None):
                 warnings.append(
-                    f"{action['track']}: take source offset "
-                    f"{('unknown' if source_offset is None else f'{source_offset:.3f}')} s does not match "
-                    f"the manifest's {audio_source_offset_s:.3f} s"
+                    f"{action['kind']} insert failed on {action['track']} ({Path(action['file']).name})"
                 )
-        position = _last_item_position(project, track)
-        if position is None or abs(position - action["start_s"]) > 1e-3:
-            warnings.append(
-                f"{action['track']}: item position "
-                f"{('unknown' if position is None else f'{position:.3f}')} s does not match "
-                f"the arrangement origin {action['start_s']:.3f} s"
+                continue
+            if action["start_s"] != 0.0:
+                controller.set_item_position(track, outcome, action["start_s"])
+            source_offset = None
+            if action["kind"] == "audio" and audio_source_offset_s > 0:
+                source_offset = _set_audio_source_offset(project, track, audio_source_offset_s)
+                if source_offset is None or abs(source_offset - audio_source_offset_s) > 1e-4:
+                    warnings.append(
+                        f"{action['track']}: take source offset "
+                        f"{('unknown' if source_offset is None else f'{source_offset:.3f}')} s does not match "
+                        f"the manifest's {audio_source_offset_s:.3f} s"
+                    )
+            position = _last_item_position(project, track)
+            if position is None or abs(position - action["start_s"]) > 1e-3:
+                warnings.append(
+                    f"{action['track']}: item position "
+                    f"{('unknown' if position is None else f'{position:.3f}')} s does not match "
+                    f"the arrangement origin {action['start_s']:.3f} s"
+                )
+            if action["kind"] == "audio":
+                applied["audio_items"] += 1
+            else:
+                applied["midi_items"] += 1
+            applied["items"].append(
+                {
+                    "track": action["track"],
+                    "kind": action["kind"],
+                    "file": Path(action["file"]).name,
+                    "start_s": action["start_s"],
+                    "position_s": position,
+                    "source_offset_s": source_offset,
+                }
             )
-        if action["kind"] == "audio":
-            applied["audio_items"] += 1
-        else:
-            applied["midi_items"] += 1
-        applied["items"].append(
-            {
-                "track": action["track"],
-                "kind": action["kind"],
-                "file": Path(action["file"]).name,
-                "start_s": action["start_s"],
-                "position_s": position,
-                "source_offset_s": source_offset,
-            }
-        )
 
     # --- regions (validated AddProjectMarker path)
-    for region in kept:
-        RPR.AddProjectMarker(project.id, True, region["start_s"], region["end_s"], region["name"], -1)
-        applied["regions"] += 1
+    with phases.phase("regions"):
+        for region in kept:
+            RPR.AddProjectMarker(project.id, True, region["start_s"], region["end_s"], region["name"], -1)
+            applied["regions"] += 1
+            phases.counted("regions")
 
     # --- save
     if save_as:
@@ -565,6 +613,9 @@ def apply_bundle(
             warnings.append("Main_SaveProjectEx did not produce the file on disk")
 
     # --- verify by re-reading
+    # Timed with a stamp rather than a `with`: the block runs to the end of the function and
+    # wrapping it would mean re-indenting every line of it (a large diff for a measurement).
+    verify_started = time.perf_counter()
     after_names = _track_names(project)
     tracks_ok = all(name in after_names for name in tracks_to_create)
     marks_after = _enumerate_marks(project)
@@ -718,6 +769,13 @@ def apply_bundle(
         "audio_start_s": audio_start_s,
         "grid": grid_info,
     }
+    # Where the fill's own time went, measured rather than guessed: one bridge call is ~32 ms and
+    # the phase that touches every item dominates, which is exactly the kind of thing that gets
+    # blamed on "REAPER being slow".
+    phases.seconds["verify"] = round(
+        phases.seconds.get("verify", 0.0) + time.perf_counter() - verify_started, 2
+    )
+    verification["phases"] = phases.report()
     # Bookkeeping entries (`_checked`, `_superseded`) are not measurements - see
     # note_report_ok. `checked: False` inside a real entry still fails.
     notes_ok = note_report_ok(note_report)
