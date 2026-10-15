@@ -1827,3 +1827,32 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to save project: {str(e)}"}
 
+    @mcp.tool("new_project_tab")
+    def new_project_tab(ctx: Context, ignore_template: bool = True) -> Dict[str, Any]:
+        """Open a FRESH project tab and leave it current, so a fill has an empty project to go to.
+
+        WHY THIS IS A TOOL AND NOT A LINE IN A SCRIPT: the manifest fill writes into whatever
+        project is current, and with `clean=True` it DELETES the AI_* tracks and the regions of
+        the project it finds. So "align the next take" in a session that already holds an aligned
+        project is a destructive operation, and the way out - a fresh tab - was the one step of
+        this toolchain that lived in a script outside it.
+
+        It is NOT destructive itself: the project that was current stays open and untouched, and
+        the answer names it under `left_behind` (with `file` empty when it has never been saved,
+        and a warning when it has - that project is one crash away from being lost).
+
+        Args:
+            ignore_template: open the tab WITHOUT applying REAPER's project template
+                (default). A template puts tracks, tempo and routing in before anything of ours
+                is written, so the fill's read-back can no longer tell its own tracks from the
+                template's; the answer warns with the new tab's track count when it is not empty.
+
+        Verified, not assumed: `Main_OnCommand` answers nothing, so the current project and the
+        list of open tabs are read before AND after, and `created` is true only when one of them
+        moved.
+        """
+        try:
+            return controller.new_project_tab(ignore_template=ignore_template)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to open a new project tab: {str(e)}"}
+

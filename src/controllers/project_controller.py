@@ -7,6 +7,41 @@ from .base_controller import BaseController
 import os
 import time
 
+#: REAPER's own action ids for opening a project tab. The two differ in one thing that matters
+#: here: the template. A template puts tracks, tempo and routing into the tab before anything of
+#: ours is written, so a fill that then reads the project back cannot tell its own work from the
+#: template's. `ignore_template` is the default for that reason.
+NEW_PROJECT_TAB = 40859
+NEW_PROJECT_TAB_IGNORING_TEMPLATE = 41929
+
+
+def _is_null_project(pointer) -> bool:
+    """Is this `EnumProjects` answer the empty slot that ENDS the enumeration?"""
+    digits = str(pointer or "").split("0x")[-1].rstrip(")")
+    return not digits or set(digits) <= {"0"}
+
+
+def _open_projects() -> list:
+    """Every open project tab as `{"index", "pointer", "file"}`; `file` is "" when unsaved.
+
+    `CountProjects` does NOT exist in reapy's `reascript_api` (probed 2026-10-15: AttributeError),
+    so the count has to come from walking `EnumProjects` until the pointer is null. The answer's
+    shape is `[pointer, index, buffer, bufsize]` - the name is in the THIRD slot, and it is filled
+    for a project that has a file and empty for one that has never been saved (probed: the same
+    call returned `...\\bundle-dnb-v15\\project\\...` for a saved tab and "" for the current, unsaved
+    one, which is also why "the current name cannot be read" was concluded here once before).
+    """
+    seen = []
+    for index in range(64):
+        answer = RPR.EnumProjects(index, "", 4096)
+        pointer = answer[0] if isinstance(answer, (list, tuple)) and answer else answer
+        if _is_null_project(pointer):
+            break
+        name = answer[2] if isinstance(answer, (list, tuple)) and len(answer) > 2 else ""
+        seen.append({"index": index, "pointer": str(pointer), "file": str(name or "")})
+    return seen
+
+
 class ProjectController(BaseController):
     """Controller for project-level operations in Reaper."""
     
@@ -354,5 +389,85 @@ class ProjectController(BaseController):
             answer["warning"] = (
                 "the file was already there and its mtime did not move: this is not a fresh "
                 "restore point"
+            )
+        return answer
+
+    def new_project_tab(self, ignore_template: bool = True) -> dict:
+        """Open a fresh project tab and leave it CURRENT, so a fill has an empty project to fill.
+
+        WHY THIS IS A TOOL AND NOT A LINE IN A SCRIPT. The manifest fill writes into whatever
+        project is current, and its `clean=True` DELETES the AI_* tracks and the regions of the
+        project it finds - so "fill the next take" in a session that already holds an aligned
+        project is a destructive operation, and the way out is a fresh tab. Doing that from a
+        script is what the previous run did, and it is the one step of this toolchain that lived
+        outside it; the tab is also the only place a caller can see what it is about to overwrite.
+
+        Opening a tab is NOT destructive: the project that was current stays open and untouched,
+        and the answer names it so a caller can see what it left behind (its file, or "" when it
+        was never saved - that project is one crash away from being lost, and this is the tool
+        that can see it).
+
+        The result is VERIFIED against the host rather than assumed: `Main_OnCommand` answers
+        nothing at all, so the current project's pointer and the number of open tabs are read
+        BEFORE and AFTER, and `created` is true only if both moved. A tab that opened but did not
+        become current, or a command id this REAPER does not have, is then a line in the answer
+        instead of a fill that quietly lands in the previous project.
+        """
+        before = reapy.Project()
+        before_tabs = _open_projects()
+        # `Project.tracks` is a LIVE property (it queries reapy on every access), so the count has
+        # to be read HERE: read after the switch it reports the NEW tab's tracks, and the
+        # left-behind project would be described as empty - the one thing this answer exists to say.
+        before_pointer = str(before.id)
+        before_track_count = len(before.tracks)
+        before_left_behind = next(
+            (tab for tab in before_tabs if tab["pointer"] == before_pointer), None
+        )
+
+        command = NEW_PROJECT_TAB_IGNORING_TEMPLATE if ignore_template else NEW_PROJECT_TAB
+        try:
+            RPR.Main_OnCommand(command, 0)
+        except Exception as e:
+            self.logger.error(f"Failed to open a new project tab: {e}")
+            return {"status": "error", "message": f"Failed to open a new project tab: {e}"}
+
+        after = reapy.Project()
+        after_tabs = _open_projects()
+        track_count = len(after.tracks)
+        created = str(after.id) != before_pointer or len(after_tabs) > len(before_tabs)
+        answer = {
+            "status": "success" if created else "error",
+            "message": (
+                "new project tab opened%s" % ("" if created else " - NOT: the command changed nothing")
+            ),
+            "created": created,
+            "command": command,
+            "ignore_template": bool(ignore_template),
+            "project": str(after.id),
+            "track_count": track_count,
+            "tabs_open": len(after_tabs),
+            "tabs_before": len(before_tabs),
+            "left_behind": (
+                {
+                    "project": before_pointer,
+                    "track_count": before_track_count,
+                    "file": (before_left_behind or {}).get("file", ""),
+                }
+            ),
+            "tabs": after_tabs,
+        }
+        if not created:
+            answer["hints"] = [
+                "the action id may differ in this REAPER build",
+                "check that REAPER is running and not showing a modal dialog",
+            ]
+        elif track_count:
+            answer["warning"] = (
+                "the new tab is not empty (%d track(s)): a template was applied, so the fill's "
+                "read-back cannot tell its own tracks from the template's" % track_count
+            )
+        if created and not answer["left_behind"]["file"]:
+            answer["left_behind"]["warning"] = (
+                "the project left open has never been saved: it exists in memory only"
             )
         return answer
