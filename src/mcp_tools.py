@@ -1798,3 +1798,32 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to render project: {str(e)}"}
 
+    @mcp.tool("save_project")
+    def save_project(ctx: Context, path: str) -> Dict[str, Any]:
+        """Write the CURRENT project to a .rpp file and verify it landed on disk.
+
+        WHY THIS TOOL EXISTS: everything else in this server builds a project in memory and
+        REAPER keeps it there until somebody saves it - measured on a real session, where an
+        unsaved aligned project was lost to a reboot and had to be rebuilt from the bundle.
+        `apply_audiocpp_manifest` can save as part of filling (its `save_as` argument), and this
+        tool is the same act on its own, for any caller that has a project worth keeping.
+
+        Args:
+            path: where to write the project, ending in .rpp (parent directories are created).
+                REQUIRED, and deliberately not defaulted: REAPER answers a save with no file name
+                with a modal Save-As dialog, and a modal blocks every call behind it, so a
+                default would be a hang rather than a convenience. The project's current file
+                name cannot be read through reapy either (`GetProjectName` and `EnumProjects`
+                return the buffer they are given - probed), so this tool cannot decide on its own
+                whether saving in place would be safe.
+
+        The answer reports `saved_as`, the file's `bytes`, the time it took, and `rewritten`
+        (whether the mtime MOVED): a file that was already there with an unchanged mtime comes
+        back with `rewritten: false` and a warning, because a caller that asked for a restore
+        point needs to know the way back is older than this call.
+        """
+        try:
+            return controller.save_project(path)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to save project: {str(e)}"}
+

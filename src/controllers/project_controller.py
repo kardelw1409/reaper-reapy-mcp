@@ -265,3 +265,94 @@ class ProjectController(BaseController):
         # NOT `perform_action(41824)`: that pair (with BOUNDSFLAG=3) is the measured
         # trigger of the "Nothing to render!" modal.
         RPR.Main_OnCommand(42230, 0)
+
+    def save_project(self, path: Optional[str] = None) -> dict:
+        """Write the CURRENT project to a ``.rpp`` and verify the file landed on disk.
+
+        A path is REQUIRED, and the refusal is the interesting part:
+
+        * REAPER answers a plain save of a project that has no file yet with a **modal Save-As
+          dialog**, and a modal blocks EVERY reapy call behind it - so the caller would HANG
+          instead of getting an answer. This repo already documents that class of failure for
+          the render path ("Nothing to render!"). MEASURED at the transport: the tool schema
+          marks `path` required, so a call without one is refused as `Field required` BEFORE any
+          of this code runs (`py -3.11` through the MCP hub, 2026-10-15); the guard below is the
+          second line of defence, for direct calls on the controller.
+        * The project's own file name cannot be read through reapy to decide whether a save in
+          place is safe: both ``GetProjectName`` and ``EnumProjects`` return the buffer they
+          were GIVEN (probed 2026-10-15: ``GetProjectName(id, "", 4096)`` came back
+          ``[<proj>, "", 4096]``), so the question "does this project already have a file?"
+          cannot be asked. A caller that knows the path passes it; a caller that does not gets
+          a refusal naming the reason - never a dialog.
+
+        The write is VERIFIED rather than assumed: ``Main_SaveProjectEx`` can return without
+        producing anything (the manifest fill warns about exactly that), so the path is re-stat'ed
+        and the answer carries the size, the time and whether the mtime MOVED. A file that was
+        already there with an unchanged mtime is reported as ``rewritten: false`` rather than
+        presented as a fresh save - a caller that asked for a restore point needs to know that
+        the way back is older than this call.
+        """
+        project = reapy.Project()
+        if not path:
+            return {
+                "status": "error",
+                "message": "save_project needs a path: this project will not be saved in place",
+                "hints": [
+                    "pass path=... (for example <bundle_dir>/project/<name>.rpp)",
+                    "saving by name raises REAPER's modal Save-As dialog when the project has no "
+                    "file yet, and a modal blocks every call behind it",
+                    "the current file name cannot be read through reapy, so the tool cannot tell "
+                    "whether saving in place is safe",
+                ],
+            }
+        target = os.path.abspath(os.path.expanduser(str(path)))
+        stem, suffix = os.path.splitext(target)
+        if not suffix:
+            target = target + ".rpp"
+        elif suffix.lower() != ".rpp":
+            return {
+                "status": "error",
+                "message": "save_project writes .rpp files; got %r" % suffix,
+                "hints": ["pass a path ending in .rpp"],
+            }
+        before_mtime = os.path.getmtime(target) if os.path.isfile(target) else None
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            started = time.perf_counter()
+            RPR.Main_SaveProjectEx(project.id, target, 0)
+            seconds = time.perf_counter() - started
+        except Exception as e:
+            self.logger.error(f"Failed to save project: {e}")
+            return {"status": "error", "message": f"Failed to save project: {e}"}
+
+        produced = next(
+            (candidate for candidate in (target, target + ".rpp")
+             if os.path.isfile(candidate) and os.path.getsize(candidate) > 0),
+            None,
+        )
+        if produced is None:
+            self.logger.error("Save reported no error but no file appeared at %s", target)
+            return {
+                "status": "error",
+                "message": "Main_SaveProjectEx returned but no file appeared",
+                "requested_path": target,
+                "hints": [
+                    "the project may be read-only, or REAPER may have refused silently",
+                    "check the path and the disk before retrying",
+                ],
+            }
+        after_mtime = os.path.getmtime(produced)
+        answer = {
+            "status": "success",
+            "message": "Project saved to %s" % produced,
+            "saved_as": produced,
+            "bytes": os.path.getsize(produced),
+            "seconds": round(seconds, 3),
+            "rewritten": before_mtime is None or after_mtime != before_mtime,
+        }
+        if not answer["rewritten"]:
+            answer["warning"] = (
+                "the file was already there and its mtime did not move: this is not a fresh "
+                "restore point"
+            )
+        return answer
