@@ -29,6 +29,7 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
         clean: bool = False,
         save_as: str | None = None,
         apply_warp: bool = True,
+        project_id: str | None = None,
     ) -> Dict[str, Any]:
         """Fill the CURRENT REAPER project from an audiocpp.manifest v1 bundle.
 
@@ -53,6 +54,11 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
         `apply_warp=False` leaves the audio unwarped; by default, if the bundle carries a
         warp.json (mcp-audiocpp :: plan_warp), every audio item gets its stretch markers - a
         render's timing drifts by ~10 ms across a take, which no item position can follow.
+        `project_id` pins WHICH project is filled (the `(ReaProject*)0x...` string
+        `new_project_tab` returns): without it the fill uses the CURRENT project, and a
+        session where the selection changed between the tab call and the fill then gets a
+        refusal (measured live: 15 AI_* tracks from the PREVIOUS take). With it, the two
+        calls act on one named project.
         """
         try:
             result = apply_bundle(
@@ -62,6 +68,7 @@ def setup_manifest_tools(mcp: FastMCP, controller: Any) -> None:
                 clean=clean,
                 save_as=save_as,
                 apply_warp=apply_warp,
+                project_id=project_id,
             )
         except ManifestError as exc:
             return {

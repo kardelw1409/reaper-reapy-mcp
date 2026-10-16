@@ -466,12 +466,21 @@ def apply_bundle(
     clean: bool = False,
     save_as: str | None = None,
     apply_warp: bool = True,
+    project_id: str | None = None,
 ) -> dict:
     """Validate, (optionally preview), mutate, verify, report.
 
     Raises ManifestError for anything that must refuse before touching the host.
     Returns the report dict (ok is False when verification finds less than the
     requested count applied, even though the mutations ran).
+
+    `project_id` pins WHICH project is filled, given as the `(ReaProject*)0x...`
+    string `new_project_tab` returns. Without it the fill uses whatever project is
+    CURRENT - which is a race, and it was measured on a live session (2026-10-16):
+    the tab tool opened an empty tab and read it back as current (track_count 0),
+    and the fill 2.7 s later found the PREVIOUS project's 15 AI_* tracks and refused
+    the second apply. Two calls that must act on the same project cannot depend on a
+    third party not changing the selection between them.
 
     `apply_warp` puts the bundle's warp.json (mcp-audiocpp :: plan_warp) onto every audio item as
     stretch markers. It is on by default because the plan only exists when somebody deliberately
@@ -564,7 +573,7 @@ def apply_bundle(
     if info.get("midi_parts"):
         item_actions = [a for a in item_actions if a["track"] != "MIDI_DRUMS"]
 
-    project = reapy.Project()
+    project = reapy.Project(project_id) if project_id else reapy.Project()
     before = {
         "project_id": str(project.id),
         "project_name": project.name,
