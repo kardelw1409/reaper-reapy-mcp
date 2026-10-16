@@ -509,6 +509,9 @@ def apply_bundle(
     # carries adds its track (vocals/instrumental FILL base tracks, drums/bass/
     # other ADD tracks). Items all sit at the arrangement origin.
     tracks_to_create: list[str] = list(BASE_AI_TRACKS)
+    for track_name, path_key in (("MIDI_VOCAL", "vocal_midi_path"), ("MIDI_INS", "ins_midi_path")):
+        if not info.get(path_key) and track_name in tracks_to_create:
+            tracks_to_create.remove(track_name)
     for stem_key, track_name in STEM_TRACK_MAP.items():
         if stem_key in info["stems"] and track_name not in tracks_to_create:
             tracks_to_create.append(track_name)
@@ -527,12 +530,18 @@ def apply_bundle(
             item_actions.append(
                 {"track": track_name, "kind": "audio", "file": info["stems"][stem_key], "start_s": audio_start_s}
             )
-    item_actions.append(
-        {"track": "MIDI_VOCAL", "kind": "midi", "file": info["vocal_midi_path"], "start_s": audio_start_s}
-    )
-    item_actions.append(
-        {"track": "MIDI_INS", "kind": "midi", "file": info["ins_midi_path"], "start_s": audio_start_s}
-    )
+    # The two SCORE-derived MIDI artifacts are optional: a manifest whose score could not be read
+    # carries no `midi.vocal` / `midi.ins`, and then there is no item to place - and no empty track to
+    # leave behind either, which is why the names come OUT of the track list below instead of being
+    # created empty.
+    if info["vocal_midi_path"]:
+        item_actions.append(
+            {"track": "MIDI_VOCAL", "kind": "midi", "file": info["vocal_midi_path"], "start_s": audio_start_s}
+        )
+    if info["ins_midi_path"]:
+        item_actions.append(
+            {"track": "MIDI_INS", "kind": "midi", "file": info["ins_midi_path"], "start_s": audio_start_s}
+        )
     for midi_key, track_name in MIDI_TRACK_MAP.items():
         if midi_key in info["extra_midi"]:
             item_actions.append(

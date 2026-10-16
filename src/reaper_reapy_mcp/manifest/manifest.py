@@ -110,6 +110,21 @@ def _require_number(doc: dict, key: str, *, positive: bool = True) -> float:
     return float(value)
 
 
+def _optional_file(bundle: Path, name: object, *, what: str) -> str | None:
+    """A file the manifest may legitimately NOT name - unlike the mandatory ones.
+
+    `midi.vocal` and `midi.ins` come from the SCORE, and a score can be unreadable while the rest of
+    the take is perfectly fine: measured on a progressive-house render, YuE2 wrote a truncated chord
+    token as the whole Vocal line of one group of forty-six, so no score-derived MIDI could be written
+    while the audio, the regions and the transcribed drum parts were all intact. Absence therefore
+    means "no item for this artifact" - which is NOT the same as naming a file that is not there: that
+    stays fatal (`_require_file`), because it means the bundle is incomplete.
+    """
+    if name in (None, ""):
+        return None
+    return _require_file(bundle, name, what=what)
+
+
 def _require_file(bundle: Path, name: object, *, what: str) -> str:
     if not isinstance(name, str) or not name:
         raise ManifestError(f"manifest is missing the {what} filename")
@@ -206,8 +221,8 @@ def load_manifest(bundle_dir: str | Path) -> dict:
     midi = doc.get("midi")
     if not isinstance(midi, dict):
         raise ManifestError("manifest is missing the midi object")
-    vocal_path = _require_file(bundle, midi.get("vocal"), what="vocal MIDI")
-    ins_path = _require_file(bundle, midi.get("ins"), what="instrumental MIDI")
+    vocal_path = _optional_file(bundle, midi.get("vocal"), what="vocal MIDI")
+    ins_path = _optional_file(bundle, midi.get("ins"), what="instrumental MIDI")
     extra_midi: dict[str, str] = {}
     for key in MIDI_TRACK_MAP:
         if midi.get(key):

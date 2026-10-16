@@ -417,3 +417,41 @@ def test_negative_source_offset_refuses(tmp_path, pointer):
     with pytest.raises(ManifestError) as excinfo:
         manifest.load_manifest(bundle)
     assert "source_offset_s" in str(excinfo.value)
+
+
+def test_a_bundle_without_score_midi_is_valid_and_places_no_item(tmp_path, pointer):
+    """Measured on a progressive-house render: YuE2 wrote a truncated chord token as the whole Vocal
+    line of one group of forty-six, so no score-derived MIDI could be written while the audio, the
+    regions and the transcribed drum parts were all intact. The fill then refused the ENTIRE project
+    with "manifest is missing the vocal MIDI filename".
+
+    Absence means "no item for this artifact" - a legitimate state - and it is NOT the same as a
+    manifest naming a file that is not there, which stays fatal (its own test below). The track is not
+    created either: an empty MIDI_VOCAL track is a track the user has to delete.
+    """
+    doc = _bundle_doc(midi={}, midi_sources={})
+    base = tmp_path / "no_score_midi"
+    base.mkdir(parents=True, exist_ok=True)
+    _write_wav(base / "song.wav")
+    (base / "manifest.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+    info = manifest.load_manifest(base)
+    assert info["vocal_midi_path"] is None
+    assert info["ins_midi_path"] is None
+    assert info["regions"], "the regions do not depend on the score's music"
+    assert info["duration_s"] == 270.0
+
+
+def test_a_manifest_naming_a_missing_vocal_file_is_still_refused(tmp_path, pointer):
+    """The other direction, and it must stay fatal: a manifest that NAMES a file means the bundle is
+    incomplete when it is absent - not that the artifact is optional."""
+    base = tmp_path / "names_missing"
+    base.mkdir(parents=True, exist_ok=True)
+    _write_wav(base / "song.wav")
+    (base / "manifest.json").write_text(
+        json.dumps(_bundle_doc(), ensure_ascii=False), encoding="utf-8"
+    )
+    with pytest.raises(ManifestError) as excinfo:
+        manifest.load_manifest(base)
+    assert "vocal MIDI" in str(excinfo.value)
+    assert excinfo.value.hints
