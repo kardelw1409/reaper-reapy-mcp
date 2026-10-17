@@ -399,8 +399,22 @@ def expected_note_spans(info: dict) -> dict[str, dict]:
         if not counted:
             continue
         entry["notes"] = sum(int(row["notes"]) for row in counted)
-        firsts = [float(row["first_note_s"]) for row in counted if row.get("first_note_s") is not None]
-        lasts = [float(row["last_note_s"]) for row in counted if row.get("last_note_s") is not None]
+        # THE FRAMES DIFFER AND BOTH ARE RIGHT: a run's own boundaries are in the FILE's seconds (the
+        # fill adds the arrangement origin when it places the item), while `midi_time` speaks RULER
+        # seconds. MEASURED on the afro take, where this was missed by exactly that amount: the kick
+        # part was reported as "first note 35.410 s vs 3.944 s (delta +31.466 s)" - a correct project
+        # rejected for a conversion the expectation owed.
+        origin = float(info.get("audio_start_s") or 0.0)
+        firsts = [
+            float(row["first_note_s"]) + origin
+            for row in counted
+            if row.get("first_note_s") is not None
+        ]
+        lasts = [
+            float(row["last_note_s"]) + origin
+            for row in counted
+            if row.get("last_note_s") is not None
+        ]
         if firsts:
             entry["first_s"] = min(firsts)
         if lasts:

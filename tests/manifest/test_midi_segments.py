@@ -83,23 +83,25 @@ def test_the_expectation_of_a_cut_part_is_the_union_of_its_runs():
     missing one lies past the last region and is deliberately not inserted, because nothing plays
     there."""
     info = {
+        "audio_start_s": 31.4756,
         "midi_time": {"drums_tom": {"notes": 119, "first_note_project_s": 31.5, "last_note_project_s": 140.903}},
         "midi_segments": {
             "drums_tom": [
                 {"start_s": 31.5, "end_s": 51.2, "notes": 10, "name": "intro",
-                 "first_note_s": 33.4, "last_note_s": 50.1},
+                 "first_note_s": 1.9, "last_note_s": 18.6},
                 {"start_s": 51.2, "end_s": 74.8, "notes": 25, "name": "verse",
-                 "first_note_s": 52.0, "last_note_s": 74.5},
+                 "first_note_s": 0.5, "last_note_s": 23.0},
                 {"start_s": 74.8, "end_s": 139.7, "notes": 83, "name": "chorus",
-                 "first_note_s": 78.9, "last_note_s": 139.181},
+                 "first_note_s": 47.4, "last_note_s": 107.705},
             ]
         },
     }
     spans = manifest.expected_note_spans(info)
     tom = spans["drums_tom"]
     assert tom["notes"] == 118, tom  # the counts ADD UP: 10 + 25 + 83
-    assert tom["first_s"] == 33.4
-    assert tom["last_s"] == 139.181
+    # the runs speak the FILE's seconds and the expectation speaks the RULER's: the origin is added
+    assert tom["first_s"] == pytest.approx(0.5 + 31.4756, abs=1e-6)
+    assert tom["last_s"] == pytest.approx(107.705 + 31.4756, abs=1e-6)
     assert tom["sliced_into"] == 3
     assert [row["name"] for row in tom["slices"]] == ["intro", "verse", "chorus"]
 
