@@ -304,6 +304,59 @@ def test_a_destination_that_is_not_in_the_memo_is_still_written():
     assert outcome["counts"]["routes_skipped_known_drop"] == 0
 
 
+def test_the_fields_of_a_skipped_slot_are_not_written_either():
+    """The plugin discards the text of an INACTIVE slot, so a field write fails the batch.
+
+    Measured live 2026-10-17: an acceptance chain failed on `modulation_35_amount`,
+    `modulation_38_bipolar`, `modulation_41_amount` - the per-slot controls of slots whose
+    destination the build had dropped. The pair was skipped (as a gap) but its `modulation_N_*`
+    values still rode the control batches, and the plugin threw the whole batch away. So a
+    skipped slot's fields are skipped WITH it and named.
+    """
+    file_doc = preset_document(
+        modulations=[{"source": "lfo_1", "destination": "osc_2_spectral_morph_amount"}]
+    )
+    live = preset_document(
+        modulations=[{"source": "", "destination": ""}],
+        controls={"modulation_1_amount": 0.25, "modulation_1_bipolar": 1.0},
+    )
+    assert file_doc["settings"]["modulation_1_amount"] != live["settings"]["modulation_1_amount"]
+
+    outcome = PRESET.change_set(
+        live, file_doc, dropped_destinations=["osc_2_spectral_morph_amount"]
+    )
+
+    assert "settings.modulation_1_amount" not in outcome["paths"]
+    assert "settings.modulation_1_bipolar" not in outcome["paths"]
+    assert outcome["counts"]["slot_fields_skipped_with_pair"] == 2
+    gaps = [gap for gap in outcome["gaps"] if gap["reason"] == "slot_text_dropped_with_pair"]
+    assert gaps and gaps[0]["slots"] == [1]
+
+
+def test_the_fields_of_a_written_slot_still_ride_the_control_batch():
+    """The skip is about INACTIVE slots only: a slot whose routing is written keeps its fields."""
+    file_doc = preset_document(modulations=[{"source": "lfo_1", "destination": "osc_2_tune"}])
+    live = preset_document(
+        modulations=[{"source": "", "destination": ""}],
+        controls={"modulation_1_amount": 0.25, "modulation_1_bipolar": 1.0},
+    )
+    outcome = PRESET.change_set(live, file_doc, dropped_destinations=["osc_2_spectral_morph_amount"])
+    assert [row["destination"] for row in outcome["routes_create"]] == ["osc_2_tune"]
+    assert outcome["paths"]["settings.modulation_1_amount"] == file_doc["settings"]["modulation_1_amount"]
+    assert outcome["paths"]["settings.modulation_1_bipolar"] == file_doc["settings"]["modulation_1_bipolar"]
+    assert "slot_fields_skipped_with_pair" not in outcome["counts"]
+
+
+def test_the_slot_of_a_field_is_parsed_from_its_own_name():
+    """The helper that decides which slot a control belongs to, on the names that exist."""
+    assert PRESET._slot_of_field("settings.modulation_35_amount") == 35
+    assert PRESET._slot_of_field("settings.modulation_1_bipolar") == 1
+    assert PRESET._slot_of_field("settings.modulation_4_power") == 4
+    assert PRESET._slot_of_field("settings.modulation_") is None
+    assert PRESET._slot_of_field("settings.modulations.0.amount") is None
+    assert PRESET._slot_of_field("settings.osc_1_level") is None
+
+
 def test_the_drops_memo_round_trips_and_is_keyed_by_build(tmp_path: Path):
     rows = [{"source": "lfo_1", "destination": "osc_2_spectral_morph_amount", "slot": 4}]
     first = PRESET.record_dropped_destinations(

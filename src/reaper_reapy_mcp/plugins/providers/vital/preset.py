@@ -339,6 +339,24 @@ def _growth_gap(document: dict[str, Any], path: str, value: Any) -> int | None:
     return None
 
 
+def _slot_of_field(path: str) -> int | None:
+    """The routing slot a `settings.modulation_<n>_<field>` path belongs to, else None.
+
+    The per-slot controls (`modulation_N_amount`, `_bipolar`, `_power`, `_stereo`,
+    `_bypass`) are ordinary settings keys, so they travel in the control batches rather than
+    with their routing - which is exactly how a write of an inactive slot's text used to end
+    up in a batch the plugin then discarded (measured 2026-10-17).
+    """
+    prefix = "settings.modulation_"
+    if not path.startswith(prefix):
+        return None
+    head = path[len(prefix):].split("_", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
 def _route_ops_from_modulations(
     file_settings: dict[str, Any],
     live_settings: dict[str, Any],
@@ -370,6 +388,14 @@ def _route_ops_from_modulations(
         "modulation_curves_not_carried": 0,
     }
     gaps: list[dict[str, Any]] = []
+    #: Slots whose routing is NOT written. The plugin keys a modulation's activity on its
+    #: destination, and it DISCARDS the text of a slot that has none: a `modulation_N_*`
+    #: write for such a slot is accepted and then re-serialised away, which fails the whole
+    #: batch it rode in (measured live 2026-10-17: the acceptance chain failed on exactly
+    #: those fields - `modulation_35_amount`, `modulation_38_bipolar`, `modulation_41_amount`
+    #: for slots whose destination the build had dropped). Fields of these slots are skipped
+    #: with their own gap instead.
+    skipped_slots: set[int] = set()
     for index, entry in enumerate(file_mods):
         slot = index + 1
         file_slot = entry if isinstance(entry, dict) else {}
@@ -386,6 +412,7 @@ def _route_ops_from_modulations(
             # same dance (and the same rollback-free drop), so the routing is named
             # and left out - which is exactly what the plugin's own load does.
             counters["routes_skipped_known_drop"] += 1
+            skipped_slots.add(slot)
             gaps.append(
                 {
                     "item": f"modulations[{index}]",
@@ -423,6 +450,7 @@ def _route_ops_from_modulations(
         if amount is not None:
             spec["amount"] = amount
         else:
+            skipped_slots.add(slot)
             gaps.append(
                 {
                     "item": f"modulations[{index}]",
@@ -455,7 +483,14 @@ def _route_ops_from_modulations(
                 ),
             }
         )
-    return {"creates": creates, "updates": updates, "removes": removes, "counters": counters, "gaps": gaps}
+    return {
+        "creates": creates,
+        "updates": updates,
+        "removes": removes,
+        "counters": counters,
+        "gaps": gaps,
+        "skipped_slots": sorted(skipped_slots),
+    }
 
 
 def change_set(
@@ -609,6 +644,32 @@ def change_set(
     route_plan = _route_ops_from_modulations(file_settings, live_settings, dropped_destinations)
     counts.update(route_plan["counters"])
     gaps.extend(route_plan["gaps"])
+    # The plugin discards the text of a slot whose pair is not active (measured): a write of
+    # `modulation_N_*` for a slot whose routing was skipped is accepted and re-serialised
+    # away, which fails the batch it rode in. Those fields are dropped here with the slot
+    # that owns them, so the plan never contains a write the channel will not honour.
+    skipped_slots = {int(slot) for slot in route_plan.get("skipped_slots") or ()}
+    if skipped_slots:
+        # `paths` is keyed by the FULL path already (`settings.modulation_1_amount`, or a bare
+        # label key), so the slot is read straight off the key.
+        dropped_fields = [path for path in paths if _slot_of_field(path) in skipped_slots]
+        for path in dropped_fields:
+            paths.pop(path, None)
+            counts["controls"] = max(0, counts["controls"] - 1)
+        if dropped_fields:
+            counts["slot_fields_skipped_with_pair"] = len(dropped_fields)
+            gaps.append(
+                {
+                    "item": "settings.modulation_*_*",
+                    "reason": "slot_text_dropped_with_pair",
+                    "detail": (
+                        f"{len(dropped_fields)} slot field(s) belong to routing slot(s) whose pair "
+                        "this build does not carry; the plugin discards the text of an inactive "
+                        "slot, so writing it would fail the batch - the fields are left as they are"
+                    ),
+                    "slots": sorted({_slot_of_field(path) for path in dropped_fields}),
+                }
+            )
 
     for key in LABEL_KEYS:
         if key in preset and preset.get(key) != document.get(key):

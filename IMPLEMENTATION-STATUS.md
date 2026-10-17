@@ -4614,12 +4614,57 @@ section becomes the record of a defect rather than of a limit. The next measurem
 varies the growth in ONE item-B field at a time (length field, line count, artifact bytes) and reads
 back each time.
 
-### 39.8 Residuals, stated plainly
+### 39.8 The write law refined, and the slot-field defect (2026-10-17, late)
+
+**The law is about the JSON text, not the block.** The first boundary measurement framed the limit as a
+block-text delta (+44 lands, +48 does not). A live ladder (`probe_p38_framing_live.py`) produced the
+pair that breaks that framing: growth 32 and growth 33 of one value have the **same block delta (+44)**
+and land/are ignored differently. `probe_p38_pad_side.py` then walked a controlled base
+(comments = 64 chars, built in +32 steps) and `probe_p38_total_cap.py` ladddered the total:
+
+| case | JSON growth | block delta | result |
+|---|---|---|---|
+| one path | +32 | +44 | **landed** |
+| one path | +33 | +44 | ignored |
+| two paths (20+13) | +33 | +36 | **landed** |
+| two paths (20+20) | +40 | +44 | ignored |
+| two paths (20+28) | +48 | +56 | ignored |
+| three paths (20+32+4) | +56 | +56 | ignored |
+| pads (shrink) 8..64 | <= 0 | 0 | **all landed** |
+
+So the per-write edge is a JSON-text property; it constrains one value (<= 32) and the sum too, and where
+the sum's edge sits (between 33 and 40) is not measured. The shipped constants (estimate 24 for a batch
+and for a single path) sit inside every measured landing case, so no constant had to move - but the
+reason in the comments changed from "block delta" to "JSON growth", and `GROWTH_ESTIMATE_TO_REAL` is now
+documented as the observation it is rather than as the rule.
+
+The in-memory framing ladder (`probe_p38_framing_in_memory.py`) is kept as the negative evidence: line
+count, last-line length, both length fields, base64 alignment and the artifact are IDENTICAL on both
+sides of the edge, so no single framing feature discriminates. What does discriminate is visible in the
+read-back: a landing write comes back as the plugin's OWN re-serialization (differences inside the
+base64), an ignored one comes back byte-identical to the previous block.
+
+**The acceptance chain's unit 34/38 was this defect, not the growth law.** Its mismatched rows were
+`modulation_35_amount`, `modulation_38_bipolar`, `modulation_41_amount` - the per-slot controls of slots
+whose pair the build had dropped. The plugin keys a modulation's activity on its destination and
+**discards the text of an inactive slot**, so those field writes were accepted and re-serialised away,
+failing the batch they rode in (they travel in the generic control batches, not with their routing). The
+plan now skips a slot's `modulation_N_*` fields together with the slot whose routing it did not write,
+and names it (`slot_text_dropped_with_pair`, four tests in `test_p38_presets.py`), so the plan can no
+longer contain a write the channel will not honour for this reason.
+
+**Probe hygiene learned the hard way this session:** a restore must only touch writable paths (a probe
+that wrote the whole captured document crashed on `synth_version`, which is outside the writable root,
+and left the instance changed until the next probe restored it); and a ladder must rebuild its base
+explicitly per trial, or each trial measures the previous trial's residue (that is how a two-path trial
+was first misread as "33 lands").
+
+### 39.9 Residuals, stated plainly
 
 1. The **first** apply pays for not knowing which destination names the build accepts (the profile
    lists 316; a part of them are gone). Every measured drop is remembered per build, so a
    second apply of the same material skips them up front - one or two applies converge per preset.
-2. A chain costs what its units cost (see 39.9): the price per unit is a base read, the write, the
+2. A chain costs what its units cost (see 39.10): the price per unit is a base read, the write, the
    read-back and a **full 2858-value parameter re-read**, which the measured "a document write
    resets ordinary parameters" law requires. That law is why the vector is read around every write,
    and a `test_p2_transaction` test pins the guarantee it buys (an external parameter change between
@@ -4634,8 +4679,7 @@ back each time.
    items (the true destination set of a build is not readable, only measurable).
 6. No commits were made and no existing file was removed in this round.
 
-### 39.9 What one state unit costs, and the three fixes that followed (2026-10-17 evening)
-
+### 39.10 What one state unit costs, and the three fixes that followed (2026-10-17 evening)
 **The measurement.** A per-primitive timing probe (`probe_p38_unit_cost.py`, `…191320Z…`) timed every
 read one unit pays on the live instance:
 
