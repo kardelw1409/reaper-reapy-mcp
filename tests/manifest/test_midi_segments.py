@@ -59,6 +59,55 @@ def test_an_audio_action_is_never_sliced_even_if_its_key_has_segments():
     assert sliced == [audio]
 
 
+def test_a_take_holds_the_whole_file_so_only_the_notes_inside_the_item_sound():
+    """MEASURED defect (afro take, 2026-10-18): a take's note list is the SOURCE's, whatever the
+    item's source offset is - so a part cut into three slices read 288 notes against the file's 96
+    (exactly 3x) and the fill refused the project as unverified. The notes that SOUND are the ones
+    inside the item, and the union over a track's items must count each note exactly once."""
+    # one source file whose notes sit at project 10, 20 and 30 (as REAPER maps them per item)
+    source_times = [10.0, 20.0, 30.0]
+    first = apply.notes_in_item_window(source_times, 10.0, 10.0)  # item [10, 20]
+    second = apply.notes_in_item_window(source_times, 20.0, 10.0)  # item [20, 30]
+    assert first == [10.0, 20.0], first
+    assert second == [20.0, 30.0], second
+    # the boundary note is in BOTH windows (it is audible at the edge); the count follows the windows
+    assert sum(len(part) for part in (apply.notes_in_item_window(source_times, 10.0, 10.0),
+                                      apply.notes_in_item_window(source_times, 20.0, 10.0))) == 4
+    # an UNSLICED item covers its whole source: nothing is filtered away
+    assert apply.notes_in_item_window(source_times, 10.0, 100.0) == source_times
+
+
+def test_the_expectation_of_a_cut_part_is_the_union_of_its_runs():
+    """MEASURED (afro take): without this the tom part was reported as "notes 118 != 119; last note
+    139.181 s vs 140.903 s" although every note that SOUNDS sat exactly where the manifest says - the
+    missing one lies past the last region and is deliberately not inserted, because nothing plays
+    there."""
+    info = {
+        "midi_time": {"drums_tom": {"notes": 119, "first_note_project_s": 31.5, "last_note_project_s": 140.903}},
+        "midi_segments": {
+            "drums_tom": [
+                {"start_s": 31.5, "end_s": 51.2, "notes": 10, "name": "intro",
+                 "first_note_s": 33.4, "last_note_s": 50.1},
+                {"start_s": 51.2, "end_s": 74.8, "notes": 25, "name": "verse",
+                 "first_note_s": 52.0, "last_note_s": 74.5},
+                {"start_s": 74.8, "end_s": 139.7, "notes": 83, "name": "chorus",
+                 "first_note_s": 78.9, "last_note_s": 139.181},
+            ]
+        },
+    }
+    spans = manifest.expected_note_spans(info)
+    tom = spans["drums_tom"]
+    assert tom["notes"] == 118, tom  # the counts ADD UP: 10 + 25 + 83
+    assert tom["first_s"] == 33.4
+    assert tom["last_s"] == 139.181
+    assert tom["sliced_into"] == 3
+    assert [row["name"] for row in tom["slices"]] == ["intro", "verse", "chorus"]
+
+    # ...and an artifact with NO runs keeps the whole-file expectation
+    info["midi_time"]["bass"] = {"notes": 88, "first_note_project_s": 78.7, "last_note_project_s": 133.3}
+    assert manifest.expected_note_spans(info)["bass"]["notes"] == 88
+
+
 def _bundle(tmp_path: Path, *, midi_segments) -> Path:
     bundle = tmp_path / "bundle"
     bundle.mkdir()

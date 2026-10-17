@@ -314,6 +314,12 @@ def load_manifest(bundle_dir: str | Path) -> dict:
                     "end_s": end,
                     "notes": int(row.get("notes") or 0),
                     "name": str(row.get("name") or ""),
+                    "first_note_s": (
+                        float(row["first_note_s"]) if row.get("first_note_s") is not None else None
+                    ),
+                    "last_note_s": (
+                        float(row["last_note_s"]) if row.get("last_note_s") is not None else None
+                    ),
                 }
             )
         if clean:
@@ -379,6 +385,32 @@ def expected_note_spans(info: dict) -> dict[str, dict]:
             "file_bpm": value.get("file_bpm"),
             "source": value.get("bar_offset_source"),
         }
+    # WHAT THE PROJECT WILL HOLD when the part is CUT BY REGION: a sliced item plays only the notes
+    # inside its own window, so the expectation is the union of the runs - their note counts ADD UP,
+    # and the extremes are the runs' own first/last notes. MEASURED (afro take): without this the tom
+    # part was reported as "notes 118 != 119; last note 139.181 s vs 140.903 s" although every note
+    # that sounds was exactly where the manifest says - the missing one sits past the last region and
+    # is deliberately not inserted (nothing plays there).
+    for key, rows in (info.get("midi_segments") or {}).items():
+        entry = out.get(key)
+        if entry is None or not rows:
+            continue
+        counted = [row for row in rows if isinstance(row.get("notes"), int)]
+        if not counted:
+            continue
+        entry["notes"] = sum(int(row["notes"]) for row in counted)
+        firsts = [float(row["first_note_s"]) for row in counted if row.get("first_note_s") is not None]
+        lasts = [float(row["last_note_s"]) for row in counted if row.get("last_note_s") is not None]
+        if firsts:
+            entry["first_s"] = min(firsts)
+        if lasts:
+            entry["last_s"] = max(lasts)
+        entry["sliced_into"] = len(counted)
+        entry["slices"] = [
+            {"name": row.get("name"), "start_s": row["start_s"], "end_s": row["end_s"],
+             "notes": row.get("notes")}
+            for row in counted
+        ]
     return out
 
 

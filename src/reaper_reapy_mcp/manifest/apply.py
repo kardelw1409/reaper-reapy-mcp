@@ -275,6 +275,22 @@ def _note_time_map(take, low_ppq: int, high_ppq: int, *, probes: int = 8) -> tup
     return resolve, report
 
 
+def notes_in_item_window(times: list[float], position_s: float, length_s: float) -> list[float]:
+    """The notes of a take that SOUND in the item, given their project times.
+
+    MEASURED reason this exists (afro take, 2026-10-18): a take's note list is the SOURCE's, whatever
+    the item's source offset is, so a part cut into 3 slices read 288 notes against the file's 96 -
+    exactly 3x, and the fill refused the project as unverified. The notes that sound are the ones
+    whose project time falls inside the item, and the mapping already accounts for the source offset
+    (measured on the bass: a slice starting at project 78.689 reports its notes from 78.689, not from
+    the item's start). Filtering by the window is therefore what makes the union over a track's items
+    count each note exactly once.
+    """
+    start = float(position_s)
+    end = start + float(length_s)
+    return [when for when in times if start - 1e-6 <= when <= end + 1e-6]
+
+
 def _take_note_times(project, track_index: int) -> dict:
     """Every note time of EVERY item on a track, in one pass each.
 
@@ -321,16 +337,28 @@ def _take_note_times(project, track_index: int) -> dict:
             total_notes += notes
             continue
         read_items += 1
-        total_notes += notes
         resolve, report = _note_time_map(take, min(ppqs), max(ppqs))
         if resolve is None or not report.get("exact"):
             # honest fallback: the calibrated map was refused, so ask per note (the slow path)
-            times.extend(float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs)
+            item_times = [float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs]
             report = dict(report or {}, used="per_note", calls=len(ppqs))
         else:
-            times.extend(resolve(ppq) for ppq in ppqs)
+            item_times = [resolve(ppq) for ppq in ppqs]
             report = dict(report, used="calibrated", notes=notes)
+        # A SLICED ITEM HOLDS THE WHOLE FILE, but plays only its own window: the take's note list is
+        # the source's, whatever the item's source offset is (measured: a 3-slice cymbal part read
+        # 288 notes against the file's 96 - exactly 3x). The notes that SOUND in this item are the
+        # ones whose project time falls inside it, and the mapping already accounts for the source
+        # offset (measured on the bass: a slice starting at project 78.689 reports its notes from
+        # 78.689, not from the item start). Filtering by the window is therefore what makes the union
+        # over the track count each note exactly once.
+        position_s = float(RPR.GetMediaItemInfo_Value(item, "D_POSITION"))
+        length_s = float(RPR.GetMediaItemInfo_Value(item, "D_LENGTH"))
+        inside = notes_in_item_window(item_times, position_s, length_s)
+        times.extend(inside)
+        total_notes += len(inside) if len(inside) != len(item_times) else notes
         report["items"] = count
+        report["sounding_notes"] = len(inside)
         if map_report is None:
             map_report = report
     if not times:
