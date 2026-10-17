@@ -155,6 +155,70 @@ def _set_audio_source_offset(project, track_index: int, offset_s: float) -> floa
     return float(RPR.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS"))
 
 
+def _set_item_slice(project, track_index: int, *, length_s: float, source_offset_s: float) -> dict:
+    """Make the newest item on a track play exactly one SLICE of its source.
+
+    This is what turns one MIDI file into per-region items: the item keeps the region's own span
+    (in project seconds, so its edges land on the bar lines the ruler draws) and looks at the
+    source from `source_offset_s` - the same relation REAPER creates when a user splits an item.
+    Both values are READ BACK, because a write that is ignored must not read as a success:
+    measured on item positions, `SetMediaItemInfo_Value(item, 'D_POSITION', -0.42)` returns 1 and
+    changes nothing.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return {"source_offset_s": None, "length_s": None, "reason": "no items"}
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return {"source_offset_s": None, "length_s": None, "reason": "no take"}
+    RPR.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", float(source_offset_s))
+    RPR.SetMediaItemInfo_Value(item, "D_LENGTH", float(length_s))
+    return {
+        "source_offset_s": float(RPR.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")),
+        "length_s": float(RPR.GetMediaItemInfo_Value(item, "D_LENGTH")),
+    }
+
+
+def cut_actions_by_segments(
+    item_actions: list[dict], segments: dict[str, list[dict]] | None, *, origin_s: float
+) -> list[dict]:
+    """Replace each MIDI action that HAS segments with one action per segment (pure, testable).
+
+    The user's own prescription ("insert the MIDI in pieces under the regions, not as one
+    continuous signal"), and the manifest carries what it needs: `midi_segments` holds, per artifact,
+    the runs the normalizer measured in the AUDIO - one row per region that holds notes, spanning the
+    REGION's own bar-line boundaries. Each row becomes its own item: start at the arrangement origin
+    PLUS the row's start, length = the row's span, and the take looks at the source from that same
+    start (REAPER's own split relation). A part that plays in half the sections therefore sits on the
+    ruler as the pieces it actually plays, and the regions between them hold no item at all.
+    """
+    if not segments:
+        return list(item_actions)
+    sliced: list[dict] = []
+    for action in item_actions:
+        rows = segments.get(action.get("artifact")) if action.get("kind") == "midi" else None
+        if not rows:
+            sliced.append(action)
+            continue
+        for index, row in enumerate(rows):
+            start = float(row["start_s"])
+            length = float(row["end_s"]) - start
+            sliced.append(
+                {
+                    **action,
+                    "start_s": float(origin_s) + start,
+                    "length_s": length,
+                    "source_offset_s": start,
+                    "segment": index,
+                    "segment_name": row.get("name") or "",
+                    "segment_notes": int(row.get("notes") or 0),
+                }
+            )
+    return sliced
+
+
 def _same_span(mark: dict, region: dict) -> bool:
     """True when a project mark covers the manifest region's range (both ends)."""
     return (
@@ -212,47 +276,72 @@ def _note_time_map(take, low_ppq: int, high_ppq: int, *, probes: int = 8) -> tup
 
 
 def _take_note_times(project, track_index: int) -> dict:
-    """Every note time of the newest item on a track, in one pass.
+    """Every note time of EVERY item on a track, in one pass each.
 
-    Returns {"notes", "times", "time_map"} - the PPQ of each note comes from
+    Returns {"notes", "times", "time_map", "items"} - the PPQ of each note comes from
     `MIDI_GetNote` (unavoidable: reapy cannot return `MIDI_GetAllEvts`' buffer, measured -
     the call succeeds with bufSize 6964 and hands back an EMPTY string, the same limitation
-    that makes region names unreadable), while the PPQ -> seconds map is calibrated once for
-    the whole item instead of once per note.
+    that makes region names unreadable), while the PPQ -> seconds map is calibrated once per
+    item instead of once per note.
+
+    WHY EVERY ITEM AND NOT ONLY THE NEWEST (measured reason, 2026-10-18): the fill inserts ONE
+    ITEM PER REGION when the manifest carries `midi_segments` (the user's "cut it by regions,
+    not one continuous signal"), so the newest item holds ONE region's notes while the track
+    holds the part. Reading the newest alone would report a part as too short - and its phase
+    as whatever that one region happened to hold. The aggregation is exact because every time
+    comes back in PROJECT seconds (`MIDI_GetProjTimeFromPPQPos`), which already accounts for
+    the item's position AND its source offset.
     """
     track = project.tracks[track_index]
     count = int(RPR.CountTrackMediaItems(track.id))
     if count < 1:
-        return {"notes": 0, "times": [], "time_map": None, "reason": "no items"}
-    item = RPR.GetTrackMediaItem(track.id, count - 1)
-    take = RPR.GetActiveTake(item)
-    if not take:
-        return {"notes": 0, "times": [], "time_map": None, "reason": "no take"}
-    counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
-    if not isinstance(counted, (list, tuple)) or len(counted) < 3:
-        return {"notes": 0, "times": [], "time_map": None, "reason": "MIDI_CountEvts unreadable"}
-    notes = int(counted[2])
-    if notes < 1:
-        return {"notes": 0, "times": [], "time_map": None, "reason": "no notes"}
-
-    ppqs: list[int] = []
-    for index in range(notes):
-        got = RPR.MIDI_GetNote(take, index, 0, 0, 0, 0, 0, 0, 0)
-        if not isinstance(got, (list, tuple)) or len(got) < 6:
+        return {"notes": 0, "times": [], "time_map": None, "items": 0, "reason": "no items"}
+    times: list[float] = []
+    total_notes = 0
+    map_report: dict | None = None
+    read_items = 0
+    for item_index in range(count):
+        item = RPR.GetTrackMediaItem(track.id, item_index)
+        take = RPR.GetActiveTake(item)
+        if not take:
             continue
-        ppqs.append(int(float(got[5])))
-    if not ppqs:
-        return {"notes": notes, "times": [], "time_map": None, "reason": "no readable notes"}
-
-    resolve, map_report = _note_time_map(take, min(ppqs), max(ppqs))
-    if resolve is None or not map_report.get("exact"):
-        # honest fallback: the calibrated map was refused, so ask per note (the slow path)
-        times = [float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs]
-        map_report = dict(map_report or {}, used="per_note", calls=len(ppqs))
-    else:
-        times = [resolve(ppq) for ppq in ppqs]
-        map_report = dict(map_report, used="calibrated", notes=notes)
-    return {"notes": notes, "times": times, "time_map": map_report}
+        counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
+        if not isinstance(counted, (list, tuple)) or len(counted) < 3:
+            continue
+        notes = int(counted[2])
+        if notes < 1:
+            continue
+        ppqs: list[int] = []
+        for note_index in range(notes):
+            got = RPR.MIDI_GetNote(take, note_index, 0, 0, 0, 0, 0, 0, 0)
+            if not isinstance(got, (list, tuple)) or len(got) < 6:
+                continue
+            ppqs.append(int(float(got[5])))
+        if not ppqs:
+            total_notes += notes
+            continue
+        read_items += 1
+        total_notes += notes
+        resolve, report = _note_time_map(take, min(ppqs), max(ppqs))
+        if resolve is None or not report.get("exact"):
+            # honest fallback: the calibrated map was refused, so ask per note (the slow path)
+            times.extend(float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs)
+            report = dict(report or {}, used="per_note", calls=len(ppqs))
+        else:
+            times.extend(resolve(ppq) for ppq in ppqs)
+            report = dict(report, used="calibrated", notes=notes)
+        report["items"] = count
+        if map_report is None:
+            map_report = report
+    if not times:
+        return {
+            "notes": total_notes,
+            "times": [],
+            "time_map": map_report,
+            "items": count,
+            "reason": "no readable notes",
+        }
+    return {"notes": total_notes, "times": times, "time_map": map_report, "items": read_items}
 
 
 def _take_note_phases(
@@ -545,11 +634,23 @@ def apply_bundle(
     # created empty.
     if info["vocal_midi_path"]:
         item_actions.append(
-            {"track": "MIDI_VOCAL", "kind": "midi", "file": info["vocal_midi_path"], "start_s": audio_start_s}
+            {
+                "track": "MIDI_VOCAL",
+                "kind": "midi",
+                "file": info["vocal_midi_path"],
+                "start_s": audio_start_s,
+                "artifact": "vocal",
+            }
         )
     if info["ins_midi_path"]:
         item_actions.append(
-            {"track": "MIDI_INS", "kind": "midi", "file": info["ins_midi_path"], "start_s": audio_start_s}
+            {
+                "track": "MIDI_INS",
+                "kind": "midi",
+                "file": info["ins_midi_path"],
+                "start_s": audio_start_s,
+                "artifact": "ins",
+            }
         )
     for midi_key, track_name in MIDI_TRACK_MAP.items():
         if midi_key in info["extra_midi"]:
@@ -559,6 +660,7 @@ def apply_bundle(
                     "kind": "midi",
                     "file": info["extra_midi"][midi_key],
                     "start_s": audio_start_s,
+                    "artifact": midi_key,
                 }
             )
     # One item per drum class, each on its own track: kick separate from snare, etc.
@@ -568,10 +670,20 @@ def apply_bundle(
         source = info.get("midi_parts", {}).get(part)
         if source:
             item_actions.append(
-                {"track": track_name, "kind": "midi", "file": source, "start_s": audio_start_s}
+                {
+                    "track": track_name,
+                    "kind": "midi",
+                    "file": source,
+                    "start_s": audio_start_s,
+                    "artifact": f"drums_{part}",
+                }
             )
     if info.get("midi_parts"):
         item_actions = [a for a in item_actions if a["track"] != "MIDI_DRUMS"]
+
+    # ---- CUT BY REGION: one item per segment, not one item per file (see
+    # cut_actions_by_segments for the rule and where the rows come from).
+    item_actions = cut_actions_by_segments(item_actions, info.get("midi_segments"), origin_s=audio_start_s)
 
     project = reapy.Project(project_id) if project_id else reapy.Project()
     before = {
@@ -710,6 +822,31 @@ def apply_bundle(
                         f"{('unknown' if source_offset is None else f'{source_offset:.3f}')} s does not match "
                         f"the manifest's {audio_source_offset_s:.3f} s"
                     )
+            if action["kind"] == "midi" and action.get("source_offset_s") is not None:
+                # A SLICED ITEM (see the 'cut by region' block): its length and the part of the file
+                # it reads are both written and READ BACK, because a take that ignores the write
+                # would otherwise be reported as placed - measured on item positions, a refused
+                # value returns success.
+                slice_report = _set_item_slice(
+                    project,
+                    track,
+                    length_s=float(action["length_s"]),
+                    source_offset_s=float(action["source_offset_s"]),
+                )
+                source_offset = slice_report.get("source_offset_s")
+                if source_offset is None or abs(source_offset - action["source_offset_s"]) > 1e-3:
+                    warnings.append(
+                        f"{action['track']} ({Path(action['file']).name}): the slice's source offset "
+                        f"{('is unknown' if source_offset is None else f'is {source_offset:.3f} s')} "
+                        f"but the manifest says {action['source_offset_s']:.3f} s"
+                    )
+                placed_length = slice_report.get("length_s")
+                if placed_length is None or abs(placed_length - action["length_s"]) > 1e-3:
+                    warnings.append(
+                        f"{action['track']} ({Path(action['file']).name}): the slice's length "
+                        f"{('is unknown' if placed_length is None else f'is {placed_length:.3f} s')} "
+                        f"but the manifest says {action['length_s']:.3f} s"
+                    )
             position = _last_item_position(project, track)
             if position is None or abs(position - action["start_s"]) > 1e-3:
                 warnings.append(
@@ -745,6 +882,12 @@ def apply_bundle(
                     "start_s": action["start_s"],
                     "position_s": position,
                     "source_offset_s": source_offset,
+                    # A sliced item carries which region it IS (see the 'cut by region' block):
+                    # without it the report of a 5-item part looks like five unrelated inserts.
+                    "segment": action.get("segment"),
+                    "segment_name": action.get("segment_name"),
+                    "segment_notes": action.get("segment_notes"),
+                    "length_s": action.get("length_s"),
                 }
             )
 

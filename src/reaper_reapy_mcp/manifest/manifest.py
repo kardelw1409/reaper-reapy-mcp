@@ -283,6 +283,42 @@ def load_manifest(bundle_dir: str | Path) -> dict:
 
     regions = _normalize_regions(doc)
 
+    # WHERE EACH PART ACTUALLY PLAYS (audiocpp `parts.normalize_parts` -> `segments`, recorded by
+    # the exporter as `midi_segments`): one row per region that holds notes, in PROJECT seconds
+    # already (`total_shift_s` was applied at export). The fill inserts ONE ITEM PER ROW instead of
+    # one item per file, which is the difference between a part that plays in the chorus and a
+    # block of MIDI lying across the whole arrangement. A bundle without the block keeps the old
+    # behaviour, and the report says which happened.
+    midi_segments: dict[str, list[dict]] = {}
+    segments_raw = doc.get("midi_segments") or {}
+    if not isinstance(segments_raw, dict):
+        raise ManifestError("manifest midi_segments must be an object")
+    for artifact, block in segments_raw.items():
+        rows = (block or {}).get("segments") if isinstance(block, dict) else block
+        if not isinstance(rows, list):
+            continue
+        clean: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                start = float(row["start_s"])
+                end = float(row["end_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            clean.append(
+                {
+                    "start_s": start,
+                    "end_s": end,
+                    "notes": int(row.get("notes") or 0),
+                    "name": str(row.get("name") or ""),
+                }
+            )
+        if clean:
+            midi_segments[str(artifact)] = clean
+
     return {
         "bundle_dir": str(bundle),
         "manifest_path": str(manifest_path),
@@ -302,6 +338,7 @@ def load_manifest(bundle_dir: str | Path) -> dict:
         "grid": grid,
         "midi_sources": doc.get("midi_sources") or {},
         "midi_time": midi_time,
+        "midi_segments": midi_segments,
         "regions": regions,
         "warnings": [str(w) for w in (doc.get("warnings") or [])],
     }
