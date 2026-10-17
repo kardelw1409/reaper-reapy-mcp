@@ -752,10 +752,17 @@ def test_revision_conflict_mid_sequence_rolls_back_the_verified_units():
 def test_a_read_failure_after_a_write_keeps_the_counters_honest():
     """The unverified write stays *unknown* even when the verify read dies.
 
-    read_state_chunk occurrence 4 is the post-write read-back of unit 0.
+    The failure is aimed at the read-back that follows the FIRST write by hooking
+    the write itself (P38: the read path used to read the chunk twice per unit, so
+    an ordinal-based injection silently stopped aiming at the read-back when that
+    duplicate read was removed).
     """
     host = build_host()
-    host.inject_at("read_state_chunk", 4, "raise", error=Wedged("verify read died"))
+    host.after(
+        "write_state_slice",
+        1,
+        lambda: host.inject("read_state_chunk", "raise", error=Wedged("verify read died")),
+    )
     transaction, host = make(request=MODE_REQUEST, host=host, dry_run=False)
     result = transaction.run()
     assert not result.ok and isinstance(result.error, Wedged)

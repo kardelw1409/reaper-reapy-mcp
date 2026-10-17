@@ -25,6 +25,7 @@ own bytes, `encode_slice` returns new bytes for exactly that span.
 
 from __future__ import annotations
 
+import array
 import base64
 import copy
 import json
@@ -128,6 +129,102 @@ ROUTE_SLOTS = 64
 #: The exclusion is reported (`restore_changes` returns it) so an outcome can
 #: name it instead of quietly claiming a complete restore.
 DERIVED_LEAVES: tuple[str, ...] = ("settings.sample.samples",)
+
+#: Top-level metadata keys a preset carries OUTSIDE `settings` (measured corpus
+#: layout). They are writable labels - measured live 2026-10-17 (P38): all eight
+#: land and read back exactly while the write stays inside `BATCH_GROWTH_BUDGET`.
+LABEL_PATHS: tuple[str, ...] = (
+    "preset_name",
+    "author",
+    "comments",
+    "preset_style",
+    "macro1",
+    "macro2",
+    "macro3",
+    "macro4",
+)
+
+#: The sample object's key inside `settings` and its whole-block path.
+SAMPLE_BLOCK_KEY = "sample"
+SAMPLE_PATH = f"{MUTABLE_ROOT}.{SAMPLE_BLOCK_KEY}"
+
+#: The per-unit GROWTH BUDGET of one state write, in the packer's own ESTIMATE
+#: (serialized-JSON characters per path, measured live 2026-10-16/17, P38, 1.5.5).
+#:
+#: The channel enforces a real BLOCK-TEXT delta, whose landing band was measured at
+#: +44 (lands) against +48 (silently ignored). The estimate is not that number: it
+#: ignores the base64 expansion of the payload and the wrapping, and the calibration
+#: probe (`probe_p38_batch_calibration.py`, `…194156Z…`) measured the conversion on the
+#: real document - a single control with estimate 14..16 lands at a real delta of
+#: 20..24, i.e. **real ~= 1.4 x estimate**.
+#:
+#: The budget is set from that conversion rather than from taste. Measured on a
+#: 43-path change set (the Cyberline control diff):
+#:
+#:   budget 12 -> 21 batches, max real delta 24  (the old value: one control per unit,
+#:                because a typical control's estimate alone (14..16) exceeds it)
+#:   budget 24 -> 12 batches, max real delta 25  <- chosen: 19 chars inside the band
+#:   budget 36 ->  6 batches, max real delta 45  (at/over the measured landing band)
+#:   budget 48 ->  4 batches, max real delta 65  (over)
+#:
+#: Fewer units is the dominant saving - every unit costs a base read, a write, a
+#: read-back and a full parameter-vector re-read (the measured reset law) - so the
+#: budget is as high as the band allows with room to spare for a document whose
+#: values serialise differently.
+BATCH_GROWTH_BUDGET = 24
+
+#: Safety cap on paths per batch. The BUDGET, not the count, is the measured
+#: constraint; the cap only stops a pathological single batch.
+BATCH_MAX_PATHS = 60
+
+#: The measured conversion from the packer's ESTIMATE to the real block-text delta
+#: (2026-10-17, `probe_p38_batch_calibration.py` `…194156Z…`: single controls estimated
+#: at 14..16 landed at 20..24). It exists as a number, not as prose, so the packing
+#: constants can be CHECKED against the measured landing band instead of trusted.
+GROWTH_ESTIMATE_TO_REAL = 1.4
+
+#: The largest real block-text delta measured to LAND (and the smallest measured to be
+#: ignored is 48): the cliff the packing constants have to stay under.
+MEASURED_LANDING_BAND = 44
+
+#: The growth ONE path may carry on its own, in the packer's own ESTIMATE (the same
+#: unit as `BATCH_GROWTH_BUDGET`, and deliberately the same value).
+#:
+#: No batching can rescue a single path bigger than the band, and the measured outcome
+#: of sending one is a SILENT ignore - the write is accepted, the block is rejected, the
+#: value reads back unchanged - so such a path is named as a gap instead of failing a
+#: transaction that would then roll back everything that DID land. Measured 2026-10-17
+#: (P38 acceptance + calibration): 7 element arrays (`settings.lfos.N.points`/`.powers`,
+#: estimated +140..+372) and a 725-character `comments` label all read back UNCHANGED,
+#: while every control at estimate 14..16 (real delta 20..24) landed and verified.
+#:
+#: At the measured conversion (real ~= 1.4 x estimate, see `BATCH_GROWTH_BUDGET`) a path
+#: at this estimate lands around +34, inside the +44 band; anything above it cannot be
+#: shown to be inside, so it is not attempted.
+SINGLE_PATH_GROWTH_LIMIT = 24
+
+#: The delay the plugin introduces into the sample payload on EVERY state load
+#: (measured repeatedly 2026-10-16/17: the read-back payload equals the written
+#: one shifted by exactly 4 samples, the first 4 zeroed). A restore pre-advances
+#: the captured payload by this much, so the landed sample reproduces the
+#: captured timing exactly (measured: byte-exact restore of the sample slot).
+SAMPLE_RELOAD_DELAY = 4
+
+#: How much of a written sample payload the plugin's OWN re-encode may move.
+#:
+#: The plugin stores the buffer as float32 and re-quantizes to int16 when it saves,
+#: truncating - so a payload can come back with individual samples moved by exactly
+#: one step. **How many samples move is payload-dependent, and that is measured, not
+#: assumed:** three recorded applies landed a 44100-sample payload with a residual of
+#: ZERO (2026-10-17, `…175859Z…`, `…183221Z…`, `…185301Z…`), while a fourth moved 1060
+#: of 44096 samples (2.4 %) by exactly ±1 LSB (`…193527Z…`). The same 2.5 % band was
+#: measured on the plugin's own re-serialisation in Stage B (1109 of 44100 samples).
+#:
+#: So the verdict reads: the payload landed at the measured delay, and every difference
+#: from it is the channel's own one-step requantization. A payload that is actually
+#: different fails both bounds - it moves more than the band, or by more than one step.
+SAMPLE_REQUANT_BAND = 0.05
+SAMPLE_REQUANT_STEP = 1
 
 _ROUTE_FIELDS = ("amount", "bipolar", "bypass", "power", "stereo")
 
@@ -373,11 +470,11 @@ def dig(doc: Any, path: str) -> Any:
 
 def _check_root(path: str) -> None:
     head = _segments(path)[:1]
-    if head != [MUTABLE_ROOT]:
+    if head != [MUTABLE_ROOT] and path not in LABEL_PATHS:
         raise InvalidValue(
             f"state path {path!r} is not rooted at {MUTABLE_ROOT!r}; an unrooted path "
             "writes where the plugin never looks",
-            detail={"path": path, "roots": [MUTABLE_ROOT]},
+            detail={"path": path, "roots": [MUTABLE_ROOT], "labels": list(LABEL_PATHS)},
         )
 
 
@@ -617,34 +714,99 @@ class VitalCodec:
         }
 
     def plan_state_writes(self, doc: dict[str, Any], changes: dict[str, Any]) -> StateWritePlan:
+        """Plan the state channel as GROWTH-BUDGETED batches (measured law, P38).
+
+        Batching: route operations keep their own unit (declared structural limit);
+        a wavetable slot rides its own unit (its whole-table guard - not this
+        estimator - bounds its growth); the remaining paths are greedy-packed so
+        each unit's estimated serialized growth stays inside
+        `BATCH_GROWTH_BUDGET`. Measured live on the 1.5.5 build: one big unit
+        (+168 and up) silently does not land, while the same changes split into
+        small batches all land and verify - so the batch, not the request size,
+        is what the channel enforces.
+
+        A single path above `SINGLE_PATH_GROWTH_LIMIT` is NOT attempted at all: no
+        batching can make it land, and the measured outcome is a silent ignore, so
+        it is named as a gap instead of failing a transaction that would then roll
+        back everything else.
+        """
         paths = dict(changes.get("paths") or {})
         units: list[StateWriteUnit] = []
+        notices: list[dict[str, Any]] = []
         if paths:
             provenance = {
                 str(row.get("path")): row for row in (changes.get("wavetable") or [])
             }
-            wavetable_notes: list[dict[str, Any]] = []
             document = doc["document"] if isinstance(doc, dict) and "document" in doc else doc
+            pending: dict[str, Any] = {}
+            table_units: list[tuple[str, dict[str, Any]]] = []
             for path in paths:
-                _check_root(str(path))
-                _check_not_derived(str(path))
-                note = self._check_wavetable_change(document, str(path), paths[path], provenance)
+                key = str(path)
+                _check_root(key)
+                _check_not_derived(key)
+                note = self._check_wavetable_change(document, key, paths[path], provenance)
                 if note is not None:
-                    paths[str(path)] = note.pop("normalized_value")
-                    wavetable_notes.append(note)
-            payload: dict[str, Any] = {"paths": paths}
-            if wavetable_notes:
-                payload["wavetable"] = wavetable_notes
-            units.append(StateWriteUnit(order_index=0, kind="state", payload=payload))
+                    paths[key] = note.pop("normalized_value")
+                    table_units.append((key, note))
+                    continue
+                limit = BATCH_GROWTH_BUDGET if key == SAMPLE_PATH else SINGLE_PATH_GROWTH_LIMIT
+                growth = _growth_of(document, key, paths[key])
+                if growth > limit:
+                    # Measured (P38): a write whose OWN growth exceeds the band is
+                    # silently IGNORED by the plugin - the block grows too much for
+                    # its parser to accept, and the value reads back unchanged. The
+                    # sample payload is held to the tighter batching budget (its
+                    # reload behaviour is its own measured law); every other path
+                    # gets the measured single-write boundary. Attempting such a
+                    # write can only fail verification and roll the transaction
+                    # back, so the path is dropped HERE and named as a gap.
+                    notices.append(
+                        {
+                            "reason": "growth_over_budget",
+                            "path": key,
+                            "growth_chars": growth,
+                            "budget_chars": limit,
+                            "message": (
+                                "this value was NOT written: its growth exceeds the measured "
+                                "single-write boundary of this channel (a write that grows the "
+                                "document beyond the band is silently ignored by the plugin "
+                                "on this build)"
+                            ),
+                        }
+                    )
+                    continue
+                pending[key] = paths[key]
+            for batch in _batch_paths(document, pending):
+                units.append(
+                    StateWriteUnit(order_index=len(units), kind="state", payload={"paths": batch})
+                )
+            for key, note in table_units:
+                units.append(
+                    StateWriteUnit(
+                        order_index=len(units),
+                        kind="state",
+                        payload={"paths": {key: paths[key]}, "wavetable": [note]},
+                    )
+                )
         route_ops = (
             [{"op": "create", **spec} for spec in (changes.get("routes_create") or [])]
             + [{"op": "update", **spec} for spec in (changes.get("routes_update") or [])]
             + [{"op": "remove", **spec} for spec in (changes.get("routes_remove") or [])]
         )
+        route_units: list[StateWriteUnit] = []
         for op in route_ops:
-            units.append(
-                StateWriteUnit(order_index=len(units), kind="state", payload={"route_op": op})
+            route_units.append(
+                StateWriteUnit(order_index=0, kind="state", payload={"route_op": op})
             )
+        # P38 ordering: route operations ride BEFORE the plain path batches. A
+        # create writes the slot's `modulation_N_*` fields from its own arguments
+        # (power/stereo/bypass default to the measured neutral 0.0), so a preset
+        # apply's control write for those same fields must come AFTER the route op
+        # to land its file values - the reverse order would have the create
+        # overwrite them with defaults.
+        units = route_units + units
+        for index, unit in enumerate(units):
+            unit.order_index = index
         return StateWritePlan(
             units=units,
             rollback_plan=[
@@ -658,6 +820,7 @@ class VitalCodec:
                 "tolerances": {"state.float": 1e-05},
                 "per_unit": "decode the located slice and compare only the written fields",
             },
+            notices=notices,
         )
 
     def encode_slice(
@@ -735,6 +898,14 @@ class VitalCodec:
                     }
                 )
                 continue
+            if str(path) == SAMPLE_PATH:
+                # The plugin re-encodes the sample buffer on every state load; a
+                # byte comparison of the base64 would report every landed write as
+                # a failure. The row establishes what CAN be established (every
+                # other field exact; the payload up to the measured reload delay)
+                # and names the delay it measured.
+                rows.append(_sample_row(str(path), value, actual, tolerance))
+                continue
             rows.append(
                 {
                     "path": str(path),
@@ -802,6 +973,21 @@ class VitalCodec:
                 current = dig(live, slot_path)
                 if current is None or current != captured:
                     leaves[slot_path] = captured
+        # The top-level labels (P38: measured writable) are part of the document the
+        # transaction wrote, so a rollback must cover them like any settings leaf.
+        # Only a differing one is restored - a rollback of an unrelated change must
+        # not rewrite metadata that already matches.
+        for label in LABEL_PATHS:
+            if label in document and live.get(label) != document[label]:
+                leaves[label] = document[label]
+        # The sample block: its payload leaf is plugin-derived (excluded above), but
+        # a WHOLE-block restore is what makes a rollback of a preset apply complete.
+        # The captured payload is pre-advanced by the measured reload delay, because
+        # the plugin delays every written payload by exactly that much (measured:
+        # without it the restore lands 4 samples late; with it, byte-exact).
+        sample = settings.get(SAMPLE_BLOCK_KEY)
+        if isinstance(sample, dict) and dig(live, SAMPLE_PATH) != sample:
+            leaves[SAMPLE_PATH] = _sample_restore_value(sample)
         return {"paths": leaves, "derived_excluded": excluded}
 
     # -- internals ----------------------------------------------------------
@@ -895,11 +1081,35 @@ class VitalCodec:
                     "a create needs a native amount (convert the semantic depth first)",
                     detail={"route": route_op, "reason": "missing_amount"},
                 )
-            slot = find_free_slot(document)
-            if slot is None:
-                raise InvalidValue(
-                    "no free modulation slot", detail={"slots": ROUTE_SLOTS, "reason": "no_free_slot"}
-                )
+            named = route_op.get("slot")
+            if named is None:
+                slot = find_free_slot(document)
+                if slot is None:
+                    raise InvalidValue(
+                        "no free modulation slot", detail={"slots": ROUTE_SLOTS, "reason": "no_free_slot"}
+                    )
+            else:
+                # P38: a caller may name the slot (a preset apply reproduces the
+                # FILE's own slot numbering, because the per-slot
+                # `modulation_N_*` amounts live at that index). A named slot must
+                # be FREE: creating into an occupied one is an update, and
+                # silently landing elsewhere is how a file's routing would pair
+                # with another slot's amount.
+                settings_for_slot = _settings(document)
+                mods = _modulations(settings_for_slot)
+                slot = int(named)
+                if not 1 <= slot <= len(mods):
+                    raise InvalidValue(
+                        f"route slot {slot} is outside 1..{len(mods)}",
+                        detail={"slot": slot, "slots": len(mods)},
+                    )
+                current = mods[slot - 1] if isinstance(mods[slot - 1], dict) else {}
+                if str(current.get("source") or "").strip() or str(current.get("destination") or "").strip():
+                    raise InvalidValue(
+                        f"route slot {slot} is occupied; a create names a FREE slot (or none, and the "
+                        "first free slot is used)",
+                        detail={"slot": slot, "reason": "slot_occupied"},
+                    )
             make_routing(
                 document,
                 str(route_op.get("source") or ""),
@@ -1035,6 +1245,179 @@ def _agrees(written: Any, read_back: Any, tolerance: float) -> bool:
     if isinstance(written, (int, float)) and isinstance(read_back, (int, float)):
         return abs(float(written) - float(read_back)) <= tolerance
     return written == read_back
+
+
+# ---------------------------------------------------------------------------
+# Growth-budget batching and the sample block (P38, measured 2026-10-16/17)
+# ---------------------------------------------------------------------------
+
+
+def _serialized_len(value: Any) -> int:
+    """A value's size in the document's own JSON encoding (`encode_item_b`'s)."""
+    try:
+        return len(json.dumps(value, separators=(",", ":")))
+    except (TypeError, ValueError):  # pragma: no cover - unencodable value
+        return 0
+
+
+def _growth_of(document: Any, path: str, value: Any) -> int:
+    """The serialized growth a single path change is expected to add.
+
+    The estimate is the same one every measured batch was packed with; it was
+    observed to undershoot the real encoded delta by at most ~12 chars, which the
+    conservative `BATCH_GROWTH_BUDGET` absorbs.
+    """
+    current = dig(document, path)
+    return _serialized_len(value) - (_serialized_len(current) if current is not None else 0)
+
+
+def _batch_paths(document: Any, pending: dict[str, Any]) -> list[dict[str, Any]]:
+    """Greedy-pack path changes so each batch stays inside the growth budget.
+
+    A batch is at least one path: the codec never splits a single change, and a path
+    whose own estimate exceeds `SINGLE_PATH_GROWTH_LIMIT` never reaches this packer
+    (it is named as a gap instead), so an over-budget batch cannot be built here.
+    """
+    batches: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    cost = 0
+    for key, value in pending.items():
+        item = _growth_of(document, key, value)
+        if current and (len(current) >= BATCH_MAX_PATHS or cost + item > BATCH_GROWTH_BUDGET):
+            batches.append(current)
+            current = {}
+            cost = 0
+        current[key] = value
+        cost += item
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _sample_restore_value(sample: dict[str, Any], delay: int = SAMPLE_RELOAD_DELAY) -> dict[str, Any]:
+    """The captured sample block with its payload pre-advanced by the reload delay.
+
+    The plugin delays every written payload by exactly `SAMPLE_RELOAD_DELAY`
+    samples on the state load (measured repeatedly), so a restore that writes the
+    captured value verbatim would land 4 samples late. Pre-advancing inverts the
+    measured delay; if the delay ever differed, verification would see the shift
+    it actually got and refuse the restore instead of hiding it.
+    """
+    out = copy.deepcopy(sample)
+    payload = out.get("samples")
+    if isinstance(payload, str) and payload:
+        try:
+            raw = b64d(payload)
+            shift = 2 * int(delay)
+            if 0 < shift < len(raw):
+                out["samples"] = _b64e(raw[shift:] + b"\x00" * shift)
+        except Exception:  # noqa: BLE001 - an undecodable payload restores as-is
+            pass
+    return out
+
+
+def _sample_alignment(written: Any, read_back: Any) -> dict[str, Any] | None:
+    """Compare two base64 int16 payloads up to the measured reload delay.
+
+    Returns the best alignment's shift and residual; ``within_delay`` is the
+    verdict the caller may rely on. ``None`` when a payload is not comparable
+    (wrong type or undecodable) - never a silent "fine".
+    """
+    if not isinstance(written, str) or not isinstance(read_back, str):
+        return None
+    if written == read_back:
+        return {
+            "shift": 0,
+            "n_samples": None,
+            "residual_differing": 0,
+            "residual_max_abs": 0,
+            "within_delay": True,
+            "exact": True,
+        }
+    try:
+        left = array.array("h")
+        left.frombytes(b64d(written))
+        right = array.array("h")
+        right.frombytes(b64d(read_back))
+    except Exception:  # noqa: BLE001 - undecodable payload is not a comparison
+        return None
+    if len(left) != len(right):
+        return {
+            "shift": None,
+            "n_samples": [len(left), len(right)],
+            "within_delay": False,
+            "reason": "payload_length_mismatch",
+        }
+    search = SAMPLE_RELOAD_DELAY + 4
+    best: tuple[int, int, int] | None = None
+    for shift in range(-search, search + 1):
+        a = left[max(0, shift):]
+        b = right[max(0, -shift):]
+        n = min(len(a), len(b))
+        err = sum(1 for index in range(0, n, 7) if a[index] != b[index])
+        if best is None or err < best[1]:
+            best = (shift, err, n)
+    shift, sampled_errors, _n = best
+    a = left[max(0, shift):]
+    b = right[max(0, -shift):]
+    span = min(len(a), len(b))
+    residual = 0
+    max_abs = 0
+    for index in range(span):
+        if a[index] != b[index]:
+            residual += 1
+            delta = abs(b[index] - a[index])
+            if delta > max_abs:
+                max_abs = delta
+    within = residual <= max(64, int(SAMPLE_REQUANT_BAND * span)) and max_abs <= SAMPLE_REQUANT_STEP
+    return {
+        "shift": shift,
+        "n_samples": span,
+        "sampled_mismatches": sampled_errors,
+        "residual_differing": residual,
+        "residual_max_abs": max_abs,
+        "requant_band": SAMPLE_REQUANT_BAND,
+        "requant_step": SAMPLE_REQUANT_STEP,
+        "within_delay": within,
+    }
+
+
+def _sample_row(path: str, written: Any, read_back: Any, tolerance: float) -> dict[str, Any]:
+    """The verification row for the whole sample block (never embeds the payloads)."""
+    written_fields = {k: v for k, v in written.items() if k != "samples"} if isinstance(written, dict) else {}
+    read_fields = {k: v for k, v in read_back.items() if k != "samples"} if isinstance(read_back, dict) else {}
+    differing = _differing_fields(written_fields, read_fields, tolerance)
+    alignment = _sample_alignment(
+        written.get("samples") if isinstance(written, dict) else None,
+        read_back.get("samples") if isinstance(read_back, dict) else None,
+    )
+    agrees = not differing and bool(alignment) and bool(alignment.get("within_delay"))
+    row: dict[str, Any] = {
+        "path": path,
+        "kind": "sample",
+        "written_fields": written_fields,
+        "read_back_fields": read_fields,
+        "differing_fields": differing[:8],
+        "payload_written_chars": len(written["samples"]) if isinstance(written, dict) and isinstance(written.get("samples"), str) else None,
+        "payload_read_back_chars": len(read_back["samples"]) if isinstance(read_back, dict) and isinstance(read_back.get("samples"), str) else None,
+        "payload_compared": alignment,
+        "agrees": agrees,
+        "channel": "state",
+    }
+    if agrees and alignment is not None and not alignment.get("exact"):
+        row["unverifiable"] = {
+            "leaf": f"{path}.samples",
+            "reason": (
+                "the plugin re-encodes the sample buffer on every state load: the read-back "
+                f"payload equals the written one delayed by {alignment.get('shift')} sample(s) "
+                f"(measured reload delay {SAMPLE_RELOAD_DELAY}), with "
+                f"{alignment.get('residual_differing')} of {alignment.get('n_samples')} samples "
+                f"moved by at most {alignment.get('residual_max_abs')} step(s) - the plugin's own "
+                "truncating int16 requantization (measured). Byte equality is not obtainable on "
+                "this channel even though the write landed; this row states what was measured."
+            ),
+        }
+    return row
 
 
 def _differing_fields(written: Any, read_back: Any, tolerance: float, prefix: str = "") -> list[str]:

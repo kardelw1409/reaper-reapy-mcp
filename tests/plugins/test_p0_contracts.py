@@ -183,10 +183,10 @@ def test_every_error_serializes_code_message_detail():
 
 def test_spec_declares_exactly_the_seven_tools():
     assert set(SPEC) == set(TOOL_NAMES)
-    # 8 since P26 added `plugin_prepare`, the universal (provider-free) discovery
-    # path. The pin moves with the round, deliberately: the count is a measurement
-    # of the surface, and the surface is what the workspace's tool cache reports.
-    assert len(TOOL_NAMES) == 8
+    # 9 since P38 added `plugin_presets` (the plugin's own preset library; the name
+    # "seven" in this test is a historical label). The pin moves with the round,
+    # deliberately: the count is a measurement of the surface.
+    assert len(TOOL_NAMES) == 9
     assert all(name.startswith("plugin_") for name in TOOL_NAMES)
 
 
@@ -210,16 +210,17 @@ def _manifest_tool_names() -> list[str]:
 def test_tool_names_disjoint_from_existing_host_tools():
     """P0-3: the plugin names intersect the existing tool set in NOTHING."""
     existing = _existing_tool_names()
-    assert len(existing) == 57, f"expected 57 existing tools, found {len(existing)}"
+    # 57 -> 59: the host surface gained two tools after the P34 pin was written
+    # (the owner's `save_project`/`new_project_tab` work - a pre-existing drift,
+    # found by P38; the pins describe the SOURCE, so they move with it).
+    assert len(existing) == 59, f"expected 59 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
-    # 57 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
-    # manifest package since E2) + 8 plugin_* (7 until P26 added plugin_prepare)
-    # = the 66 tools the running server advertises (P34 measured that count on
-    # tools/list). The pin now names every group; the earlier "57 + 8 = 65"
-    # comment silently excluded the manifest tool and went stale (P34 finding).
+    # 59 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
+    # manifest package since E2) + 9 plugin_* (8 until P38 added plugin_presets)
+    # = the 69 tools the running server advertises.
     manifest = _manifest_tool_names()
     assert manifest == ["apply_audiocpp_manifest"], manifest
-    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 66
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 69
 
 
 def test_every_mutating_tool_declares_dry_run_true():

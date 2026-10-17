@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Mapping
 
+from . import logs
 from .errors import InvalidValue, PluginError
 
 __all__ = [
@@ -48,6 +50,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "plugin_state",
     "plugin_modulation",
     "plugin_prepare",
+    "plugin_presets",
 )
 
 #: Tool-layer fault classification for an unexpected internal exception. This
@@ -233,6 +236,71 @@ SPEC: dict[str, dict[str, Any]] = {
             "counts{}, unknown_by_reason{}, cost{}, warnings[]"
         ),
     },
+    "plugin_presets": {
+        "purpose": (
+            "The plugin's OWN preset library - its built-in preset browser's files, not the "
+            "host's session presets (the plugin does not expose those). op='search' lists "
+            "presets with stable ids; op='info' shows one preset's metadata; op='apply' loads "
+            "ONE preset into the plugin (dry-run by default; a real apply is a CHAIN of verified "
+            "writes - measured 2026-10-17: ~19 s for a 3-unit apply and ~1.5 min for a 38-unit "
+            "one on a 2858-parameter instance, where every unit pays a base read, the write, a "
+            "read-back and a full parameter re-read); op='save' writes the live "
+            "plugin state to a new preset file (the file name gets a numeric suffix when it "
+            "already exists). An apply that cannot carry every part still commits and says so: "
+            "`partial: true` plus a named gap per part (a routing the running build drops, a "
+            "table or sample that would grow the engine, a value a hard rule guards). Providers "
+            "without a preset capability refuse explicitly."
+        ),
+        "args": {
+            "instance": {"type": "object", "required": True, "default": None},
+            "op": {
+                "type": "string",
+                "required": True,
+                "default": None,
+                "enum": ["search", "info", "apply", "save", "init"],
+            },
+            "query": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "search: whitespace-separated tokens, each must match the preset name, embedded name or author",
+            },
+            "style": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "search: exact style filter (the preset's own `preset_style`) ",
+            },
+            "preset": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "info/apply: the preset id from search (its path relative to the library root)",
+            },
+            "limit": {"type": "integer", "required": False, "default": 20},
+            "offset": {"type": "integer", "required": False, "default": 0},
+            "name": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "save: the new preset's name (file stem); required for save",
+            },
+            "bank": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "save: optional single folder under the user preset root",
+            },
+            "dry_run": {"type": "boolean", "required": False, "default": True},
+        },
+        "required": ("instance", "op"),
+        "destructive": True,
+        "mutating_ops": ("apply", "save", "init"),
+        "returns": (
+            "op, preset(s), counts, gaps[], plan/outcome for apply, file info for save; "
+            "`partial` and `dropped_routes` name the routings the plugin itself discarded"
+        ),
+    },
 }
 
 #: name -> body. Bodies are added by the phases that implement them; the table
@@ -330,6 +398,33 @@ def synthesize_docstring(name: str) -> str:
     )
 
 
+def _argument_shape(name: str, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """A call's arguments as SHAPE, never content: sizes, keys and scalars only.
+
+    A tool argument can carry a whole document or a control set; copying it into a log
+    would put the user's material in a diagnostic file and could dwarf the log itself.
+    Scalars (a preset id, an op, a flag, a selector) are small and are what a reader
+    needs to tell two calls apart, so they are kept verbatim.
+    """
+    shape: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            text = value if isinstance(value, bool) or not isinstance(value, str) else value
+            if isinstance(text, str) and len(text) > 120:
+                shape[key] = f"<str {len(text)} chars>"
+            else:
+                shape[key] = text
+        elif isinstance(value, Mapping):
+            shape[key] = f"<object {len(value)} keys: {','.join(sorted(str(k) for k in value)[:8])}>"
+        elif isinstance(value, (list, tuple)):
+            shape[key] = f"<list {len(value)} items>"
+        else:
+            shape[key] = f"<{type(value).__name__}>"
+    return shape
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -414,16 +509,41 @@ def setup_plugin_tools(mcp: Any, *, config: Any = None) -> None:
                     meta=identity_meta(),
                 )
 
-        tool.__name__ = name
-        tool.__doc__ = synthesize_docstring(name)
+        def logged(**kwargs: Any) -> dict[str, Any]:
+            """The tool the transport actually sees: same answer, one log line around it.
+
+            Owner's ask (2026-10-17): a call that takes minutes must be visible WHILE it
+            runs. The line is written when the call ends (duration included), the
+            per-unit progress comes from the transaction itself (see
+            `plugins/logs.py`), and neither can turn a working call into an error. The
+            argument shape is logged by KEY and SIZE - a tool argument can carry a
+            whole document, and a log is not a place to copy the user's material.
+            """
+            started = time.perf_counter()
+            answer = tool(**kwargs)
+            try:
+                logs.event(
+                    "tool",
+                    tool=name,
+                    ok=bool(answer.get("ok")),
+                    seconds=round(time.perf_counter() - started, 3),
+                    args=_argument_shape(name, kwargs),
+                    error=(answer.get("error") or {}).get("code"),
+                )
+            except Exception:  # noqa: BLE001 - logging never fails a call
+                pass
+            return answer
+
+        logged.__name__ = name
+        logged.__doc__ = synthesize_docstring(name)
         # A `**kwargs`-only function is modelled by FastMCP as ONE required field
         # called `kwargs`, so a real MCP client could never call the tool (found by
         # the P9 tests, which drive `mcp.call_tool` rather than the closure). The
         # declared signature gives the server the tool's real argument names; the
         # closure still performs its own required-argument validation, so a missing
         # argument is an envelope refusal rather than a validation error.
-        tool.__signature__ = _declared_signature(spec)
-        mcp.tool(name=name)(tool)
+        logged.__signature__ = _declared_signature(spec)
+        mcp.tool(name=name)(logged)
 
     for name in TOOL_NAMES:
         _register(name)

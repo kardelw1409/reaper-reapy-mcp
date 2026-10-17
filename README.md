@@ -146,14 +146,18 @@ plugin through a **provider** (a profile + codec pair). One provider ships today
 with a typed `UnsupportedProvider` refusal instead of failing.
 
 - `plugin_instances`: List the plugin instances on a track (fx index + identity facts)
+- `plugin_prepare`: Prepare (or reuse) the provider profile for an instance — the universal,
+  provider-free discovery path
 - `plugin_describe`: Describe the addressed instance's capability profile (controls, laws, limits)
 - `plugin_find`: Find controls by name or intent, with the live-verified identity of each match
 - `plugin_read`: Read one or more controls (display, native and normalized values)
 - `plugin_write`: Write controls and/or modulation routes — **dry run by default**
 - `plugin_state`: Inspect the plugin's internal document state (settings and routes)
 - `plugin_modulation`: List the modulation slots of the instance
+- `plugin_presets`: The plugin's **own preset library** — `search` / `info` / `apply` (dry run by
+  default) / `save`; an apply is a chain of verified writes
 
-All seven take a target selector (`track_index`, optionally `fx_index`) plus a
+All nine take a target selector (`track_index`, optionally `fx_index`) plus a
 target token where the layer supports one, and every response is the same
 envelope: schema 2, with `error` and `outcome` (`final_state`, `verdict`,
 counters) and the resolved target only in `meta`.
@@ -172,6 +176,12 @@ counters) and the resolved target only in `meta`.
   `derived_leaf_not_restored` on restore.
 - The instance's document version is gated against the provider's measured set;
   a mismatch refuses rather than writes.
+- **A write the plugin itself discards is named, not fatal** (measured laws, P38): a modulation
+  pair whose destination the running build no longer knows is accepted and then silently dropped,
+  and a single write whose growth passes the channel's band is silently ignored — both are reported
+  as named gaps (`route_dropped_by_plugin`, `growth_over_budget`) with `partial: true`, while the
+  rest of the transaction lands and verifies. A `plugin_presets` apply therefore uses the same
+  transaction machinery as any other write and never claims more than it carried.
 
 **Provider configuration (environment variables):**
 
@@ -179,6 +189,8 @@ counters) and the resolved target only in `meta`.
 | --- | --- | --- |
 | `REAPER_MCP_PLUGIN_PROVIDERS` | Comma-separated provider ids to enable (e.g. `vital`) | unset ⇒ no providers |
 | `REAPER_MCP_PLUGIN_CACHE` | Directory for the discovery/profile cache | platform cache dir |
+| `REAPER_MCP_VITAL_DATA_DIR` | The plugin's own data root (its preset library) | resolved from the plugin's config, else the platform default |
+| `REAPER_MCP_VITAL_CATALOG_DIR` | Preset catalog cache + the dropped-destination memo | platform cache dir |
 | `REAPER_MCP_VITAL_REGISTRY_DIR` | Vital sound-design registry directory | `C:\REAPER\prompts\vital_sound_design\registry` |
 
 Design and phase documentation lives in

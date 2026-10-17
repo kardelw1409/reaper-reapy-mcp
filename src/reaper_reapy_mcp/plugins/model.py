@@ -597,6 +597,10 @@ class StateWritePlan:
     units: list[StateWriteUnit] = field(default_factory=list)
     rollback_plan: list[dict[str, Any]] = field(default_factory=list)
     verification_plan: dict[str, Any] = field(default_factory=dict)
+    #: Changes the codec declined to write, each named with the measurement that
+    #: declined it (P38): a caller-visible gap, never a silent skip. The
+    #: transaction folds these into its named gaps so they reach the outcome.
+    notices: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

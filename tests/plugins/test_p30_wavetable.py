@@ -395,10 +395,17 @@ def test_the_rollback_restores_the_slot_as_a_whole_table():
     assert not [key for key in paths if WT.parse_wavetable_path(key) and key != "settings.wavetables.0"]
     # a slot that already matches is not rewritten at all
     assert "settings.wavetables.1" not in paths
-    # and the change set is plannable: the guard runs on it without refusing
+    # and the change set is plannable: the guard runs on it without refusing.
+    # P38 (measured live 2026-10-16/17): a state write is planned as GROWTH-BUDGETED
+    # batches, and a wavetable slot rides its OWN unit (its bound is the whole-table
+    # guard, not the packing estimator). So a restore change set yields several units,
+    # and the slot's note must ride the unit that addresses exactly that slot.
     plan = codec.plan_state_writes(live, changes)
-    assert len(plan.units) == 1
-    assert plan.units[0].payload["wavetable"][0]["path"] == "settings.wavetables.0"
+    assert len(plan.units) > 1
+    table_units = [unit for unit in plan.units if unit.payload.get("wavetable")]
+    assert len(table_units) == 1
+    assert set(table_units[0].payload["paths"]) == {"settings.wavetables.0"}
+    assert table_units[0].payload["wavetable"][0]["path"] == "settings.wavetables.0"
 
 
 # ---------------------------------------------------------------------------

@@ -138,7 +138,14 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: `version` stamped from the live document, because the plugin restamps it). The write
 #: channel and the file it lives in are part of what the provider declares, so the key
 #: must move (07 §3.4).
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r13"
+#: r14 (2026-10-17): the **preset library** (`preset.py`, `catalog.py`) and the codec's
+#: measured write laws (P38): a state write is planned as growth-budgeted batches (a
+#: unit that grows the document past the measured band silently does not land), the eight
+#: top-level labels are writable, and the sample block is carried/verified up to the
+#: plugin's measured 4-sample reload delay. The provider now owns a capability
+#: (`presets()`) and its label/sample write surface - both are behaviour the profile and
+#: the tool layer depend on, so the key must move (07 §3.4).
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r14"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -150,6 +157,8 @@ _PROVIDER_FILES = (
     "enum_boundaries.py",
     "source_facts.py",
     "wavetables.py",
+    "preset.py",
+    "catalog.py",
     "__init__.py",
 )
 
@@ -562,14 +571,30 @@ class VitalProvider:
                     }
                 )
                 continue
-            resolved.routes_create.append(
-                {
-                    "source": str(source),
-                    "destination": str(destination),
-                    "amount": float(amount),
-                    "bipolar": float(spec.get("bipolar") or 0.0),
-                }
-            )
+            entry = {
+                "source": str(source),
+                "destination": str(destination),
+                "amount": float(amount),
+                "bipolar": float(spec.get("bipolar") or 0.0),
+            }
+            # P38: a create may name the slot it lands in (a preset apply reproduces
+            # the file's own slot numbering, because the per-slot `modulation_N_*`
+            # amounts live at that index). The codec validates that the slot is free;
+            # a non-integer here is a typed refusal rather than a silent drop.
+            if spec.get("slot") is not None:
+                try:
+                    entry["slot"] = int(spec["slot"])
+                except (TypeError, ValueError):
+                    resolved.problems.append(
+                        {
+                            "route": dict(spec),
+                            "code": "InvalidRoute",
+                            "message": "a create's `slot` must be an integer route slot number",
+                            "detail": {"reason": "bad_slot", "slot": spec.get("slot")},
+                        }
+                    )
+                    continue
+            resolved.routes_create.append(entry)
 
         for key, target in (("routes_update", resolved.routes_update), ("routes_remove", resolved.routes_remove)):
             for spec in request.get(key) or []:
@@ -622,17 +647,21 @@ class VitalProvider:
                 target.append(entry)
 
         for path, value in dict(request.get("state") or {}).items():
-            if not str(path).startswith(f"{_STATE_ROOT}."):
+            key = str(path)
+            # Top-level LABEL paths (preset metadata) are writable since P38
+            # (measured live: all eight land and read back inside the write
+            # budget); everything else must be rooted at the document's settings.
+            if not key.startswith(f"{_STATE_ROOT}.") and key not in codec_module.LABEL_PATHS:
                 resolved.problems.append(
                     {
                         "path": path,
                         "code": "InvalidValue",
                         "message": f"state path {path!r} is not rooted at {_STATE_ROOT!r}",
-                        "detail": {"roots": [_STATE_ROOT]},
+                        "detail": {"roots": [_STATE_ROOT], "labels": list(codec_module.LABEL_PATHS)},
                     }
                 )
                 continue
-            resolved.state[str(path)] = value
+            resolved.state[key] = value
 
         # Wavetable selection (P30): the table is document state and has NO host
         # parameter (measured: the 775-control inventory holds only `*_wave_frame`,
@@ -857,6 +886,30 @@ class VitalProvider:
         a write changed. Descriptors only - never the wave data.
         """
         return {"wavetables": wavetables_module.describe_slots(document or {})}
+
+    def presets(self) -> Any:
+        """The plugin's NATIVE preset library (P38) - the capability `plugin_presets` uses.
+
+        Returns an object exposing `search/info/plan/save` (see
+        `preset.PresetCapability`). The tool layer treats a provider without this
+        hook as one without a preset capability and refuses typed - never silently.
+        """
+        from . import preset as preset_module
+
+        return preset_module.PresetCapability()
+
+    def guarded_state_paths(self, profile: dict[str, Any]) -> list[str]:
+        """State paths a DECLARED-BUT-NOT-EVALUATED hard rule refuses to enter (P38).
+
+        The transaction refuses any plan that writes one of these subjects (the
+        `fm_needs_modulator` guard), so a bulk change set - a preset apply - must
+        know them BEFORE planning and name the skip as a gap rather than let the
+        whole apply die on one control. Derived from the rules table and the
+        profile's own declared names (never re-typed here), so a new guard moves
+        this list with it.
+        """
+        mapping = rules_module._subject_paths(profile or {})
+        return sorted(set(mapping.values()))
 
     def write_order(self) -> tuple[str, ...]:
         """Fixed document -> parameters (the measured ordering rule)."""

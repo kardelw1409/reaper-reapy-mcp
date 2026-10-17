@@ -1747,6 +1747,217 @@ def _discovery_view(payload: Mapping[str, Any], *, include_controls: bool) -> di
     return view
 
 
+# ---------------------------------------------------------------------------
+# plugin_presets (the plugin's own preset library - P38)
+# ---------------------------------------------------------------------------
+
+
+def _plan_projection(plan: Any) -> dict[str, Any]:
+    """The compact plan projection shared with plugin_write's response shape."""
+    return {
+        "label": plan.label,
+        "n_items": len(plan.changes),
+        "items": [
+            {
+                "subject": item.subject,
+                "channel": item.channel,
+                "from": item.from_,
+                "to": item.to,
+                "value_space": item.value_space,
+            }
+            for item in plan.changes
+        ],
+        "write_order": list(plan.write_order),
+    }
+
+
+def _preset_carry_flag(plan_view: dict[str, Any], data: dict[str, Any]) -> None:
+    """Mark a preset apply PARTIAL whenever any part of the file was not carried.
+
+    The transaction's own `partial` covers what IT refused or lost; a preset apply can
+    also leave parts out at PLAN time (a host-owned value, a guarded rule, a table or a
+    curve the growth band refuses, a routing this build drops). In that case the live
+    state is not the file, and the response must not read as "the preset is loaded" -
+    each reason is counted here so a caller sees WHY without walking `gaps[]`.
+    """
+    gaps = list(plan_view.get("gaps") or [])
+    if not gaps:
+        return
+    reasons: dict[str, int] = {}
+    for gap in gaps:
+        reason = str(gap.get("reason") or "unspecified")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    data["partial"] = True
+    data["preset_carry"] = {
+        "gaps": len(gaps),
+        "reasons": reasons,
+        "note": (
+            "the live state is not the preset file in every part: gaps[] names each part "
+            "that was not carried, and the outcome covers what was written"
+        ),
+    }
+
+
+def plugin_presets(
+    *,
+    config: Any = None,
+    instance: Any = None,
+    op: str | None = None,
+    query: str | None = None,
+    style: str | None = None,
+    preset: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    name: str | None = None,
+    bank: str | None = None,
+    dry_run: bool = True,
+    **_: Any,
+) -> dict[str, Any]:
+    """The plugin's NATIVE preset library: search / info / apply / save.
+
+    The apply rides the SAME transaction machinery as any other write: the change
+    set is built from the preset file and the live document, the codec plans it
+    as measured growth-budgeted batches, and every unit is read back and
+    verified before the next one is sent.
+    """
+    from .tools import error_envelope, ok_envelope
+
+    operation = str(op or "").strip().lower()
+    if operation not in ("search", "info", "apply", "save", "init"):
+        raise InvalidValue(
+            f"unknown preset op {op!r}",
+            detail={"op": op, "accepted": ["search", "info", "apply", "save", "init"]},
+        )
+    if operation == "init":
+        raise InvalidValue(
+            "op='init' is not available yet: this build CONSTRUCTS its Init state in code (no "
+            "init document ships), and no measured init artifact has been recorded for this "
+            "provider. Load an init-style preset with op='apply' instead",
+            detail={"op": "init", "reason": "init_artifact_not_recorded"},
+        )
+    enabled = V.strict_bool(dry_run, "dry_run")
+    resolved_config = _config(config)
+    provider, resolution, bridge, registry, source = _resolution_any(
+        resolved_config,
+        instance,
+        require_writable=operation in ("apply", "save"),
+        tool="plugin_presets",
+    )
+    _requires_provider(source, "plugin_presets", "the plugin's own preset library")
+    hook = getattr(provider, "presets", None)
+    capability = hook() if callable(hook) else None
+    if capability is None:
+        raise UnsupportedProvider(
+            "this provider declares no preset capability",
+            detail={"provider": str(getattr(provider, "id", "?")), "tool": "plugin_presets"},
+        )
+    meta = _meta(resolution, source=source)
+    ref = resolution.instance.ref
+    data: dict[str, Any] = {"op": operation, "instance": _ref_dict(ref)}
+
+    if operation == "search":
+        data.update(capability.search(query=query, style=style, limit=limit, offset=offset))
+        return ok_envelope("plugin_presets", data, meta=meta)
+    if operation == "info":
+        if not preset:
+            raise InvalidValue(
+                "op='info' needs `preset` (an id from op='search')", detail={"op": "info"}
+            )
+        data["preset"] = capability.info(str(preset))
+        return ok_envelope("plugin_presets", data, meta=meta)
+
+    track_index, fx_index = ref.location["track_index"], ref.location["fx_index"]
+    facts = bridge.fx_facts(track_index, fx_index)
+    chunk = bridge.read_state_chunk(ref)
+    slice_ = bridge.locate_state_slice(ref, facts, chunk)
+    document = provider.codec().decode(slice_)["document"]
+
+    if operation == "save":
+        if not name:
+            raise InvalidValue(
+                "op='save' needs `name` for the new preset file", detail={"op": "save"}
+            )
+        data["saved"] = capability.save(document, name=str(name), bank=bank)
+        return ok_envelope("plugin_presets", data, meta=meta)
+
+    # -- apply ---------------------------------------------------------------
+    if not preset:
+        raise InvalidValue(
+            "op='apply' needs `preset` (an id from op='search')", detail={"op": "apply"}
+        )
+    guard_hook = getattr(provider, "guarded_state_paths", None)
+    guarded = list(guard_hook(resolution.profile) or []) if callable(guard_hook) else []
+    # A pair destination this build's plugin was measured to DROP (the slot reads back
+    # empty) is skipped at plan time: writing it again would repeat an apply that the
+    # plugin's own load discards anyway (measured P38 2026-10-17).
+    live_version = str(document.get("synth_version") or "")
+    known_drops: list[str] = []
+    drops_hook = getattr(capability, "known_dropped_destinations", None)
+    if callable(drops_hook):
+        known_drops = list(drops_hook(live_version) or [])
+    plan_view = capability.plan(
+        document,
+        str(preset),
+        guarded_paths=guarded,
+        dropped_destinations=known_drops,
+    )
+    data["preset"] = plan_view.get("preset")
+    data["counts"] = plan_view.get("counts")
+    data["gaps"] = plan_view.get("gaps") or []
+    request_body: dict[str, Any] = {"state": dict(plan_view.get("paths") or {})}
+    if plan_view.get("wavetables"):
+        request_body["wavetable"] = list(plan_view["wavetables"])
+    for key in ("routes_create", "routes_update", "routes_remove"):
+        if plan_view.get(key):
+            request_body[key] = list(plan_view[key])
+    if not any(request_body.get(key) for key in ("state", "wavetable", "routes_create", "routes_update", "routes_remove")):
+        data["note"] = "the live state already matches this preset: nothing to write"
+        return ok_envelope("plugin_presets", data, meta=meta)
+    transaction = Transaction(
+        provider=provider,
+        codec=provider.codec(),
+        bridge=bridge,
+        profile=resolution.profile,
+        ref=ref,
+        request=request_body,
+        token=resolution.instance.token,
+        registry=registry,
+        dry_run=enabled,
+        label="plugin_presets:apply",
+    )
+    result = transaction.run()
+    data.update(result.data)
+    _preset_carry_flag(plan_view, data)
+    if result.plan is not None:
+        data.setdefault("plan", _plan_projection(result.plan))
+    # Losing a pair to the plugin is a finding about THIS build, so it is remembered
+    # (keyed by the live synth version) and named - the memo only ever makes a later
+    # apply skip a routing the plugin would have dropped anyway.
+    record_hook = getattr(capability, "record_dropped_destinations", None)
+    if callable(record_hook):
+        outcome_rows = (result.data.get("outcome") or {}) if isinstance(result.data.get("outcome"), dict) else {}
+        freshly_dropped = list(result.data.get("dropped_routes") or [])
+        if not freshly_dropped:
+            freshly_dropped = [
+                gap.get("route") or {}
+                for gap in (outcome_rows.get("named_gaps") or [])
+                if isinstance(gap, dict) and gap.get("reason") == "route_dropped_by_plugin"
+            ]
+        if freshly_dropped:
+            try:
+                data["dropped_destinations_recorded"] = record_hook(
+                    freshly_dropped, synth_version=live_version, preset_id=str(preset)
+                )
+            except OSError as exc:  # a memo write must never fail an apply that landed
+                data["dropped_destinations_recorded"] = {"error": f"{exc.__class__.__name__}: {exc}"}
+    if result.ok:
+        return ok_envelope("plugin_presets", data, meta=meta, outcome=result.data.get("outcome"))
+    error = result.error or PluginError("the preset apply did not complete")
+    if isinstance(error, InvalidValue) and result.data.get("problems"):
+        data["problems"] = result.data["problems"]
+    return error_envelope("plugin_presets", error, meta=meta, outcome=result.data.get("outcome"))
+
+
 #: tool name -> production body. Registration is unconditional (AUD-013): the
 #: table is attached by `setup_plugin_tools`, and a call with no provider
 #: configured answers a typed `UnsupportedProvider` instead of being absent.
@@ -1759,6 +1970,7 @@ BODIES: dict[str, Any] = {
     "plugin_state": plugin_state,
     "plugin_modulation": plugin_modulation,
     "plugin_prepare": plugin_prepare,
+    "plugin_presets": plugin_presets,
 }
 
 

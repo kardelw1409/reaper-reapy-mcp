@@ -19,9 +19,11 @@ The engine is provider-agnostic and host-agnostic: it talks to a
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from . import dependencies as D
+from . import logs as L
 from . import plan as P
 from . import request_value
 from . import values as V
@@ -145,12 +147,17 @@ class Transaction:
         self._tracker = RevisionTracker()
         self._snapshot: StateSnapshot | None = None
         self._last_slice: Any = None
+        self._last_document: Any = None
         self._last_vector: dict[str, float] = {}
         self._last_verified: dict[str, str] = {}
         self._attempted: dict[str, set[str]] = {"state": set(), "parameters": set()}
         self._rows: dict[str, list[dict[str, Any]]] = {"state": [], "parameters": []}
         self._mismatched: dict[str, list[dict[str, Any]]] = {"state": [], "parameters": []}
         self._named_gaps: list[dict[str, Any]] = []
+        #: Route operations the plugin accepted and then silently dropped on
+        #: re-serialisation (an unknown pair name - measured behaviour, P38).
+        #: Named in the outcome like any other gap, and reported as `partial`.
+        self._dropped_routes: list[dict[str, Any]] = []
         self._resolved: ResolvedRequest | None = None
         #: The batch's unresolved-control policy: `refuse` (default, historical) or
         #: `skip` (explicit opt-in). Validated in `__init__`, before any host work.
@@ -168,6 +175,15 @@ class Transaction:
         self.binding_method = (
             "index_name_guarded_in_write_hop" if self.index_addressed else "ident_table_verified"
         )
+        #: The instance's index -> ident table and the parameter count it was read
+        #: for, cached for the transaction (see `_parameter_idents`). P38 measured
+        #: 2026-10-17: the full vector read used to pay an ident sweep (~3.0 s over
+        #: 2858 parameters) twice per state unit, which dominated a preset apply.
+        self._ident_table: list[str] | None = None
+        self._ident_count: int | None = None
+        #: The last facts Core read for the target (`_revalidate_target`), reused by
+        #: the parameter-count lookups inside one transaction.
+        self._facts: Any = None
 
     # ------------------------------------------------------------------
     # Entry point
@@ -248,11 +264,53 @@ class Transaction:
                 )
 
             units, parameter_pairs = self._build_units(live.document, resolved)
-            for unit in units:
-                self._apply_state_unit(unit)
+            # A long chain must be visible WHILE it runs (owner's ask, 2026-10-17): the
+            # log carries one line per unit with its duration, and the tool line (written
+            # by the registration closure) carries the total. Nothing here can fail the
+            # call: the writer swallows its own errors.
+            chain_started = time.perf_counter()
+            L.event(
+                "transaction.start",
+                label=self.label,
+                units=len(units),
+                parameters=len(parameter_pairs),
+                tool=(self.request or {}).get("__tool") if isinstance(self.request, dict) else None,
+            )
+            for position, unit in enumerate(units, start=1):
+                unit_started = time.perf_counter()
+                shape = {
+                    "label": self.label,
+                    "index": position,
+                    "of": len(units),
+                    "kind": unit.kind,
+                    "paths": len((unit.payload or {}).get("paths") or {}),
+                    "route": (unit.payload or {}).get("route_op", {}).get("op")
+                    if isinstance((unit.payload or {}).get("route_op"), dict)
+                    else None,
+                }
+                try:
+                    self._apply_state_unit(unit)
+                except PluginError as exc:
+                    # a unit that fails must still leave its line: a silent failure is
+                    # exactly what this log exists to make visible
+                    L.event(
+                        "unit.failed",
+                        seconds=round(time.perf_counter() - unit_started, 3),
+                        code=exc.code,
+                        **shape,
+                    )
+                    raise
+                L.event("unit", seconds=round(time.perf_counter() - unit_started, 3), **shape)
             if parameter_pairs:
                 self._apply_parameter_batch(parameter_pairs)
             self.stage = Stage.COMMIT
+            L.event(
+                "transaction.end",
+                label=self.label,
+                ok=True,
+                units=len(units),
+                seconds=round(time.perf_counter() - chain_started, 3),
+            )
             return self._result(
                 ok=True,
                 committed=True,
@@ -265,7 +323,10 @@ class Transaction:
                     "dependency_findings": [_finding_row(f) for f in plan.findings],
                     "preflight": self._preflight_evidence(),
                     "refused": list(self.refused),
-                    "partial": bool(self.refused),
+                    "partial": bool(self.refused) or bool(self._dropped_routes),
+                    # A pair the plugin's own load would drop too: named, never
+                    # implied to have landed (`partial` covers it as well).
+                    "dropped_routes": list(self._dropped_routes),
                     "read_cost_next": {
                         "needed": 0,
                         "why": "this response already contains the read-back of everything it changed",
@@ -273,6 +334,7 @@ class Transaction:
                 },
             )
         except PluginError as exc:
+            L.event("transaction.error", label=self.label, code=exc.code, stage=str(self.stage.value))
             return self._handle_error(exc, plan)
 
     # ------------------------------------------------------------------
@@ -509,6 +571,7 @@ class Transaction:
             )
         slice_, document = self._read_state()
         self._last_slice = slice_
+        self._last_document = document
         self._check_document_version(document)  # P8: the live version gates the write
         routes = list((document or {}).get("routes") or [])
         readback = self._read_planned_parameters(resolved)
@@ -603,7 +666,25 @@ class Transaction:
             state_units: list[StateWriteUnit] = []
         else:
             changes = P.state_changes(resolved)
-            state_units = list(self.codec.plan_state_writes(document, changes).units)
+            state_plan = self.codec.plan_state_writes(document, changes)
+            state_units = list(state_plan.units)
+            # A codec may decline a change it cannot land (P38: the sample block whose
+            # growth exceeds the measured write budget). Declined changes are NAMED
+            # here so the outcome says what was not done and why - never silently.
+            for notice in getattr(state_plan, "notices", []) or []:
+                self._named_gaps.append(
+                    {
+                        "channel": "state",
+                        "reason": str(notice.get("reason") or "codec_notice"),
+                        "path": notice.get("path"),
+                        "detail": notice.get("message"),
+                        "evidence": {
+                            key: value
+                            for key, value in notice.items()
+                            if key not in {"reason", "path", "message"}
+                        },
+                    }
+                )
         pairs = self._parameter_pairs(resolved)
         self._require_bound_parameters(resolved, pairs)
         declared = tuple(stage for stage in self.write_order if stage != "verify")
@@ -636,7 +717,11 @@ class Transaction:
         self.stage = Stage.STATE_WRITE
         self._check_cancel()
         self._revalidate()
-        current_slice, current_document = self._read_state()
+        # The revalidation just read (and decoded) this unit's base state, and the
+        # write below is guarded against a chunk that moved since: a second read of
+        # the same chunk would buy nothing and cost one host round trip per unit.
+        current_slice = self._last_slice
+        current_document = self._last_document
         new_block = self.codec.encode_slice(current_document, unit, current_slice)
         self._attempted["state"].add(text_digest(new_block.block_text))
 
@@ -652,10 +737,35 @@ class Transaction:
         self._mismatched["state"].extend(report.mismatched)
         self._establish_effect()
         if not report.ok:
-            raise WriteNotApplied(
-                "the state write was accepted by the host but the read-back does not agree",
-                detail={"unit": unit.order_index, "mismatched": report.mismatched, "space": report.space},
-            )
+            if _route_dropped_by_plugin(unit, report):
+                # Measured plugin behaviour (P38, 2026-10-17): a modulation PAIR whose
+                # source/destination the running build no longer carries (a name from
+                # an older preset format) is accepted by the host and then SILENTLY
+                # dropped by the plugin on re-serialisation - the slot comes back
+                # empty. That is exactly what the plugin's own GUI load does with such
+                # a preset, so the layer mirrors it: the write is verified (the drop
+                # IS the finding), the pair is named as a gap, and the rest of the
+                # transaction continues. Every other non-landing unit still refuses.
+                self._named_gaps.append(
+                    {
+                        "channel": "state",
+                        "reason": "route_dropped_by_plugin",
+                        "route": (unit.payload or {}).get("route_op"),
+                        "detail": (
+                            "the write was accepted and the plugin dropped the pair on "
+                            "re-serialisation (an unknown source/destination name is skipped "
+                            "silently - measured), so the slot is unchanged; this is the same "
+                            "outcome the plugin's own preset load produces"
+                        ),
+                        "mismatched": report.mismatched,
+                    }
+                )
+                self._dropped_routes.append(dict(unit.payload.get("route_op") or {}))
+            else:
+                raise WriteNotApplied(
+                    "the state write was accepted by the host but the read-back does not agree",
+                    detail={"unit": unit.order_index, "mismatched": report.mismatched, "space": report.space},
+                )
         self._last_slice = readback_slice
         self._last_verified["state"] = text_digest(readback_slice.block_text)
         # a document write can reset ordinary parameters (measured behaviour),
@@ -847,6 +957,12 @@ class Transaction:
     def _revalidate_target(self) -> None:
         facts = self._fresh_facts()
         self.registry.revalidate(self.token.id, facts)  # TargetChanged, never re-targets
+        if self._ident_count is not None and facts.param_count != self._ident_count:
+            # a different parameter count means a different table: drop the cache
+            # rather than pair cached idents with live values
+            self._ident_table = None
+            self._ident_count = None
+        self._facts = facts
 
     def _revalidate(self) -> None:
         """Token + expected revision before every write unit / parameter batch."""
@@ -859,9 +975,10 @@ class Transaction:
             )
             self._tracker.check(observed)  # StateConflict before that unit's write
             return
-        slice_, _ = self._read_state()
+        slice_, document = self._read_state()
         vector = self._read_full_parameter_vector()
         self._last_slice = slice_
+        self._last_document = document
         self._last_vector = vector
         observed = StateRevision.compute(state_channel=slice_.block_text, parameters=vector)
         self._tracker.check(observed)  # StateConflict before that unit's write
@@ -928,28 +1045,56 @@ class Transaction:
         return slice_, document
 
     def _param_count(self) -> int | None:
-        facts = self._read(
-            self.bridge.fx_facts, self.ref.location["track_index"], self.ref.location["fx_index"]
-        )
+        facts = self._facts
+        if facts is None:
+            facts = self._read(
+                self.bridge.fx_facts, self.ref.location["track_index"], self.ref.location["fx_index"]
+            )
+            self._facts = facts
         return facts.param_count
+
+    def _parameter_idents(self) -> list[str]:
+        """The instance's index -> ident table, measured ONCE per transaction.
+
+        Measured live 2026-10-17 (P38): one ident sweep of the 2858-parameter
+        instance costs **3.03 s** (`TrackFX_GetParamIdent` is ~1.06 ms per index)
+        while the value read of the same size costs 0.46 s. The transaction reads
+        the full vector around every state write, so the ident sweep - not the
+        values - dominated a preset apply (~6 s of ~8 s per unit).
+
+        The table is a property of the loaded instance, and the cache is bounded by
+        the same guard the rest of the engine uses: the target is re-validated
+        before every unit (`TargetChanged` aborts), and a host-reported parameter
+        count that differs from the cached one drops the table instead of pairing
+        stale idents with live values.
+        """
+        count = self._param_count()
+        if count is None:
+            raise SnapshotUnavailable(
+                "the host does not report a parameter count", detail={"field": "param_count"}
+            )
+        if self._ident_table is not None and self._ident_count == count:
+            return self._ident_table
+        indices = list(range(count))
+        idents = self._read(self.bridge.param_idents, self.ref, indices)
+        if any(ident is None for ident in idents):
+            raise SnapshotUnavailable(
+                "a parameter has no durable ident; the vector cannot be captured",
+                detail={
+                    "missing": [index for index, ident in zip(indices, idents) if ident is None]
+                },
+            )
+        self._ident_table = [str(ident) for ident in idents]
+        self._ident_count = count
+        return self._ident_table
 
     def _read_full_parameter_vector(self) -> dict[str, float]:
         if self.index_addressed:
             # The index path's capture scope is the planned set (see `capture_scope`),
             # so "the vector" means that set - read in one hop.
             return self._read_planned_vector()
-        count = self._param_count()
-        if count is None:
-            raise SnapshotUnavailable(
-                "the host does not report a parameter count", detail={"field": "param_count"}
-            )
-        indices = list(range(count))
-        idents = self._read(self.bridge.param_idents, self.ref, indices)
-        if any(ident is None for ident in idents):
-            raise SnapshotUnavailable(
-                "a parameter has no durable ident; the vector cannot be captured",
-                detail={"missing": [index for index, ident in zip(indices, idents) if ident is None]},
-            )
+        idents = self._parameter_idents()
+        indices = list(range(len(idents)))
         values = self._read(self.bridge.read_params, self.ref, indices)
         if len(values) != len(indices):
             raise SnapshotUnavailable(
@@ -1102,6 +1247,10 @@ class Transaction:
         failure_stage = self.stage
         self.stage = Stage.ROLLBACK
         self._rollback = RollbackReport(attempted=True, why=f"{exc.code}: {exc.message}")
+        # A rollback is a chain of writes of its own and can run for a minute: the log
+        # carries its boundaries so a failed call's timeline is readable end to end.
+        rollback_started = time.perf_counter()
+        L.event("rollback.start", label=self.label, cause=exc.code, stage=str(failure_stage.value))
         failed_loudly = False
         state_ok = False
         parameters_ok = False
@@ -1138,6 +1287,13 @@ class Transaction:
             self._named_gaps.append(_gap("parameters", f"{restore_exc.code}: {restore_exc.message}"))
 
         restored = {"state": state_ok, "parameters": parameters_ok}
+        L.event(
+            "rollback.end",
+            label=self.label,
+            seconds=round(time.perf_counter() - rollback_started, 3),
+            channels=restored,
+            loud=failed_loudly,
+        )
         # Only the channels this provider declared are judged: a channel that was
         # never in scope contributes neither to `verified` nor to the verdict -
         # and it is named in the outcome instead (see `_assemble_snapshot`).
@@ -1583,6 +1739,47 @@ def _changes_are_empty(changes: Any) -> bool:
 
 def _gap(channel: str, reason: str) -> dict[str, Any]:
     return {"channel": channel, "reason": reason}
+
+
+def _route_dropped_by_plugin(unit: Any, report: Any) -> bool:
+    """True when a route operation failed verification because the PLUGIN skipped it.
+
+    Measured behaviour (P38, 2026-10-17): a modulation pair whose source or
+    destination the running build no longer knows is accepted by the host and then
+    dropped on re-serialisation, so the slot reads back **completely empty** - no
+    source, no destination, and the op's own fields back at their defaults. The
+    plugin's own preset load does exactly the same with such a preset, so the
+    layer must mirror it rather than roll the whole transaction back.
+
+    The shape is what makes this decidable, and it is deliberately narrow:
+
+    * the unit is a route op (only a route unit's rows are pair rows);
+    * every row belongs to a resolved slot AND every pair field reads back empty -
+      a single field that landed is a REAL verification failure, not a drop;
+    * the unresolved-slot row (no field at all) is not a drop either.
+
+    Anything else keeps the historical refusal + rollback path.
+    """
+    route_op = (unit.payload or {}).get("route_op")
+    if not isinstance(route_op, dict) or route_op.get("op") not in ("create", "update"):
+        return False
+    if not report.mismatched:
+        return False
+    pair_absent = False
+    for row in report.rows:
+        subject = row.get("subject")
+        if not isinstance(subject, dict) or subject.get("route") is None:
+            return False
+        field = row.get("field")
+        if field in ("source", "destination"):
+            if row.get("read_back") not in ("", None):
+                # part of the pair landed: the plugin did NOT drop it whole
+                return False
+            pair_absent = True
+        elif field is None:
+            # the "slot present" probe row - the slot itself is not addressable
+            return False
+    return pair_absent
 
 
 def _finding_row(finding: Any) -> dict[str, Any]:

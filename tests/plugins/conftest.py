@@ -33,6 +33,18 @@ def _pin_offline_calibration(monkeypatch):
     monkeypatch.setenv("REAPER_MCP_VITAL_CALIBRATION", _CALIBRATION_OFF)
     monkeypatch.setenv("REAPER_MCP_VITAL_ENUM_BOUNDARIES", _CALIBRATION_OFF)
 
+
+@pytest.fixture(autouse=True)
+def _pin_offline_log_dir(tmp_path_factory, monkeypatch):
+    """Keep the run log out of the user's real log directory.
+
+    The layer writes one JSON line per tool call and per write unit (so a long call is
+    visible while it runs). Hermetic means the suite writes those lines into a temporary
+    directory instead of `%LOCALAPPDATA%`: an offline test pass must not touch - or
+    sweep - the logs of a real session.
+    """
+    monkeypatch.setenv("REAPER_MCP_LOG_DIR", str(tmp_path_factory.mktemp("run-logs")))
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
 HERE = Path(__file__).resolve().parent

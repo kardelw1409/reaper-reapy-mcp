@@ -59,6 +59,17 @@ def create_server(debug: bool = True) -> FastMCP:
         plugin_preload.preload_from_env()
     except Exception:  # noqa: BLE001 - a preload that cannot run must not stop the server
         logging.getLogger(__name__).warning("plugin profile preload did not run", exc_info=True)
+    # The plugin layer's own run log: one JSON line per tool call and per write unit, so a
+    # call that takes minutes is visible while it runs. The sweep keeps a retention window
+    # (24 h by default) over OUR files only, and it runs here - at server start - so a log
+    # directory cannot grow across sessions. Both are best-effort by construction.
+    try:
+        from reaper_reapy_mcp.plugins import logs as plugin_logs
+
+        swept = plugin_logs.sweep()
+        plugin_logs.event("server.start", swept=swept, log_dir=swept.get("directory"))
+    except Exception:  # noqa: BLE001 - diagnostics must never stop the server
+        logging.getLogger(__name__).warning("plugin run log could not be prepared", exc_info=True)
     # REAPER's own error boxes freeze EVERY call - a modal blocks all reapy
     # communication (measured; T-01 in the reference troubleshooting map). The
     # dialog guard answers the boxes this project knows (render errors, render

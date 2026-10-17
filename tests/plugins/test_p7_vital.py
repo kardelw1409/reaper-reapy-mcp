@@ -308,8 +308,13 @@ def test_codec_refuses_a_corrupt_block_and_an_unrooted_path():
     assert type(excinfo2.value).__name__ == "Unreadable"
 
     doc = document()
+    # A top-level LABEL path is writable since P38 (measured live 2026-10-17: all
+    # eight labels land and read back inside the measured write budget); a path
+    # outside the document's roots is still refused with the roots named.
+    VC.set_path(doc, "author", "x")
+    assert doc["author"] == "x"
     with pytest.raises(InvalidValue) as excinfo3:
-        VC.set_path(doc, "author", "x")
+        VC.set_path(doc, "not_settings.foo", "x")
     assert excinfo3.value.detail["roots"] == ["settings"]
     with pytest.raises(InvalidValue):
         VC.set_path(doc, "settings.modulations.99.destination", "x")
@@ -404,7 +409,7 @@ def test_profile_from_the_pinned_registry_is_schema_valid_and_cacheable():
     assert build.cacheable, build.validation.codes()
     assert build.source_digest and build.provider_artifact_digest
     assert build.provider_revision == IMPLEMENTATION_REVISION
-    assert len(provider.artifact_paths()) == 10  # 9 -> 10 in P30: wavetables.py
+    assert len(provider.artifact_paths()) == 12  # 10 -> 12 in P38: preset.py, catalog.py
 
     assert profile["provider"] == "vital"
     assert profile["identity"]["fingerprint"]["param_count"] == 8
@@ -564,10 +569,25 @@ def test_v5_unknown_route_vocabulary_is_refused_before_any_write():
 def test_unrooted_state_path_and_missing_slot_are_refused():
     provider = provider_on_fixtures()
     profile = provider.build_profile(dict(IDENTITY))
-    resolved = provider.normalize_request(profile, {"state": {"author": "x"}, "routes_remove": [{}]})
+    resolved = provider.normalize_request(profile, {"state": {"not_settings.x": 1}, "routes_remove": [{}]})
     codes = sorted(problem["code"] for problem in resolved.problems)
     assert codes == ["InvalidRoute", "InvalidValue"]
     assert resolved.state == {}
+
+
+def test_label_state_paths_are_accepted_since_p38():
+    """Preset metadata (the eight top-level labels) is addressable state.
+
+    Measured live 2026-10-17 (P38): all eight labels land and read back while the
+    write stays inside the growth budget, so a preset apply can carry them.
+    """
+    provider = provider_on_fixtures()
+    profile = provider.build_profile(dict(IDENTITY))
+    resolved = provider.normalize_request(
+        profile, {"state": {"preset_name": "X", "author": "Y", "macro1": "Z"}}
+    )
+    assert resolved.problems == []
+    assert resolved.state == {"preset_name": "X", "author": "Y", "macro1": "Z"}
 
 
 def test_structural_change_refuses_when_a_disable_target_cannot_be_addressed():

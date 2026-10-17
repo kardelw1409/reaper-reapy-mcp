@@ -4455,3 +4455,285 @@ that survives a prune.
    files are. 12 §11 carries the corrected counts; doc 14 §5 now points at the current policy.
 5. No commits were made in this round: the P28-P32 work is still staged/unstaged, exactly as the
    brief required.
+
+## 39. P38 - the plugin's own preset library, and the four write laws the chunk channel enforces (2026-10-16/17)
+
+**The ask.** Give the agent search / inspect / apply / save of Vital's **native** preset browser
+through the existing MCP - as an extension of the V3 plugin layer, not a second server. Owner's
+constraints, given before any code: universal mechanism (no Vital-shaped API in Core), **no machine
+paths** in the code, presets must simply load (the model picks one and it lands), a save collision
+gets an auto-suffix, and standing permission for live probes on the sandbox instance (track 15 /
+index 14). The research half was read-only; the brief is `docs/vital-preset-browser-research-brief.md`,
+its report `docs/universal-plugin-mcp-v3/21-vital-preset-browser-research.md` (§10.5/§10.6 are the
+laws below), and every measurement lives outside the repository under
+`%LOCALAPPDATA%\reaper_reapy_mcp\run_artifacts\…__vital-preset-research__*` (P32 policy).
+
+### 39.1 What the layer can and cannot reach (research round)
+
+- The host's preset channels are **blind for this plugin** (measured): `TrackFX_GetPresetIndex` → `-1`,
+  `numberOfPresetsOut = 4`, `TrackFX_GetPreset` → `''`, `EnumTrackMIDIProgramNamesEx` → 0. The
+  plugin's own browser library is therefore the only real preset surface, and it is a filesystem one.
+- The plugin's library is `~/Documents/Vital/User/Presets/**`: **2226 `.vital` files, 2.19 GB**, 125
+  authors, versions 0.8.6…1.5.5, and **549 of them carry no embedded `preset_name`** - the file name
+  is the name. The plugin's own `Vital.library` index disagrees with the directory (4451 date entries
+  for 2226 files): it is never used.
+- A `.vital` file **is** the engine document (single-line JSON, sorted keys), so an apply is a
+  document diff - and the diff must travel the **state channel** that P30/P33 measured.
+
+### 39.2 The four measured laws (every one of them enforced in code)
+
+| Law | Measurement | Consequence in the layer |
+|---|---|---|
+| **Batch growth budget** | one write of +168 and up silently does not land; the same changes split into 27 small batches all land (776/777 controls equal) | `plan_state_writes` greedy-packs by an estimated growth budget (`BATCH_GROWTH_BUDGET = 12`) |
+| **Block-text boundary** (`probe_growth_boundary.py`, `…180238Z…4872`) | +24/+32/+40/+40/+44 land, +48/+56/+64 do not; every run restored (`matches_capture`) | a **single** path above `SINGLE_PATH_GROWTH_LIMIT = 36` is not attempted at all - it is a named gap |
+| **Sample reload delay** | every landed write shifts the sample payload by exactly 4 samples | a restore pre-advances the captured payload by `SAMPLE_RELOAD_DELAY = 4` (byte-exact restore) |
+| **Unknown pair name is dropped** (`probe_route_name_vs_growth.py`, `…180410Z…39280`) | a destination the build does not know is accepted (Δ +36) and read back `''`; the same shape with a known name (Δ +44) lands | route ops tolerate exactly the "whole pair came back empty" shape as a named gap; the destination is remembered per build |
+
+The last law is the one that made an untouched preset fail: **18 of the chosen preset's 42 routings
+target names this build no longer knows** (`modulation_N_amount` / `modulation_N_power`,
+`reverb_decay_time`, `reverb_high_shelf_gain`, `osc_2_spectral_morph_amount`) - routing a macro into
+another modulation's depth. The plugin's own GUI load drops them identically.
+
+### 39.3 The shipped mechanism
+
+| Piece | What it is |
+|---|---|
+| `providers/vital/preset.py` (new) | portable data root (env override → the plugin's own config key → platform default; nothing machine-specific), `safe_join`, head/tail metadata, `change_set` (differences only + a **named gap** for every part it cannot carry), atomic `save_document` with auto-suffix |
+| `providers/vital/catalog.py` (new) | the search index, deliberately OUTSIDE the Capability Profile: its own directory, its own reader revision, key = library digest (relpath/size/mtime_ns); 2226 files scan in ~0.6 s cold |
+| `codec.py` | growth-budgeted batching; route ops ride **first** (so the file's `modulation_N_*` values overwrite a create's defaults); labels writable; sample whole-block under budget; `SINGLE_PATH_GROWTH_LIMIT`; `_growth_of` |
+| `transaction.py` | `_route_dropped_by_plugin` (the narrow drop tolerance), `StateWritePlan.notices` → named gaps, `dropped_routes`, honest `partial` |
+| `api.py` | the `plugin_presets` body (search/info/apply/save/init) + `_preset_carry_flag`: an apply that could not carry every part is **partial** with its reasons counted |
+| `provider.py` | revision `vital-provider-2026.10-r14`, `artifact_paths()` 12 files (both new modules are behaviour-affecting), `presets()` hook, `guarded_state_paths()` |
+| `tools.py` | `plugin_presets` in `TOOL_NAMES` (9 plugin tools; 59 host + 1 manifest + 9 = 69 registered) |
+| drops memo | `%LOCALAPPDATA%\reaper_reapy_mcp\presets\vital_destination_drops.json`, keyed by the live `synth_version`: the next apply skips a routing this build was measured to drop |
+
+An apply is a **plain transaction**: dry-run by default, one unit at a time, each read back and
+verified, dependency rules evaluated, rollback on a real failure.
+
+### 39.4 Offline verification
+
+| check | result |
+|---|---|
+| `py -3.11 -m pytest -q -p no:cacheprovider tests/plugins --ignore=tests/plugins/live` | **1003 passed, 2 skipped** |
+| new test files | `test_p38_presets.py` (32), `test_p38_preset_batching.py` (15), `test_p38_route_drops.py` (9), `test_p38_preset_carry_flag.py` (3) |
+| pins moved with the round (deliberately) | tools 8 → 9, `artifact_paths` 10 → 12, provider revision r13 → r14, batched-unit assertions in `test_p30_wavetable.py`, `author` is now a writable label in `test_p7_vital.py` |
+| hermeticity | every library is built in `tmp_path`; no real preset, host or `%LOCALAPPDATA%` state is read |
+
+The route-drop tests are the interesting ones: they drive a **real transaction** over the mock host
+with a codec double that reproduces the measured behaviour (a slot-addressed create whose pair the
+plugin re-serialises empty) and assert the two sides of the tolerance - the dropped pair continues as
+a named gap, while a pair that landed with the wrong depth still refuses and rolls back.
+
+### 39.5 Live acceptance (the sandbox instance, 1.5.5)
+
+Four runs, each capturing the document first and restoring it afterwards (the last one: `restore
+matches_capture = true, changed_paths = 0`, digest identical to the capture):
+
+| run | evidence | outcome |
+|---|---|---|
+| A `…174320Z…37744` | before the dependency fix | dry run refused: `fm_needs_modulator`/`route_into_off_filter` unevaluable |
+| B `…175534Z…12656` | first write attempt | dry run ok (113 controls, 14 lfos, 8 labels, 42 creates, 2 tables declined); apply failed at **unit 3**, 153.9 s - the first dropped pair |
+| C `…181644Z…21984` | with the drop tolerance | 18 drops named as gaps and the chain continued; failed at **unit 84**: `settings.lfos.2.points` grew +192 and read back unchanged (the single-path growth law) |
+| D `…184137Z…32708` | final | **`ok: true, committed: true`, 656.4 s** |
+
+Run D in numbers: comparison against the preset file **772 controls equal, 0 float-representation
+differences, 3 mismatches** - and the three are exactly the named gaps (`beats_per_minute`, host-owned;
+`osc_1/osc_2_distortion_type`, the two `fm_needs_modulator`-guarded values). Blocks: `lfos` 4/8,
+`custom_warps` 3/3, `random_values` 3/3, `modulations` 36/64 (18 dropped routings + 10 curves whose
+`line_mapping` the provider does not write). Labels: `preset_name` and `author` landed (growing
+8 labels to 7), `comments` was refused by the growth band (+725). Save: a 175 677-byte file into a
+**temporary** library root, round-trip document equal, second save auto-suffixed `_2`. Second dry run:
+`routes_skipped_known_drop = 18` - the memo turned the measured drops into up-front skips.
+
+The `partial` semantics were then fixed and measured on the cheap channel
+(`probe_p38_partial_dry_run.py`, `…185448Z…33344`, dry run only): `partial: true`,
+`preset_carry = {gaps: 29, reasons: {destination_dropped_by_plugin: 18, growth_over_budget: 5,
+guarded_rule_subject: 2, wavetable_growth_refused: 2, host_owned_parameter: 1,
+modulation_curve_not_carried: 1}}`, `write_calls_attempted = 0`, document digest unchanged. The
+recorded apply (run D) predates that flag, so its own `partial: false` must be read as "the plan the
+transaction received carried everything it contained", not as "the preset is fully loaded".
+
+### 39.6 What the layer refuses to claim
+
+A preset apply names every part it could not carry, with the measurement behind it:
+`host_owned_parameter` (the tempo follows the project), `guarded_rule_subject` (a hard rule that is
+declared but not evaluable refuses any plan entering its setting), `growth_over_budget` (a value whose
+own growth is beyond the band - the whole element, never half of a curve),
+`wavetable_growth_refused` (the P30 whole-table guard), `destination_dropped_by_plugin` /
+`route_dropped_by_plugin` (the plugin's own load would drop it), `inactive_slot_text_skipped`,
+`modulation_curve_not_carried` (no `line_mapping` writes are declared), and
+`derived_leaf_not_restored` on a rollback. None of them is silent, and none of them fails an apply
+that otherwise landed.
+
+### 39.7 The wavetable channel, measured against the corpus (2026-10-17, after an owner's ear test)
+
+The owner loaded `LD - Future Saw` (through this layer) and reported it sounding like a plain init saw.
+Two separate facts were behind that, and only one of them was a defect in the answer:
+
+1. **That preset carries no wavetable at all** - all three slots hold the Init table, and the file
+   changes **30 controls** (compressor, EQ, `filter_fx`, reverb, volume, polyphony, portamento) while
+   leaving every `osc_*` at Init. Applied 30/30, document == file on 772 keys, and the THREE VIEWS
+   agree: the live document, the live parameter channel (read through the profile's own laws) and the
+   file say the same thing. It is a thin preset, faithfully installed - the saw is what the file is.
+2. **A preset that DOES carry a wavetable cannot be honoured.** Measured on a stratified sample of the
+   library (`probe_p38_wavetable_corpus.py`, 150 files, stride 14 over the size-sorted 2226):
+
+   | measurement | value |
+   |---|---|
+   | presets whose every slot is the Init table (apply cleanly) | **23 / 150** |
+   | presets carrying at least one CUSTOM table | **127 / 150 (85 %)** |
+   | custom tables in the sample | 246 (123 single-frame, 123 multi-frame) |
+   | tables that pass the measured guard | **6** |
+   | tables refused | **240** (all 123 multi-frame ones among them) |
+   | custom payload bytes | min 649 / **median 87 856** / max 1 469 727 |
+   | measured-safe payload (`VERIFIED_PAYLOAD_BYTES`) | 11 159 |
+
+   The six that pass are single-frame tables whose payload is exactly the Init size (11 149-11 159 B) -
+   a same-size replacement, which the channel accepts (padding is length-preserving, the sample block
+   uses the same rule). Everything else is **growth**, and growth is the measured failure mode: a
+   growing payload does not land, and one such attempt with a mismatched `version` aborted REAPER
+   (P30, `wavetables.py`). The empirical consequence is blunt: **a preset that relies on its wavetable
+   sounds like whatever table the slot already holds (Init), while the outcome says `partial: true`
+   with a named `wavetable_growth_refused` gap.** `House Bass` (applied earlier in the same session)
+   is exactly that case: 1 custom 8-frame table, declined, gap named.
+
+**What this means for the layer's claims.** An apply is faithful for: the controls, the elements
+(`lfos`, `custom_warps`, `random_values`), the labels, the routings the build accepts, the sample block
+under the growth budget, and a wavetable **only when it does not grow the slot** (in practice: a
+same-size single-frame table, or a slot the plugin itself already loaded - then the cap rises to what
+the engine holds). It is NOT faithful for a preset's multi-frame ("3D") table, and that is the majority
+of the library. The layer never claims otherwise (the gap is named), but the gap is a sentence in a
+list, and the sound is what a user judges.
+
+**Open question this measurement raises, stated as a question and not as a plan.** The plugin's own
+browser loads such a table with no trouble (it reads the file directly), so the limit is about THIS
+channel, not about the plugin's capacity. The measured landing band is razor-thin (+44 lands, +48 does
+not) which is a strange shape for a buffer limit; a framing / length-field explanation for it has not
+been tested. If that explanation turns out to hold, table-bearing presets become installable and this
+section becomes the record of a defect rather than of a limit. The next measurement is a probe that
+varies the growth in ONE item-B field at a time (length field, line count, artifact bytes) and reads
+back each time.
+
+### 39.8 Residuals, stated plainly
+
+1. The **first** apply pays for not knowing which destination names the build accepts (the profile
+   lists 316; a part of them are gone). Every measured drop is remembered per build, so a
+   second apply of the same material skips them up front - one or two applies converge per preset.
+2. A chain costs what its units cost (see 39.9): the price per unit is a base read, the write, the
+   read-back and a **full 2858-value parameter re-read**, which the measured "a document write
+   resets ordinary parameters" law requires. That law is why the vector is read around every write,
+   and a `test_p2_transaction` test pins the guarantee it buys (an external parameter change between
+   units refuses as `StateConflict`) - so the saving came from reading the SAME data more cheaply,
+   never from reading less.
+3. `op="init"` stays a typed refusal (`init_artifact_not_recorded`): this build CONSTRUCTS its Init
+   state in code, and no measured init artifact exists to load. An init-style preset applies normally.
+4. A preset's `beats_per_minute` and `tuning` are not applicable by construction (host tempo /
+   document-only), and a very long `comments` string cannot travel the channel at all (+725 growth).
+5. The research report's §10.1 boundary interval is corrected to (+44, +48]; §10.5/§10.6 are the new
+   laws and the memo; §10.7 records the cost law and the requantization finding; §11 keeps the open
+   items (the true destination set of a build is not readable, only measurable).
+6. No commits were made and no existing file was removed in this round.
+
+### 39.9 What one state unit costs, and the three fixes that followed (2026-10-17 evening)
+
+**The measurement.** A per-primitive timing probe (`probe_p38_unit_cost.py`, `…191320Z…`) timed every
+read one unit pays on the live instance:
+
+| primitive | median | note |
+|---|---|---|
+| `param_idents` (2858) | **3.03 s** | one host call per index (~1.06 ms each) |
+| `read_params` (2858) | 0.46 s | the values themselves |
+| `fx_facts` | 0.28 s | reads the whole track chunk internally |
+| `read_state_chunk` | 0.063 s | |
+| `locate_state_slice` | 0.094 s | |
+| `codec.decode` | 0.0016 s | |
+
+A unit read the **full vector twice** (before its write, and once more to re-baseline after it - the
+measured reset law), so ~6 s of the ~7.9 s per unit was the ident sweep: an unchanged table, read
+again for the same loaded instance. That is the whole of the 656 s measured in 39.5.
+
+**Fix 1 - the ident table is read once per transaction** (`_parameter_idents`): it is a property of
+the loaded instance, the target is re-validated before every unit (`TargetChanged` aborts, measured),
+and a host-reported parameter count that differs from the cached one drops the table. The values are
+still read around every write - the saving is the table, not the monitoring.
+
+**Fix 2 - one base read per unit, not two** (`_apply_state_unit`): the unit's own revalidation already
+read and decoded the base state, and the write is guarded against a chunk that moved since, so the
+second read of the same chunk bought nothing. Pinned by `tests/plugins/test_p38_read_cost.py`
+(exactly `1 + 2 x units` chunk reads, one ident sweep whatever the chain length).
+
+**Defect found while measuring - a landed sample write was reported as failed.** The unit that failed
+the first timed apply was the sample block, and the row said why: the payload came back delayed by
+the measured 4 samples **and requantized** - 1060 of 44096 samples moved by exactly ±1 LSB (2.4%).
+Three earlier applies had landed a 44100-sample payload with a residual of ZERO, so the old verdict
+(0.5 % tolerance) passed those and failed this one. The ±1 LSB band is the plugin's own truncating
+int16 re-encode (the same 2.5 % measured in Stage B), so the verdict now reads: landed at the
+measured delay, every difference one step and inside the measured band - and the row names the counts.
+`tests/plugins/test_p38_sample_requant.py` pins both sides (the measured case passes; a payload moved
+two steps, beyond the band, or past the delay still fails).
+
+**Fix 3 - the batch budget is calibrated, not guessed** (`probe_p38_batch_calibration.py`). The
+packer sizes a batch with an ESTIMATE (serialized JSON chars) while the channel enforces a real
+BLOCK delta; the calibration measured the conversion on the real document: a control estimated at
+14..16 lands at a real +20..24, i.e. **real ~= 1.4 x estimate**. At the old budget of 12 a typical
+control's own estimate exceeded it, so **every control rode its own unit** (21 batches for a 43-path
+diff). Measured alternatives: budget 24 -> 12 batches (max real +25), 36 -> 6 batches (max real +45,
+AT the measured cliff of +44/+48), 48 -> 4 batches (+65, over). The budget is now 24 and the
+conversion is a named constant (`GROWTH_ESTIMATE_TO_REAL`, `MEASURED_LANDING_BAND`) so the packing
+constants are CHECKED against the measured cliff in the suite instead of trusted.
+
+**What the fixes bought (live, same instance, shipped `plugin_presets` body):**
+
+| run | before | after |
+|---|---|---|
+| `House Bass` (11 controls + sample + 2 tables, 3 units) | failed at the sample write | **ok, committed, 19.0 s** |
+| `LD - Future Saw` (Lead, 57 controls + 4 labels + 3 wavetable slots, 5 units) | - | **ok, committed, 23.2 s**; 771 controls equal, all labels landed, the three tables match the file's own (init tables, same `table_id`) |
+| unit cost (a state unit, measured from the run log) | 7.9 s projected | **2.4-4.8 s** (payload-dependent) |
+| a control-heavy chain | 656 s / ~85 units | units cut ~1.75x by the packing fix on top of the per-unit saving |
+| comparison against the preset file | 3 named gaps | **770-771 controls equal, 1 mismatch** (the file carries no `preset_name` key in one case, and the host owns `beats_per_minute` in both) |
+
+**The run log** (`plugins/logs.py`, `%LOCALAPPDATA%\reaper_reapy_mcp\logs\mcp-YYYY-MM-DD.log`): one JSON
+line per tool call (duration, argument SHAPE - never content) and per unit (`index`, `of`, `kind`,
+`paths`, `seconds`), plus `unit.failed` when a unit refuses. Retention is swept at server start and at
+most hourly (default 24 h, `REAPER_MCP_LOG_RETENTION_HOURS`), and the sweep only touches this layer's
+own `mcp-*.log` files. This is what made the 19 s run readable line by line:
+
+```
+transaction.start units=3
+unit index=1 of=3 kind=state paths=11 seconds=2.763
+unit index=2 of=3 kind=state paths=1  seconds=4.769
+unit index=3 of=3 kind=state paths=1  seconds=4.722
+transaction.end ok=true units=3 seconds=12.258
+```
+
+**A cancelled tool call is not a cancelled write.** The first `plugin_presets(op=\"apply\")` of this
+session was cancelled in the editor; the server-side call kept running and applied the preset with the
+pre-optimisation read path (the instance carried `author = "SNFK"` afterwards, and the next probe
+measured 0 differing controls). Reads are safe to cancel; a cancelled WRITE call is not - the layer
+already reports an unverified write as an unknown effect, and this is the same fact from the client
+side. Recording it here so the next measurement starts by checking for a concurrent writer
+(`probe_p38_instance_stability.py` does exactly that, read-only).
+
+**One live symptom stays open, with its evidence.** The control-heavy chain (Cyberline, 38 units) ran
+at ~2.8 s per unit and failed at **unit 34** - a 43-path control batch whose read-back showed 38 of its
+paths unchanged, i.e. the plugin kept its previous serialization for that unit (the measured
+"write silently ignored" symptom). A read-only reproduction of that packing on the live document
+(`probe_p38_batch_diagnosis.py`) measures that batch at estimate 19 / real delta 25, with every one of
+the 16 batches at most 32 - so the batch is inside the band when planned against the document the plan
+was built on, and something about the document **as it stands after 33 route units** made it not land.
+Two candidate mechanisms are recorded rather than guessed: the slots whose pair the plugin discards
+(read back as `0.0` for `modulation_N_amount` on empty slots - the same silent-drop family as 39.8's
+route drop), and a possible total-size effect on a document that those creates had grown by ~2 kB. The
+next measurement is a two-writer-free run that captures the block before and after that unit. The
+rollback itself behaved: the instance came back to a committable state and the preset the owner asked
+for applied cleanly afterwards (19.2 s, `ALL_VERIFIED`).
+
+**The next lever, named and not taken.** A unit still pays a full vector read **twice** - once after
+its write (to re-baseline, because the write reset the parameters) and once in the next unit's own
+revalidation. The two reads are the same data a moment apart, so the post-write one could be dropped
+and the baseline adopted from the next unit's read whenever the state channel matches what the write
+verified (which is the justification the post-write read has). Measured value: 0.46 s of a ~2.8 s
+unit (~16 %), i.e. ~17 s on the 38-unit chain. It is left undone because it changes the revision
+tracker's contract ("the expected revision advances only from this transaction's own verified
+read-back"), and that contract has its own tests; doing it needs a measurement of what an external
+parameter write in that window does today, which the post-write read presently absorbs anyway.
