@@ -465,7 +465,8 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": (
             "op, path, described (name/length/channels/payload), controls sent, controls_skipped, "
             "notes[] (how a value was delivered when it took two writes), outcome; op='read' adds "
-            "the sampler's current control values"
+            "the sampler's current control values. A plan never carries the payload: the block in a "
+            "preview reports `payload_chars`, and the material itself goes to the write"
         ),
     },
 }

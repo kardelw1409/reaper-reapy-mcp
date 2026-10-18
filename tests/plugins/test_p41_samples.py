@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import array
 import base64
+import json
 import struct
 import sys
 import wave
@@ -697,6 +698,75 @@ def test_the_informational_marker_is_what_separates_a_note_from_a_gap():
     assert A._informational_notice(None) is False
     assert A._value_refused([{"path": "settings.sample", "evidence": {"informational": True}}], "settings.sample") is False
     assert A._value_refused([{"path": "settings.sample"}], "settings.sample") is True
+
+
+def test_a_dry_run_plan_reports_the_payload_size_not_the_payload(vital_api, monkeypatch):
+    """MEASURED (2026-10-18, live): a dry run answered 6,457,749 characters of `state_paths`.
+
+    The plan for one 12-second stereo load carried 99.87 % of a 6,466,384-character answer as the
+    two base64 payloads - inside a PREVIEW, which is a summary by definition, and after the request
+    had already named the material by file path. The value still goes to the WRITE in full (that is
+    what `test_a_load_lands_the_block_and_verifies_it` reads back out of the plugin); the answer
+    describes it in `op="read"`'s own vocabulary instead.
+    """
+    host = host_with(document_with_sample(length=512))
+    monkeypatch.setattr(A, "_BRIDGE", host)
+    payload = [((index * 37) % 2000) - 1000 for index in range(4096)]
+    envelope = A.plugin_sample(
+        config=vital_api,
+        instance=dict(INSTANCE),
+        op="load",
+        samples=payload,
+        sample_rate=44_100,
+        dry_run=True,
+    )
+    assert envelope["ok"] is True, envelope.get("error")
+    block = envelope["data"]["preview"]["state_paths"]["settings.sample"]
+    assert set(block) == {"name", "length", "sample_rate", "payload_chars"}, block
+    assert block["length"] == 4096
+    assert block["payload_chars"] == {
+        "samples": len(base64.b64encode(array.array("h", payload).tobytes()).decode("ascii"))
+    }
+    # the whole answer is now the plan and its rows - not the material
+    assert len(json.dumps(envelope)) < 20_000
+
+
+def test_only_the_sampler_block_is_summarized():
+    """Every other state value keeps its own shape - the hook is about the payload, not values."""
+    assert VS.summarize_block({"name": "x", "length": 3, "other": [1, 2]}) == {
+        "name": "x",
+        "length": 3,
+        "other": [1, 2],
+    }
+    assert VS.summarize_block(4.0) == 4.0
+    assert VS.summarize_block(None) is None
+
+
+def test_the_providers_hook_summarizes_the_sampler_path_only():
+    from reaper_reapy_mcp.plugins.providers.vital import provider as VP
+
+    provider = VP.VitalProvider()
+    block = {"name": "x", "length": 3, "samples": "AAAA", "samples_stereo": "BBBBBB"}
+    summarized = provider.summarize_state_value("settings.sample", block)
+    assert summarized["payload_chars"] == {"samples": 4, "samples_stereo": 6}
+    assert "samples" not in summarized and "samples_stereo" not in summarized
+    assert provider.summarize_state_value("settings.sample.name", block) == summarized
+    cutoff = {"value": 40.0}
+    assert provider.summarize_state_value("settings.filter_1_cutoff", cutoff) is cutoff
+
+
+def test_a_provider_without_the_hook_keeps_its_preview_verbatim():
+    """The summarizer is OPTIONAL: a provider that declares nothing is not summarized at all."""
+    from reaper_reapy_mcp.plugins import transaction as TR
+
+    class Bare:
+        pass
+
+    class Fake:
+        provider = Bare()
+
+    paths = {"settings.sample": {"samples": "AAAA"}, "settings.osc_1_on": 1.0}
+    assert TR.Transaction._summarized_paths(Fake(), paths) == paths
 
 
 def test_a_load_that_only_switches_the_sampler_on_still_names_the_chain(vital_api, monkeypatch):

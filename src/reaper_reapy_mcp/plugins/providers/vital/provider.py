@@ -935,6 +935,22 @@ class VitalProvider:
 
         return samples_module.SampleCapability()
 
+    def summarize_state_value(self, path: str, value: Any) -> Any:
+        """What a PREVIEW may carry for one state path (P41): the payload's SIZE, not the payload.
+
+        A preview says what would change; a sampler block's value IS the PCM, and one dry run
+        answered 6.46 MB of base64 for a 12-second stereo file (measured 2026-10-18) - which no
+        caller can act on, and which the request already named by file path. Only the sampler's
+        own block is touched, and the WRITE is untouched: the units carry the block in full.
+        """
+        from . import samples as samples_module
+
+        slot = samples_module.SampleCapability().slot_path()
+        text = str(path)
+        if text == slot or text.startswith(f"{slot}."):
+            return samples_module.summarize_block(value)
+        return value
+
     def guarded_state_paths(self, profile: dict[str, Any]) -> list[str]:
         """State paths a DECLARED-BUT-NOT-EVALUATED hard rule refuses to enter (P38).
 

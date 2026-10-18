@@ -51,6 +51,7 @@ __all__ = [
     "describe",
     "read_riff_wav",
     "read_wav",
+    "summarize_block",
 ]
 
 #: Caller-facing knob -> the provider's own control id. The vocabulary is the PROFILE's
@@ -538,3 +539,24 @@ class SampleCapability:
 
     def read(self, document: Any) -> dict[str, Any]:
         return describe(document)
+
+
+def summarize_block(value: Any) -> Any:
+    """A sample block with its PAYLOAD replaced by its size - what a plan summary may carry.
+
+    MEASURED (2026-10-18, live): a dry-run `plugin_sample(op="load")` answered 6,457,749
+    characters of `preview.state_paths["settings.sample"]` - 99.87 % of a 6,466,384-character
+    answer - and all of it the two base64 payloads the request had ALREADY named by file path.
+    The value still travels in full to the write (that is what a block is for); only the ANSWER
+    summarizes it, in the vocabulary `op="read"` uses (`payload_chars`), so a plan and a read
+    describe a block the same way.
+    """
+    if not isinstance(value, dict):
+        return value
+    summary = {key: item for key, item in value.items() if key not in codec_module.SAMPLE_PAYLOAD_KEYS}
+    payload_chars = {
+        key: len(value[key]) for key in codec_module.SAMPLE_PAYLOAD_KEYS if key in value
+    }
+    if payload_chars:
+        summary["payload_chars"] = payload_chars
+    return summary

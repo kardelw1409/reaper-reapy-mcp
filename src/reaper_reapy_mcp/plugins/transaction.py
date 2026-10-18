@@ -1568,6 +1568,20 @@ class Transaction:
     # Result assembly
     # ------------------------------------------------------------------
 
+    def _summarized_paths(self, paths: dict[str, Any]) -> dict[str, Any]:
+        """The preview's state values, summarized by the provider when it declares how (P41).
+
+        A preview says WHAT would change, and for the sampler the value IS the payload: a dry run
+        of a 12-second stereo load answered 6,457,749 characters of base64 (measured 2026-10-18,
+        99.87 % of the answer). The PLAN is untouched - the units still carry the whole value -
+        and only the provider decides what a summary may hold, so no plugin vocabulary enters
+        this layer and a provider that declares nothing keeps every value verbatim.
+        """
+        hook = getattr(self.provider, "summarize_state_value", None)
+        if not callable(hook) or not paths:
+            return dict(paths)
+        return {str(path): hook(str(path), value) for path, value in paths.items()}
+
     def _preview(self, live: P.LiveState, resolved: ResolvedRequest) -> dict[str, Any]:
         changes = (
             P.state_changes(resolved)
@@ -1575,7 +1589,7 @@ class Transaction:
             else {"paths": {}, "routes_create": [], "routes_update": [], "routes_remove": []}
         )
         return {
-            "state_paths": changes["paths"],
+            "state_paths": self._summarized_paths(changes["paths"]),
             "routes_create": changes["routes_create"],
             "routes_update": changes["routes_update"],
             "routes_remove": changes["routes_remove"],
