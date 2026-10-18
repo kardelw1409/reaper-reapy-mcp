@@ -601,7 +601,7 @@ def change_set(
         if live_settings.get(key) != value:
             carry(state_path, value, "controls")
 
-    for block in ("lfos", "custom_warps", "random_values"):
+    for block in codec_module.ELEMENT_BLOCKS:
         before = set(paths)
         _diff_element(block, live_settings.get(block), file_settings.get(block), paths)
         added = [row for row in paths if row not in before]

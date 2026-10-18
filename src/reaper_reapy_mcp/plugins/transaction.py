@@ -831,6 +831,45 @@ class Transaction:
                 )
                 self._dropped_routes.append(dict(unit.payload.get("route_op") or {}))
             else:
+                # MEASURED (P43, live 2026-10-18): a plugin may CANONICALISE a written value on
+                # load - a preset's LFO curve with a duplicate x came back with the point
+                # zeroed - and the state then holds bytes this layer never sent. The rollback's
+                # external-change rule called that state FOREIGN and skipped the restore
+                # (`not_restored (external_change)`, `FAILED_AND_NOT_RESTORED`) although nothing
+                # but our own write had happened. When the divergence from the INTENDED document
+                # lies entirely inside this unit's own paths, the state IS our write as the
+                # plugin re-serialized it: recognised, counted, named - so the rollback may
+                # restore over it. Anything outside our paths keeps the rule's old answer.
+                reserialized = self._plugin_reserialized(unit, readback_document, current_document)
+                if reserialized is not None:
+                    self._attempted["state"].add(text_digest(readback_slice.block_text))
+                    # The measured side effect of our own state write (a document write resets
+                    # ordinary parameters) moves the VECTOR too, so the parameter channel is
+                    # recognised on the same evidence: the reset is this write's own doing. The
+                    # digest is recorded, never assumed - the restore still verifies every value
+                    # it writes, and without this the incident left the parameters as the plugin
+                    # had reset them (`not_restored (external_change)`, measured live).
+                    try:
+                        self._attempted["parameters"].add(
+                            _vector_digest(self._read_full_parameter_vector())
+                        )
+                    except PluginError:
+                        pass
+                    self._named_gaps.append(
+                        {
+                            "channel": "state",
+                            "reason": "plugin_reserialized_write",
+                            "paths": reserialized,
+                            "detail": (
+                                "the write did not verify, and the state diverges from the "
+                                "intended document ONLY within this unit's own paths - it is "
+                                "the plugin's re-serialization of our write, not a foreign "
+                                "change, so the rollback is allowed to restore over it (the "
+                                "parameter vector is recognised on the same evidence: a state "
+                                "write resets ordinary parameters - measured)"
+                            ),
+                        }
+                    )
                 raise WriteNotApplied(
                     "the state write was accepted by the host but the read-back does not agree",
                     detail={"unit": unit.order_index, "mismatched": report.mismatched, "space": report.space},
@@ -846,6 +885,42 @@ class Transaction:
         self._tracker.advance_from_verified_readback(
             StateRevision.compute(state_channel=readback_slice.block_text, parameters=fresh)
         )
+
+    def _plugin_reserialized(self, unit: StateWriteUnit, observed: Any, base: Any) -> list[str] | None:
+        """The paths where `observed` diverges from THIS unit's own intended write.
+
+        Returns that list when every differing path is one the unit itself wrote (`[]` when the
+        plugin re-serialized the value back to exactly what was written), and `None` when the
+        state diverged OUTSIDE the unit's write or the codec cannot compute the comparison - a
+        provider is never credited with a recognition it cannot make.
+
+        The comparison is the codec's own differ over the space it writes, against the intended
+        document built by the codec's own `apply_intended_values`. "Only inside our own paths"
+        is the strongest evidence available without a second host write: a foreign change
+        confined to exactly the paths this unit wrote, in the moment between its write and its
+        read-back, would be indistinguishable - and it is the state the transaction was about to
+        compensate anyway.
+        """
+        apply_hook = getattr(self.codec, "apply_intended_values", None)
+        differ = getattr(self.codec, "differing_paths", None)
+        values = dict((unit.payload or {}).get("paths") or {})
+        if not callable(apply_hook) or not callable(differ) or not values:
+            return None
+        intended = copy.deepcopy(base)
+        try:
+            apply_hook(intended, values)
+            differing = [str(path) for path in differ(observed, intended)]
+        except PluginError:
+            return None
+        own = {str(path) for path in values}
+
+        def _covered(path: str) -> bool:
+            # A unit writes a VALUE, and a value may be a list: the differ names the LEAF that
+            # moved (`settings.lfos.0.points.1`), so a difference is inside our own write when
+            # the unit wrote that path itself or an ANCESTOR of it.
+            return any(path == owner or path.startswith(f"{owner}.") for owner in own)
+
+        return None if any(not _covered(path) for path in differing) else differing
 
     def _apply_parameter_batch(self, pairs: list[tuple[Any, ...]]) -> None:
         self.stage = Stage.PARAMETER_WRITE

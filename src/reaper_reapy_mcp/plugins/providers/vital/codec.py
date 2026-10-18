@@ -131,6 +131,12 @@ ROUTE_SLOTS = 64
 #: name it instead of quietly claiming a complete restore.
 DERIVED_LEAVES: tuple[str, ...] = ("settings.sample.samples",)
 
+#: The list-valued settings blocks whose elements are ONE value: the plugin re-serializes an
+#: element's arrays against its own `num_points`, so an element is written whole and restored whole
+#: (P43, measured: a capture SHORTER than the live array left four extra values behind when the
+#: restore was expressed leaf by leaf).
+ELEMENT_BLOCKS: tuple[str, ...] = ("lfos", "custom_warps", "random_values")
+
 #: Top-level metadata keys a preset carries OUTSIDE `settings` (measured corpus
 #: layout). They are writable labels - measured live 2026-10-17 (P38): all eight
 #: land and read back exactly while the write stays inside `BATCH_GROWTH_BUDGET`.
@@ -1381,6 +1387,27 @@ class VitalCodec:
         for label in LABEL_PATHS:
             if label in document and live.get(label) != document[label]:
                 leaves[label] = document[label]
+        # LIST elements are restored as ONE value, not leaf by leaf (P43, measured offline from the
+        # live incident): `flat_paths` names list entries by INDEX, so a captured array SHORTER
+        # than the live one left its extra tail in place - the live `lfos[0].points` kept four
+        # values the capture never had while every leaf row verified, and a restore that did that
+        # was not restoring the same shape the forward apply writes (`_diff_element` writes an
+        # element's field as a WHOLE value). The element is a value again here; a differing one is
+        # restored whole, an equal one is simply not restored.
+        for block in ELEMENT_BLOCKS:
+            captured_block = settings.get(block)
+            if not isinstance(captured_block, list):
+                continue
+            for index, element in enumerate(captured_block):
+                element_path = f"{MUTABLE_ROOT}.{block}.{index}"
+                for path in [
+                    key
+                    for key in leaves
+                    if key == element_path or key.startswith(f"{element_path}.")
+                ]:
+                    leaves.pop(path, None)
+                if dig(live, element_path) != element:
+                    leaves[element_path] = element
         # The sample block: its payload leaf is plugin-derived (excluded above), but
         # a WHOLE-block restore is what makes a rollback of a preset apply complete.
         # The captured payload is pre-advanced by the measured reload delay, because
@@ -1390,6 +1417,44 @@ class VitalCodec:
         if isinstance(sample, dict) and dig(live, SAMPLE_PATH) != sample:
             leaves[SAMPLE_PATH] = _sample_restore_value(sample)
         return {"paths": leaves, "derived_excluded": excluded}
+
+    def _writable_view(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Every path a state write may address as ``{path: value}`` - the space a foreign change
+        would appear in.
+
+        Plugin-derived leaves (`DERIVED_LEAVES`) are excluded: the plugin re-derives them on
+        every load whether or not this layer wrote anything (`settings.sample.samples` drifts by
+        its measured reload delay), so a difference there can neither confirm nor deny a foreign
+        change. A wavetable slot is ONE value - its leaves are not write targets.
+        """
+        document = doc["document"] if isinstance(doc, dict) and "document" in doc else doc
+        if not isinstance(document, dict):
+            return {}
+        settings = document.get("settings") if isinstance(document.get("settings"), dict) else {}
+        view = flat_paths({MUTABLE_ROOT: settings})
+        for path in [key for key in view if wavetables_module.parse_wavetable_path(key)]:
+            view.pop(path, None)
+        for path in DERIVED_LEAVES:
+            view.pop(path, None)
+        tables = settings.get(wavetables_module.SETTINGS_KEY)
+        if isinstance(tables, list):
+            for index, table in enumerate(tables):
+                view[f"{MUTABLE_ROOT}.{wavetables_module.SETTINGS_KEY}.{index}"] = table
+        for label in LABEL_PATHS:
+            if label in document:
+                view[label] = document[label]
+        return view
+
+    def differing_paths(self, a: dict[str, Any], b: dict[str, Any]) -> list[str]:
+        """The writable paths where two decoded documents disagree (P43).
+
+        The differ the transaction's external-change recognition needs: it answers "did anything
+        outside this unit's own paths move" over exactly the space this codec writes. A path
+        present on one side only counts as a difference (a removed table must not read as equal).
+        """
+        left = self._writable_view(a)
+        right = self._writable_view(b)
+        return sorted(path for path in set(left) | set(right) if left.get(path) != right.get(path))
 
     # -- internals ----------------------------------------------------------
 
