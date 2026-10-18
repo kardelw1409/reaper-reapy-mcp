@@ -5369,7 +5369,7 @@ delay, a growing load riding the balloon pair, and the two-source refusal) and
 the row shape, and a differing embedded name kept). `test_p0_contracts.py`'s surface pins moved
 10 -> 11 tools and 70 -> 71 total.
 
-### 43.6 The WAV reader had to grow: sample packs are FLOAT (same day, after the owner's first try)
+### 43.5 The WAV reader had to grow: sample packs are FLOAT (same day, after the owner's first try)
 
 The owner ran the tool on his own sample pack and it refused the file. Two measurements came out of
 that one call:
@@ -5397,6 +5397,45 @@ the code it found.
 **1137 passed, 2 skipped** after the reader (43.4 recorded 1132); `test_p41_samples.py` grew to 32
 tests, including float32/float64/extensible/24-bit/truncated/unknown-code cases written by hand
 (the stdlib cannot WRITE float WAVs, so the tests build those headers byte by byte).
+
+### 43.6 The answer was 41 % boilerplate: an output budget for the envelope
+
+The owner, reading a `plugin_sample(op="read")` answer: "the output is huge, it will eat your
+context". Measured rather than argued - a `plugin_sample` read was **4165 characters** as the MCP
+server serializes it, and the pieces were:
+
+| block | before | after |
+|---|---|---|
+| `meta` | 2156 | 1646 |
+| `data.controls` | 1086 | 256 |
+| a static prose note inside `data` | 153 | 0 |
+| **total** | **4165** | **2438 (-41 %)** |
+
+Three things were boilerplate:
+
+* **the identity/continuity disclosure**: 716 characters of prose (`why` + `consequence`), repeated
+  verbatim in `meta` of EVERY response of EVERY tool. The audit requirement stays - a caller must see
+  what a target token does NOT establish without asking - so the compact form (450 characters) keeps
+  every field that carries the claim (`validated`, `not_claimed`, `reason`, the evidence id, and a
+  one-sentence consequence) and `plugin_describe` gained the prose as its ONE home. The evidence is
+  named by its id there (the corpus' naming rule), by path in the prose;
+* **empty fields and duplication**: `refusals: []`, `quarantined: []`, `warnings: []`, `reason: null`,
+  `capped: 0`, and a `startup.directory` that repeats the parent of `cache.path` - all dropped from the
+  wire form. "An empty list says nothing a caller can act on" is the rule, applied in `_meta`;
+* **static explanation inside payloads**: the sampler's "an ordinary state block" sentence and the
+  wavetable read's paragraph about single-frame tables are identical on every call, so they moved into
+  the two tool descriptions (where an agent reads them once).
+
+The `read` op's controls also stopped mirroring the profile's full record: `{control_id: display}` is
+what a caller acts on and what `plugin_write` accepts (1086 -> 256 characters), and a caller who wants
+`normalized`/`unit`/`law` calls `plugin_read`, which is the tool that serves them.
+
+`tests/plugins/test_p41_output_budget.py` (6 tests) pins all of it: the compact claim carries every
+field, the prose is still reachable and is never a different claim, the compact form is under 65 % of
+the prose, the static sentences live in the tool descriptions, and the two `_meta` trim rules are
+visible in the source so re-adding `refusals: []` to every answer fails a test instead of slipping in.
+
+**1143 passed, 2 skipped** (43.5 recorded 1137).
 
 ### 43.7 What is NOT closed, stated plainly
 
