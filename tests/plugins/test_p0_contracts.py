@@ -215,15 +215,18 @@ def test_tool_names_disjoint_from_existing_host_tools():
     # 57 -> 59: the host surface gained two tools after the P34 pin was written
     # (the owner's `save_project`/`new_project_tab` work - a pre-existing drift,
     # found by P38; the pins describe the SOURCE, so they move with it).
-    assert len(existing) == 59, f"expected 59 existing tools, found {len(existing)}"
+    # 59 -> 63 (P42): REAPER's OWN FX preset store became reachable - get_fx_presets,
+    # set_fx_preset, navigate_fx_presets, save_fx_preset. A different store from
+    # `plugin_presets` (the plugin's built-in browser), so the names do not collide.
+    assert len(existing) == 63, f"expected 63 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
-    # 59 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
+    # 63 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
     # manifest package since E2) + 11 plugin_* (8 until P38 added plugin_presets,
     # 9 until P40 added plugin_wavetable, 10 until P41 added plugin_sample) = the tools
     # the running server advertises.
     manifest = _manifest_tool_names()
     assert manifest == ["apply_audiocpp_manifest"], manifest
-    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 71
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 75
 
 
 def test_every_mutating_tool_declares_dry_run_true():

@@ -17,16 +17,18 @@ from controllers.midi_controller import MIDIController
 from controllers.audio_controller import AudioController
 from controllers.master_controller import MasterController
 from controllers.project_controller import ProjectController
+from controllers.preset_controller import PresetController
 
 # Create a combined controller that inherits from all controllers
 class ReaperController(
     TrackController,
     FXController,
     MarkerController,
-    MIDIController, 
+    MIDIController,
     AudioController,
     MasterController,
     ProjectController,
+    PresetController,
     BaseController  # BaseController must be last
 ):
     """Controller for interacting with Reaper using reapy.

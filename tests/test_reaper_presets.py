@@ -1,0 +1,253 @@
+"""REAPER's own FX preset store, offline: the measured format, held still.
+
+MEASURED (2026-10-18, live machine, `presets/vst3-Vital.ini`, 4 presets): `[General]` with
+`NbPresets=N`, then one `[PresetK]` per preset whose keys are `Data`, `Data_1`, ... (uppercase hex,
+32,770 characters = 16,385 bytes per full chunk), `Len` (payload bytes) and `Name`. The decoded
+payload reaches the ASCII `VstW` marker at ~offset 48, i.e. it is the FX's VST3 state - the same
+bytes a track chunk carries as item A + item B.
+
+These tests are hermetic: no host, no REAPER resource path, no file outside `tmp_path`. The live
+channel (`get_fx_presets` / `set_fx_preset` / `save_fx_preset`) is verified through the MCP tools.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils.reaper_presets import (  # noqa: E402
+    PRESET_CHUNK_BYTES,
+    append_preset,
+    extract_fx_state,
+    parse_preset_library,
+    preset_names,
+    render_preset_section,
+)
+
+
+def library_text(*presets: tuple[str, bytes], nb_presets: int | None = None) -> str:
+    """A preset file in REAPER's own shape, built by the same renderer the writer uses."""
+    lines = ["[General]", f"NbPresets={len(presets) if nb_presets is None else nb_presets}", ""]
+    for index, (name, data) in enumerate(presets):
+        lines.extend(render_preset_section(index, name, data))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def sample_data(size: int = 40, seed: int = 3) -> bytes:
+    return bytes(((index * 37 + seed) % 256) for index in range(size))
+
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+
+
+def test_the_measured_shape_parses_into_names_sizes_and_a_count():
+    text = library_text(("BassHouse", b"x" * 100), ("Bass 808", b"y" * 50))
+    parsed = parse_preset_library(text)
+    assert parsed["problems"] == [], parsed["problems"]
+    assert parsed["nb_presets"] == 2
+    assert [preset["name"] for preset in parsed["presets"]] == ["BassHouse", "Bass 808"]
+    assert [preset["index"] for preset in parsed["presets"]] == [0, 1]
+    assert [preset["len"] for preset in parsed["presets"]] == [100, 50]
+    assert preset_names(text) == [
+        {"index": 0, "name": "BassHouse", "bytes": 100, "section": "Preset0"},
+        {"index": 1, "name": "Bass 808", "bytes": 50, "section": "Preset1"},
+    ]
+
+
+def test_a_payload_that_disagrees_with_len_is_a_problem_not_a_pass():
+    """`Len` is the payload size in BYTES: the cheapest consistency probe the format offers."""
+    text = library_text(("BassHouse", b"x" * 100))
+    broken = text.replace("Len=100", "Len=101")
+    problems = parse_preset_library(broken)["problems"]
+    assert [row["reason"] for row in problems] == ["payload_size_disagrees_with_len"]
+    assert problems[0]["len"] == 101 and problems[0]["data_chars"] == 200
+
+
+def test_junk_lines_are_reported_rather_than_skipped():
+    text = "[General]\nNbPresets=1\n\nthis is not a key\n[Preset0]\nData=00\nLen=1\nName=x\n"
+    problems = parse_preset_library(text)["problems"]
+    assert [row["reason"] for row in problems] == ["not_a_key_value"]
+
+
+def test_a_preset_without_a_name_is_reported():
+    text = "[General]\nNbPresets=1\n\n[Preset0]\nData=00\nLen=1\n"
+    problems = parse_preset_library(text)["problems"]
+    assert [row["reason"] for row in problems] == ["preset_without_name"]
+
+
+# ---------------------------------------------------------------------------
+# Writing (the renderer)
+# ---------------------------------------------------------------------------
+
+
+def test_the_renderer_writes_the_measured_chunking():
+    data = sample_data(PRESET_CHUNK_BYTES + 17)
+    lines = render_preset_section(2, "BassHouse", data)
+    assert lines[0] == "[Preset2]"
+    keys = [line.split("=", 1)[0] for line in lines[1:]]
+    assert keys == ["Data", "Data_1", "Len", "Name"]
+    first, second = (line.split("=", 1)[1] for line in lines[1:3])
+    assert len(first) == PRESET_CHUNK_BYTES * 2 == 32_770, "a full chunk is 16,385 bytes of hex"
+    assert len(second) == 17 * 2
+    assert first == data[:PRESET_CHUNK_BYTES].hex().upper(), "uppercase hex, as REAPER writes it"
+    assert lines[3] == f"Len={len(data)}"
+    assert lines[4] == "Name=BassHouse"
+
+
+def test_the_renderer_refuses_what_it_cannot_write():
+    with pytest.raises(ValueError):
+        render_preset_section(-1, "x", b"data")
+    with pytest.raises(ValueError):
+        render_preset_section(0, "   ", b"data")
+    with pytest.raises(ValueError):
+        render_preset_section(0, "x", b"")
+
+
+def test_appending_adds_one_section_and_moves_only_the_count():
+    first = ("BassHouse", sample_data(64, seed=1))
+    second = ("Bass 808", sample_data(PRESET_CHUNK_BYTES + 3, seed=2))
+    text = library_text(first, second)
+    payload = sample_data(200, seed=9)
+    result = append_preset(text, "New Sound", payload)
+    assert result["index"] == 2
+    assert result["section"] == "Preset2"
+    assert result["nb_presets_before"] == 2 and result["nb_presets_after"] == 3
+    assert "NbPresets=3" in result["text"]
+    # every existing section survives verbatim; only the count line moves
+    assert text[text.index("[Preset0]") :].rstrip("\n") in result["text"]
+    # and the new section reads back with the payload it was given
+    rows = preset_names(result["text"])
+    assert [row["name"] for row in rows] == ["BassHouse", "Bass 808", "New Sound"]
+    assert rows[2]["bytes"] == len(payload)
+    parsed = parse_preset_library(result["text"])
+    assert parsed["problems"] == [], parsed["problems"]
+    section = [preset for preset in parsed["presets"] if preset["name"] == "New Sound"][0]
+    assert section["data_chars"] == len(payload) * 2
+
+
+def test_appending_to_an_empty_or_absent_file_starts_the_library():
+    result = append_preset("[General]\nNbPresets=0\n", "First", sample_data(10))
+    assert result["index"] == 0 and result["nb_presets_after"] == 1
+    assert [row["name"] for row in preset_names(result["text"])] == ["First"]
+
+
+def test_appending_refuses_a_file_whose_format_is_not_the_measured_one():
+    """Better to refuse than to append to something REAPER would then misread."""
+    with pytest.raises(ValueError) as bad:
+        append_preset("[General]\nNbPresets=x\n[Preset0]\nName=x\n", "New", sample_data(4))
+    assert "measured format" in str(bad.value)
+
+
+def test_appending_refuses_a_file_without_a_count_key():
+    with pytest.raises(ValueError) as bad:
+        append_preset("[Preset0]\nData=00\nLen=1\nName=x\n", "New", sample_data(4))
+    assert "NbPresets" in str(bad.value)
+
+
+# ---------------------------------------------------------------------------
+# Reading an FX's state out of a track chunk (the payload a preset stores)
+# ---------------------------------------------------------------------------
+
+
+def block(class_id: str, module: str, item_a: bytes, item_b: bytes, name: str = "Synth") -> str:
+    """A plugin block in the measured chunk layout (header, item A, item B, terminator)."""
+    import base64
+
+    a = base64.b64encode(item_a).decode("ascii")
+    b = base64.b64encode(item_b).decode("ascii")
+    return "\n".join([f'<VST "{name}" {module} 0 "" {{{class_id}}} ""', a, b, ">"])
+
+
+CLASS_A = "56535456697461766974616C00000000"
+CLASS_B = "11112222333344445555666677778888"
+
+
+def chunk_with(*blocks: str, extra: str = "") -> str:
+    return "<TRACK\nNAME \"Track 1\"\n" + extra + "\n".join(blocks) + "\n>\n"
+
+
+def test_the_state_is_item_a_followed_by_item_b():
+    item_a, item_b = b"a" * 44, b"b" * 300
+    chunk = chunk_with(block(CLASS_A, "Vital.vst3", item_a, item_b))
+    state = extract_fx_state(chunk, 0)
+    assert state["data"] == item_a + item_b
+    assert state["item_a_bytes"] == 44 and state["item_b_bytes"] == 300
+    assert state["class_hex"] == CLASS_A and state["module"] == "Vital.vst3"
+    assert state["matches"] == 1
+
+
+def test_the_ordinal_picks_among_identical_builds_and_identity_filters_first():
+    one = block(CLASS_A, "Vital.vst3", b"1" * 44, b"first")
+    two = block(CLASS_A, "Vital.vst3", b"2" * 44, b"second")
+    other = block(CLASS_B, "Other.vst3", b"3" * 44, b"other")
+    chunk = chunk_with(one, other, two)
+    # without an identity the ordinal is the chunk's block order - the track's FX slots
+    assert extract_fx_state(chunk, 0)["data"].endswith(b"first")
+    assert extract_fx_state(chunk, 1)["data"].endswith(b"other")
+    assert extract_fx_state(chunk, 2)["data"].endswith(b"second")
+    # with an identity the ordinal counts only the MATCHING blocks
+    assert extract_fx_state(chunk, 0, class_hex=CLASS_B)["data"].endswith(b"other")
+    assert extract_fx_state(chunk, 0, module="Vital.vst3")["matches"] == 2
+    assert extract_fx_state(chunk, 1, module="Vital.vst3")["data"].endswith(b"second")
+    # an identity that matches nothing is refused, never resolved to "the only one there"
+    with pytest.raises(ValueError):
+        extract_fx_state(chunk, 0, module="Absent.vst3")
+
+
+def test_the_ordinal_outside_the_matches_is_refused():
+    chunk = chunk_with(block(CLASS_A, "Vital.vst3", b"1" * 44, b"first"))
+    with pytest.raises(ValueError) as bad:
+        extract_fx_state(chunk, 1)
+    assert "ordinal" in str(bad.value)
+
+
+def test_a_chunk_without_a_plugin_block_is_refused():
+    with pytest.raises(ValueError):
+        extract_fx_state("<TRACK\nNAME \"x\"\n>\n", 0)
+
+
+def test_an_unterminated_block_is_refused():
+    chunk = '<TRACK\n<VST "x" m.vst3 0 "" {' + CLASS_A + '} ""\nAAAA\n'
+    with pytest.raises(ValueError) as bad:
+        extract_fx_state(chunk, 0)
+    assert "not terminated" in str(bad.value)
+
+
+def test_multiline_item_b_is_joined_like_the_host_writes_it():
+    """A big state is wrapped across lines; the payload is their concatenation."""
+    import base64
+
+    item_b = bytes(range(256)) * 20
+    encoded = base64.b64encode(item_b).decode("ascii")
+    wrapped = "\n".join(encoded[at : at + 128] for at in range(0, len(encoded), 128))
+    chunk = chunk_with(f'<VST "x" m.vst3 0 "" {{{CLASS_A}}} ""\nAAAA\n{wrapped}\n>')
+    state = extract_fx_state(chunk, 0)
+    assert state["data"] == base64.b64decode("AAAA") + item_b
+
+
+# ---------------------------------------------------------------------------
+# The controller and the tools that expose it (import safety, no host)
+# ---------------------------------------------------------------------------
+
+
+def test_the_preset_controller_and_its_four_tools_load_without_a_host():
+    """Importing the channel must not connect to REAPER: the server registers tools at startup."""
+    import importlib
+
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    module = importlib.import_module("controllers.preset_controller")
+    for method in ("get_fx_presets", "set_fx_preset", "navigate_fx_presets", "save_fx_preset"):
+        assert callable(getattr(module.PresetController, method)), method
+    combined = importlib.import_module("reaper_controller")
+    assert "PresetController" in [base.__name__ for base in combined.ReaperController.__mro__]
+    tools = importlib.import_module("mcp_tools")
+    assert callable(tools.setup_mcp_tools)

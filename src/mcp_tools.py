@@ -1856,3 +1856,95 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to open a new project tab: {str(e)}"}
 
+    # ----- REAPER's OWN FX presets (the preset dropdown in the FX window) -----
+    #
+    # A different store from `plugin_presets` (the plugin's built-in browser): REAPER's set is a
+    # file REAPER itself reads (measured 2026-10-18: `presets/vst3-Vital.ini`, format in
+    # `utils/reaper_presets.py`), and applying one is ONE host call that lets the plugin load its
+    # own state - no chunk read, no chunk write, no state-size ceiling. The host API has read,
+    # select and navigate calls and NO save call (measured by enumeration), so `save_fx_preset`
+    # writes REAPER's file in REAPER's format and makes the host confirm it before reporting.
+
+    @mcp.tool("get_fx_presets")
+    def get_fx_presets(ctx: Context, track_index: int, fx_index: int) -> Dict[str, Any]:
+        """List REAPER's own presets for one FX slot: the current preset, the count, the file, names.
+
+        Reads the HOST's preset channel (`TrackFX_GetPreset` / `TrackFX_GetPresetIndex` /
+        `TrackFX_GetUserPresetFilename`) and the preset FILE REAPER keeps for this FX, so the two
+        sources can be compared. A plugin that manages its own presets exposes none here and the
+        answer says so (`channel_empty`); a file REAPER has not re-read yet shows up as
+        `disagreement` because the host's numbering and the file's names then differ.
+
+        The names are parsed from the file (no host calls per preset). Preset payloads are never
+        returned - a listing is a listing.
+        """
+        try:
+            return controller.get_fx_presets(track_index, fx_index)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to read FX presets: {str(e)}"}
+
+    @mcp.tool("set_fx_preset")
+    def set_fx_preset(
+        ctx: Context,
+        track_index: int,
+        fx_index: int,
+        name: Optional[str] = None,
+        index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Apply ONE of REAPER's own presets to an FX slot - by `name` OR by `index`, never both.
+
+        This is the FAST path for a sound that already exists as a preset: the plugin loads its own
+        state in one host call (`TrackFX_SetPreset` / `TrackFX_SetPresetByIndex`), with no state
+        chunk read or write and therefore no state-size ceiling. The call is verified: the preset
+        name and index are read before and after, and `verified` is true only when the selector
+        became current - a host that answered `true` without changing the preset is reported as
+        `verified: false` rather than as a success.
+        """
+        try:
+            return controller.set_fx_preset(track_index, fx_index, name=name, index=index)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to set FX preset: {str(e)}"}
+
+    @mcp.tool("navigate_fx_presets")
+    def navigate_fx_presets(
+        ctx: Context, track_index: int, fx_index: int, step: int = 1
+    ) -> Dict[str, Any]:
+        """Step through REAPER's presets for an FX slot (`TrackFX_NavigatePresets`) and report where.
+
+        `step` may be negative to walk backwards. The answer carries `before` and `after` (name and
+        index) plus `changed`, so a step that the host accepted but that did not move the preset is
+        visible instead of implied.
+        """
+        try:
+            return controller.navigate_fx_presets(track_index, fx_index, step=step)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to navigate FX presets: {str(e)}"}
+
+    @mcp.tool("save_fx_preset")
+    def save_fx_preset(
+        ctx: Context, track_index: int, fx_index: int, name: str, dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """Save the FX's CURRENT state as a REAPER preset (default `dry_run: true` shows the plan).
+
+        REAPER exposes NO save call for FX presets (measured by enumerating `reapy.reascript_api`),
+        so this writes REAPER's own preset file in REAPER's own measured format - the shape the
+        owner's own saved presets have (`[General] NbPresets`, then `[PresetK]` with 16,385-byte
+        hex chunks, `Len`, `Name`) - and then makes the HOST confirm it, because an unconfirmed
+        preset is a trap: the preset count must grow, the new name must become selectable, and the
+        state that comes back after applying it must equal the bytes that were saved. Any failure
+        restores the file, re-applies the preset that was current, and returns `status: error` with
+        the numbers it measured.
+
+        A backup of the file is kept beside it as `<file>.reaper-mcp-backup` (written once, never
+        overwritten), so the way back does not depend on this call.
+
+        Args:
+            track_index / fx_index: the FX slot whose state is saved.
+            name: the preset name as it will appear in REAPER's preset dropdown.
+            dry_run: when true (default) nothing is written and the plan is returned.
+        """
+        try:
+            return controller.save_fx_preset(track_index, fx_index, name=name, dry_run=dry_run)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to save FX preset: {str(e)}"}
+

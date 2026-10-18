@@ -5668,3 +5668,76 @@ measured `4,189,248`), a light plan that a peer does NOT refuse, both balloon pl
 schedule's ceiling, and the protocol's own signature.
 
 **1172 passed, 2 skipped** (44.3's round recorded 1164).
+
+## 45. P42, second half - REAPER's OWN FX preset store, which the server did not have at all (2026-10-18)
+
+The owner's idea, verbatim: "мы ведь можем пресеты сохранять прямо в рипере, можно для каких то целей
+сохранять пресет через рипер или ставить из того набора, ведь это тоже быстро и мы еще так не
+проверяли, заодно проверим все ли есть в нашем мсп для быстрой такой работы или нет". The audit
+answer was **no, nothing exists**: `src/mcp_tools.py` carried 59 host tools and not one of them
+touched REAPER's preset list - the only preset tool in the whole server was `plugin_presets`, which
+serves the PLUGIN's built-in browser (a different store, and the slow one: it applies a preset as a
+state-chunk write with the whole measured ceiling arithmetic around it).
+
+### 45.1 What REAPER itself keeps (measured on this machine, before writing any code)
+
+`%REAPER%\presets\vst3-Vital.ini` - **3,912,003 bytes, 140 lines, 4 presets**: `BassHouse`
+(175,762 B), `pad` (176,148 B), `DirtyBassKongo` (1,428,230 B), `Bass 808` (175,065 B). A second
+measurement (`presets/` listing) shows the same family for other plugins - `vst-reaeq.ini`,
+`vst3-Dexed-builtin.ini`, ... - so this is REAPER's general FX-preset store, not a Vital special.
+The format is `[General] NbPresets=N`, then one `[PresetK]` per preset with uppercase-hex `Data`,
+`Data_1`, ... lines of **16,385 bytes** each (32,770 hex characters), a `Len` in **bytes** and a
+`Name`. The decoded payload reaches the ASCII `VstW` marker at ~offset 48 - the same wrapper the
+plugin state carries inside a track chunk (item B), i.e. the file stores the FX's own VST3 state.
+
+Note the contrast with the plugin layer's P38 finding ("every host-visible preset channel answers
+empty/`-1` on Vital"): that measurement is about the plugin's VST3 *program* channel, and it stands
+- the file above exists precisely because these presets were saved **through REAPER**, which is why
+this channel is the useful one for the owner's workflow.
+
+### 45.2 The API surface, enumerated rather than assumed
+
+`TrackFX_GetPreset`, `TrackFX_GetPresetIndex`, `TrackFX_SetPreset`, `TrackFX_SetPresetByIndex`,
+`TrackFX_NavigatePresets`, `TrackFX_GetUserPresetFilename` - and **no save call**
+(`TrackFX_*` list enumerated; the only `*Save*` + `FX` intersection is empty). So reading, selecting
+and stepping are one host call each, and saving has to be a file write - which is why the save path
+is the one that must verify itself.
+
+### 45.3 What was added
+
+* `src/utils/reaper_presets.py` (pure, no reapy): the measured format as a parser
+  (`parse_preset_library`, `preset_names`), a renderer (`render_preset_section`) and the append
+  (`append_preset`) - which refuses a file it cannot parse rather than corrupting a preset library -
+  plus `extract_fx_state`, which reads the addressed FX's own state bytes (item A + item B) out of a
+  track chunk by the measured block layout;
+* `src/controllers/preset_controller.py`: `get_fx_presets` / `set_fx_preset` / `navigate_fx_presets`
+  / `save_fx_preset`. The host's string-returning calls are invoked through a helper that tries the
+  two conventions reapy uses for out-buffers and **reports which shape worked** (`read_shapes`),
+  because guessing one would make a live failure look like an empty channel;
+* four MCP tools of the same names in `src/mcp_tools.py`, and `PresetController` mixed into
+  `ReaperController`.
+
+### 45.4 The save is verified, because an unconfirmed preset is a trap
+
+`save_fx_preset` reads the state, appends REAPER's section, keeps ONE backup beside the file
+(`<file>.reaper-mcp-backup`, never overwritten) and then makes the host prove it: the preset count
+must grow, the new name must become selectable, and the state applied back must equal the bytes that
+were saved. Any step that fails restores the file, re-applies the preset that was current, and
+answers `status: error` with the three numbers. `dry_run: true` (the default) stops after the plan.
+
+### 45.5 Offline surface
+
+`tests/test_reaper_presets.py` (17 tests): the measured shape parses into names/sizes/count, a
+`Len`/payload disagreement is a *problem* (the format's cheapest consistency probe), junk lines and a
+nameless preset are reported rather than skipped, the renderer's exact chunking (`Data`, `Data_1`,
+`Len`, `Name`; 32,770 hex characters for a full chunk; uppercase), its refusals (bad index, empty
+name, empty payload), appending (adds one section, moves only the count line, every existing section
+survives verbatim, the new payload reads back), appending to an empty/absent file, and both append
+refusals; then `extract_fx_state`: item A + item B, the ordinal as the chunk's FX order, identity
+filtering, refusals (no block, unterminated block, ordinal out of range, identity that matches
+nothing) and a wrapped multi-line item B. The last test proves the channel's modules import with no
+host at all, which is what the server does at startup.
+
+The tool-count pin moved with the surface (59 -> 63 host tools; 71 -> 75 total advertised).
+
+**1189 passed, 2 skipped** (44.4 recorded 1172).
