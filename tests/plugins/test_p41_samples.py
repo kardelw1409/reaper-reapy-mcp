@@ -81,6 +81,40 @@ def write_wav(
     return path
 
 
+#: WAVE_FORMAT_EXTENSIBLE's SubFormat GUID for the two codes this layer reads (the rest of the
+#: GUID is the standard `0000-0010-8000-00AA00389B71` KSDATAFORMAT suffix).
+_GUID_TAIL = bytes.fromhex("000000001000800000aa00389b71")
+
+
+def write_raw_wav(
+    path: Path,
+    *,
+    payload: bytes,
+    bits: int,
+    channels: int,
+    rate: int = 44_100,
+    code: int = 1,
+    extensible: bool = False,
+) -> Path:
+    """A WAV header written BY HAND, so the shapes `wave` refuses can be tested.
+
+    `wave` can only WRITE integer PCM, and the two cases that matter here are exactly the ones it
+    cannot write: IEEE float (`code=3`) and WAVE_FORMAT_EXTENSIBLE (whose SubFormat GUID carries the
+    real code). The channel mask is left zero ("not specified"), which the reader must tolerate.
+    """
+    block = (bits // 8) * channels
+    if extensible:
+        fmt = struct.pack("<HHIIHH", 0xFFFE, channels, rate, rate * block, block, bits)
+        fmt += struct.pack("<HHI", 22, bits, 0)
+        fmt += struct.pack("<H", code) + _GUID_TAIL
+    else:
+        fmt = struct.pack("<HHIIHH", code, channels, rate, rate * block, block, bits)
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+    chunks += b"data" + struct.pack("<I", len(payload)) + payload
+    path.write_bytes(b"RIFF" + struct.pack("<I", len(chunks) + 4) + b"WAVE" + chunks)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # 1. Reading a file: the channels, the rate, and every refusal
 # ---------------------------------------------------------------------------
@@ -126,12 +160,84 @@ def test_a_thirty_two_bit_file_is_scaled_not_truncated(tmp_path: Path):
     assert decoded["left"][:2] == [-10_000, -9_300], decoded["left"][:2]
 
 
-def test_a_twenty_four_bit_file_is_refused_by_name(tmp_path: Path):
-    """A wrong shift would be a silent amplitude error - so it is refused, not guessed."""
+def test_a_twenty_four_bit_file_keeps_its_top_sixteen_bits(tmp_path: Path):
+    """24-bit is supported: the plugin plays int16, so the top bits ARE the sample.
+
+    The stdlib handles this width (it is integer PCM), so the `wave` reader answers it and the
+    layer's own converter still does the 24 -> 16 step - the same function the RIFF reader uses.
+    """
+    values = [0, 1 << 16, -(1 << 16), (1 << 22), -((1 << 22) + 1)]
+    payload = b"".join((value & 0xFFFFFF).to_bytes(3, "little") for value in values)
+    path = write_raw_wav(tmp_path / "twentyfour.wav", payload=payload, bits=24, channels=1)
+    decoded = VS.read_wav(str(path))
+    assert decoded["bits"] == 24 and decoded["reader"] == "wave"
+    assert decoded["left"] == [0, 256, -256, 16384, -16385], decoded["left"]
+
+
+def test_a_float_wav_is_read_with_both_channels(tmp_path: Path):
+    """MEASURED: the owner's own packs are `fmt=3 ch=2 bits=32` - float stereo - which the stdlib
+    `wave` reader refuses as "unknown format: 3". The RIFF reader reads it."""
+    left = [0.0, 0.5, -0.5, 1.0]
+    right = [0.0, -0.25, 0.25, -1.0]
+    payload = struct.pack("<8f", *[value for pair in zip(left, right) for value in pair])
+    path = write_raw_wav(tmp_path / "float.wav", payload=payload, bits=32, channels=2, code=3)
+    decoded = VS.read_wav(str(path))
+    assert decoded["reader"] == "riff" and decoded["encoding"] == "float"
+    assert decoded["left"][1] == round(0.5 * VS.PCM_SCALE)
+    assert decoded["left"][2] == round(-0.5 * VS.PCM_SCALE)
+    assert decoded["left"][3] == VS.PCM_MAX, "the plugin's own scale is 32767, not 32768"
+    assert decoded["right"][3] == -VS.PCM_MAX
+
+
+def test_a_sixty_four_bit_float_wav_reads_the_same_way(tmp_path: Path):
+    payload = struct.pack("<2d", 0.25, -0.25)
+    path = write_raw_wav(tmp_path / "double.wav", payload=payload, bits=64, channels=1, code=3)
+    decoded = VS.read_wav(str(path))
+    assert decoded["encoding"] == "float" and decoded["bits"] == 64
+    assert decoded["left"] == [round(0.25 * VS.PCM_SCALE), round(-0.25 * VS.PCM_SCALE)]
+
+
+def test_an_extensible_header_is_resolved_through_its_subformat(tmp_path: Path):
+    """WAVE_FORMAT_EXTENSIBLE (0xFFFE) is what most DAWs write above 16-bit; the real code sits in
+    the first two bytes of its SubFormat GUID."""
+    payload = struct.pack("<4f", 0.0, 0.75, -0.75, 0.125)
+    path = write_raw_wav(
+        tmp_path / "ext.wav", payload=payload, bits=32, channels=1, extensible=True, code=3
+    )
+    decoded = VS.read_wav(str(path))
+    assert decoded["encoding"] == "float", decoded
+    assert decoded["left"][1] == round(0.75 * VS.PCM_SCALE)
+    # and an extensible PCM file resolves to PCM rather than being refused
+    pcm = write_raw_wav(
+        tmp_path / "ext_pcm.wav",
+        payload=struct.pack("<4h", 0, 100, -100, 32767),
+        bits=16,
+        channels=1,
+        extensible=True,
+        code=1,
+    )
+    assert VS.read_wav(str(pcm))["left"] == [0, 100, -100, 32767]
+
+
+def test_a_compressed_format_code_is_refused_with_the_accepted_list(tmp_path: Path):
+    path = write_raw_wav(
+        tmp_path / "adpcm.wav", payload=b"\x00" * 16, bits=4, channels=1, code=0x0011
+    )
     with pytest.raises(InvalidValue) as bad:
-        VS._pcm_from_bytes(b"\x00" * 12, 3, 1)
-    assert bad.value.detail["bits"] == 24
-    assert "16-bit" in bad.value.detail["why"]
+        VS.read_wav(str(path))
+    assert bad.value.detail["format_code"] == 0x0011
+    assert "PCM" in bad.value.detail["accepted"]["1"]
+
+
+def test_a_truncated_data_chunk_is_clipped_not_an_error(tmp_path: Path):
+    """A file whose `data` size runs past the end must not raise an IndexError."""
+    payload = struct.pack("<4f", 0.1, 0.2, 0.3, 0.4)
+    path = write_raw_wav(tmp_path / "cut.wav", payload=payload, bits=32, channels=1, code=3)
+    raw = path.read_bytes()
+    path.write_bytes(raw[:-6])  # 16 bytes -> 10: two whole float frames and a stump
+    decoded = VS.read_wav(str(path))
+    assert decoded["frames"] == 2, decoded["frames"]
+    assert decoded["left"] == [round(0.1 * VS.PCM_SCALE), round(0.2 * VS.PCM_SCALE)]
 
 
 def test_a_missing_file_is_named(tmp_path: Path):
@@ -158,7 +264,7 @@ def test_a_non_wav_file_says_what_it_found(tmp_path: Path):
     path.write_bytes(b"RIFF not really")
     with pytest.raises(InvalidValue) as bad:
         VS.read_wav(str(path))
-    assert bad.value.detail["reason"] in ("not_pcm_wav",)
+    assert bad.value.detail["reason"] in ("not_riff_wave", "not_pcm_wav")
 
 
 # ---------------------------------------------------------------------------

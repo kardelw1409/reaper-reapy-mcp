@@ -22,9 +22,12 @@ What the sampler IS, from the plugin's own source and the live measurements:
 * the sampler's own controls are ordinary parameters and ride the same batch
   (``sample_on`` / ``sample_loop`` / ``sample_destination`` / ``sample_level`` / ...).
 
-Reading a WAV file is deliberately STDLIB ONLY (``wave``): a sampler loader that needed a
-third-party decoder would not be usable from a bare environment, and the formats it accepts
-are exactly the ones the stdlib guarantees (PCM 8/16-bit, and 32-bit PCM as int).
+Reading a WAV file: the stdlib `wave` reader is tried first (it is the format's reference
+implementation for integer PCM), and anything it refuses is handed to this module's own RIFF
+reader, which also covers the shapes sample packs actually ship - measured on the owner's own
+packs: `fmt=3 ch=2 rate=44100 bits=32`, i.e. 32-bit FLOAT stereo, which `wave` reports as
+"unknown format: 3" and refuses. The layer therefore reads integer PCM at 8/16/24/32 bits, IEEE
+float at 32/64, and either of those wrapped in WAVE_FORMAT_EXTENSIBLE.
 """
 
 from __future__ import annotations
@@ -39,10 +42,13 @@ from ...errors import InvalidValue, Unreadable
 from . import codec as codec_module
 
 __all__ = [
+    "PCM_MAX",
+    "PCM_SCALE",
     "SAMPLER_CONTROLS",
     "SampleCapability",
     "build_block",
     "describe",
+    "read_riff_wav",
     "read_wav",
 ]
 
@@ -66,57 +72,212 @@ SAMPLER_CONTROLS: dict[str, str] = {
 MAX_SAMPLES = codec_module.SAMPLE_MAX_SAMPLES
 
 
-def _pcm_from_bytes(raw: bytes, width: int, channels: int) -> tuple[list[float], ...]:
-    """De-interleave ``raw`` into int16 channels (scaled by 32767/2**15 semantics).
+def _pcm_from_int(raw: bytes, width: int) -> list[int]:
+    """One channel's bytes as int16 values, for the integer PCM widths a WAV can carry.
 
-    Only the widths the stdlib can hand over are accepted, and each conversion is named:
-    8-bit WAV data is UNSIGNED (the format's own convention), 16-bit is int16,
-    32-bit is int32 scaled down. 24-bit is refused rather than guessed: a wrong shift is a
-    silent amplitude error, and the caller can convert the file once and be sure.
+    8-bit WAV data is UNSIGNED (the format's own convention); 16-bit is int16; 24-bit is
+    sign-extended from three bytes and its low 8 bits are dropped (the plugin plays int16, so the
+    top 16 bits ARE the sample); 32-bit keeps the top 16. A width outside this set is refused
+    rather than guessed - a wrong shift is a silent amplitude error.
     """
     import array
 
     if width == 1:
         data = array.array("B")
         data.frombytes(raw)
-        samples = [(value - 128) * 256 for value in data]
-    elif width == 2:
+        return [(value - 128) * 256 for value in data]
+    if width == 2:
         data = array.array("h")
         data.frombytes(raw)
-        samples = list(data)
-    elif width == 4:
-        if sys.byteorder != "little":  # pragma: no cover - Windows/x86 hosts are little-endian
+        return list(data)
+    if width == 3:
+        out: list[int] = []
+        for index in range(0, len(raw) - 2, 3):
+            value = raw[index] | (raw[index + 1] << 8) | (raw[index + 2] << 16)
+            if value & 0x800000:
+                value -= 1 << 24
+            out.append(value >> 8)
+        return out
+    if width == 4:
+        if sys.byteorder != "little":  # pragma: no cover - the hosts this runs on are little-endian
             raise Unreadable(
                 "32-bit PCM on a big-endian host is not converted by this layer",
                 detail={"byteorder": sys.byteorder},
             )
         data = array.array("i")
         data.frombytes(raw)
-        samples = [value >> 16 for value in data]
-    else:
-        raise InvalidValue(
-            f"a {width * 8}-bit PCM sample width is not converted by this layer",
-            detail={
-                "bits": width * 8,
-                "accepted": [8, 16, 32],
-                "why": "a 24-bit payload needs a shift this layer will not guess; convert the "
-                       "file to 16-bit PCM first",
-            },
-        )
+        return [value >> 16 for value in data]
+    raise InvalidValue(
+        f"a {width * 8}-bit integer PCM sample width is not converted by this layer",
+        detail={"bits": width * 8, "accepted": [8, 16, 24, 32]},
+    )
+
+
+def _pcm_from_float(raw: bytes, width: int) -> list[int]:
+    """IEEE-float WAV data as int16, at the plugin's OWN scale.
+
+    The plugin's own conversion is `utils::floatToPcmData`: ``clamp(value * kPcmScale, -kPcmScale,
+    kPcmScale)`` with ``kPcmScale = 32767`` (`utils.cpp`). This mirrors that scale and rounds to
+    the nearest step instead of truncating toward zero - at most one LSB away from the plugin's own
+    arithmetic, and inside the channel's measured requant band either way.
+    """
+    import array
+
+    kind = "f" if width == 4 else "d"
+    data = array.array(kind)
+    data.frombytes(raw[: len(raw) // (width) * width])
+    if sys.byteorder == "big":  # pragma: no cover
+        data.byteswap()
+    out: list[int] = []
+    for value in data:
+        scaled = float(value) * PCM_SCALE
+        if scaled >= PCM_SCALE:
+            out.append(PCM_MAX)
+        elif scaled <= -PCM_SCALE:
+            out.append(-PCM_MAX)
+        else:
+            out.append(int(scaled + (0.5 if scaled >= 0 else -0.5)))
+    return out
+
+
+def _pcm_from_bytes(raw: bytes, width: int, channels: int, *, is_float: bool) -> tuple[list[int], ...]:
+    """De-interleave ``raw`` into int16 channels."""
+    samples = _pcm_from_float(raw, width) if is_float else _pcm_from_int(raw, width)
     if channels <= 1:
         return (samples,)
-    left = samples[0::channels]
-    right = samples[1::channels]
-    extra = channels - 2
-    if extra:
-        # more than two channels: the plugin's engine is mono-or-stereo, so taking the first
-        # two is the only faithful reading - and the caller is told how many were dropped
-        return (left, right)
-    return (left, right)
+    # more than two channels: the plugin's engine is mono-or-stereo, so taking the first two is
+    # the only faithful reading - and the caller is told how many were dropped
+    return (samples[0::channels], samples[1::channels])
+
+
+def _chunks(raw: bytes) -> dict[str, bytes]:
+    """The RIFF chunks of a WAVE file, keyed by id (`fmt `, `data`, ...).
+
+    Minimal on purpose: a WAV is a RIFF container of length-prefixed, word-aligned chunks, and the
+    two this layer reads are the format and the samples. Every other chunk (LIST, fact, cue, smpl,
+    bext) is skipped by its own length, and a chunk whose declared size runs past the file is
+    CLIPPED to what is there - a truncated file must not raise an IndexError.
+    """
+    if len(raw) < 12 or raw[0:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise InvalidValue(
+            "the file is not a RIFF/WAVE file",
+            detail={"reason": "not_riff_wave", "head": raw[:4].decode("latin-1", "replace")},
+        )
+    out: dict[str, bytes] = {}
+    offset = 12
+    while offset + 8 <= len(raw):
+        chunk_id = raw[offset:offset + 4].decode("latin-1", "replace")
+        size = int.from_bytes(raw[offset + 4:offset + 8], "little")
+        start = offset + 8
+        end = min(start + size, len(raw))
+        if chunk_id and chunk_id not in out:
+            out[chunk_id] = raw[start:end]
+        offset = start + size + (size & 1)
+    return out
+
+
+#: The format codes a WAV can carry that this layer understands. `0xFFFE` is
+#: WAVE_FORMAT_EXTENSIBLE: the real code sits in the first two bytes of its SubFormat GUID, and
+#: most modern DAW exports use it for anything above 16-bit.
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_FLOAT = 0x0003
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+#: The plugin's own scale (`utils.cpp`: `kPcmScale = 32767.0f`). Its conversion clamps to
+#: +/-32767, so -32768 is never produced by the plugin's own arithmetic.
+PCM_SCALE = 32767.0
+PCM_MAX = 32767
+
+
+def read_riff_wav(path: Path) -> dict[str, Any]:
+    """Read a WAV the stdlib refuses: float, extensible, or 24-bit (P41).
+
+    Python's stdlib `wave` handles integer PCM only and reports everything else as "unknown
+    format" - which is exactly the shape most sample packs ship (measured on the owner's own packs:
+    `fmt=3 ch=2 rate=44100 bits=32`, i.e. 32-bit float stereo, refused by `wave`). This reader
+    accepts what the format defines and the plugin can play: integer PCM at 8/16/24/32 bits, IEEE
+    float at 32/64, and either of those wrapped in WAVE_FORMAT_EXTENSIBLE.
+    """
+    raw = path.read_bytes()
+    chunks = _chunks(raw)
+    fmt = chunks.get("fmt ")
+    data = chunks.get("data")
+    if fmt is None or len(fmt) < 16:
+        raise InvalidValue(
+            f"{path.name!r} carries no readable `fmt ` chunk",
+            detail={"path": str(path), "reason": "no_fmt_chunk", "chunks": sorted(chunks)},
+        )
+    if data is None:
+        raise InvalidValue(
+            f"{path.name!r} carries no `data` chunk",
+            detail={"path": str(path), "reason": "no_data_chunk", "chunks": sorted(chunks)},
+        )
+    code = int.from_bytes(fmt[0:2], "little")
+    channels = int.from_bytes(fmt[2:4], "little")
+    rate = int.from_bytes(fmt[4:8], "little")
+    bits = int.from_bytes(fmt[14:16], "little")
+    if code == WAVE_FORMAT_EXTENSIBLE:
+        if len(fmt) < 26:
+            raise InvalidValue(
+                f"{path.name!r} declares WAVE_FORMAT_EXTENSIBLE without a SubFormat",
+                detail={"path": str(path), "reason": "extensible_without_subformat", "fmt_bytes": len(fmt)},
+            )
+        code = int.from_bytes(fmt[24:26], "little")
+    if code not in (WAVE_FORMAT_PCM, WAVE_FORMAT_FLOAT):
+        raise InvalidValue(
+            f"{path.name!r} carries format code {code}, which is not PCM or IEEE float",
+            detail={
+                "path": str(path),
+                "format_code": code,
+                "accepted": {"1": "PCM", "3": "IEEE float", "65534": "extensible (their SubFormat)"},
+                "why": "a compressed WAV (ADPCM, mu-law, ...) would have to be decoded by something "
+                       "this layer does not have; convert the file to PCM or float WAV",
+            },
+        )
+    is_float = code == WAVE_FORMAT_FLOAT
+    if is_float and bits not in (32, 64):
+        raise InvalidValue(
+            f"{path.name!r} declares IEEE float at {bits} bits",
+            detail={"path": str(path), "bits": bits, "accepted": [32, 64]},
+        )
+    if not is_float and bits not in (8, 16, 24, 32):
+        raise InvalidValue(
+            f"{path.name!r} declares {bits}-bit integer PCM",
+            detail={"path": str(path), "bits": bits, "accepted": [8, 16, 24, 32]},
+        )
+    if channels < 1:
+        raise InvalidValue(
+            f"{path.name!r} declares no channels",
+            detail={"path": str(path), "channels": channels},
+        )
+    frame_bytes = max(1, (bits // 8) * channels)
+    frames = len(data) // frame_bytes
+    decoded = _pcm_from_bytes(data[: frames * frame_bytes], bits // 8, channels, is_float=is_float)
+    left = decoded[0]
+    right = decoded[1] if len(decoded) > 1 else None
+    return {
+        "path": str(path),
+        "name": path.stem,
+        "sample_rate": rate,
+        "bits": bits,
+        "file_channels": channels,
+        "frames": len(left),
+        "left": left,
+        "right": right,
+        "dropped_channels": max(0, channels - 2),
+        "encoding": "float" if is_float else "pcm",
+        "reader": "riff",
+    }
 
 
 def read_wav(path: str) -> dict[str, Any]:
-    """One PCM WAV file as interleaved-decoded int16 channels, or a typed refusal."""
+    """One WAV file as decoded int16 channels, or a typed refusal.
+
+    The stdlib `wave` reader is tried FIRST (it is the format's reference implementation for
+    integer PCM); anything it refuses is handed to the layer's own RIFF reader, which also covers
+    the float and extensible shapes sample packs ship. Which reader answered is reported
+    (`reader`), so a caller never has to guess what read the file.
+    """
     candidate = Path(str(path))
     if not candidate.is_file():
         raise InvalidValue(
@@ -125,17 +286,9 @@ def read_wav(path: str) -> dict[str, Any]:
         )
     try:
         handle = wave.open(str(candidate), "rb")
-    except wave.Error as exc:
-        raise InvalidValue(
-            f"{candidate.name!r} is not a WAV file this layer can read: {exc}",
-            detail={
-                "path": str(candidate),
-                "reason": "not_pcm_wav",
-                "why": "the stdlib `wave` reader accepts uncompressed PCM (and reports anything "
-                       "else here) - convert the file to 16-bit PCM WAV if it is compressed or "
-                       "float-encoded",
-            },
-        ) from exc
+    except wave.Error:
+        # the stdlib knows integer PCM only: float, extensible and 24-bit land here
+        return _bounded(path=candidate, decoded=read_riff_wav(candidate))
     except OSError as exc:
         raise Unreadable(
             f"the file could not be opened: {exc}", detail={"path": str(candidate)}
@@ -151,33 +304,44 @@ def read_wav(path: str) -> dict[str, Any]:
                 f"the WAV is compressed ({comptype}), which this layer does not decode",
                 detail={"path": str(candidate), "compression": comptype, "accepted": "NONE (PCM)"},
             )
-        if frames > MAX_SAMPLES:
-            raise InvalidValue(
-                "the sample is longer than the plugin's own buffer bound",
-                detail={
-                    "path": str(candidate),
-                    "frames": frames,
-                    "max_samples": MAX_SAMPLES,
-                    "why": "`Sample::loadSample` clamps its buffer to kMaxSize = 1,764,000 samples "
-                           "(measured in the plugin's source), so a longer file cannot be delivered "
-                           "through this channel - trim the file first",
-                },
-            )
         raw = handle.readframes(frames)
-    decoded = _pcm_from_bytes(raw, width, channels)
+    decoded = _pcm_from_bytes(raw, width, channels, is_float=False)
     left = decoded[0]
     right = decoded[1] if len(decoded) > 1 else None
-    return {
-        "path": str(candidate),
-        "name": candidate.stem,
-        "sample_rate": rate,
-        "bits": width * 8,
-        "file_channels": channels,
-        "frames": min(len(left), frames),
-        "left": left,
-        "right": right,
-        "dropped_channels": max(0, channels - 2),
-    }
+    return _bounded(
+        path=candidate,
+        decoded={
+            "path": str(candidate),
+            "name": candidate.stem,
+            "sample_rate": rate,
+            "bits": width * 8,
+            "file_channels": channels,
+            "frames": min(len(left), frames),
+            "left": left,
+            "right": right,
+            "dropped_channels": max(0, channels - 2),
+            "encoding": "pcm",
+            "reader": "wave",
+        },
+    )
+
+
+def _bounded(*, path: Path, decoded: dict[str, Any]) -> dict[str, Any]:
+    """Refuse a sample longer than the plugin's own buffer bound (never truncate it)."""
+    frames = int(decoded["frames"])
+    if frames > MAX_SAMPLES:
+        raise InvalidValue(
+            "the sample is longer than the plugin's own buffer bound",
+            detail={
+                "path": str(path),
+                "frames": frames,
+                "max_samples": MAX_SAMPLES,
+                "why": "`Sample::loadSample` clamps its buffer to kMaxSize = 1,764,000 samples "
+                       "(measured in the plugin's source), so a longer file cannot be delivered "
+                       "through this channel - trim the file first",
+            },
+        )
+    return decoded
 
 
 def build_block(
@@ -305,6 +469,8 @@ class SampleCapability:
                 "file": decoded["path"],
                 "file_channels": decoded["file_channels"],
                 "file_bits": decoded["bits"],
+                "file_encoding": decoded.get("encoding"),
+                "reader": decoded.get("reader"),
                 "dropped_channels": decoded["dropped_channels"],
                 "sample_rate": decoded["sample_rate"],
             }
