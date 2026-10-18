@@ -19,6 +19,7 @@ from controllers.base_controller import BaseController
 from mcp_tools import setup_mcp_tools
 from reaper_reapy_mcp.plugins import setup_plugin_tools
 from reaper_reapy_mcp.manifest import setup_manifest_tools
+from reaper_reapy_mcp.vision import setup_vision_tools
 
 
 class ReaperController(
@@ -55,6 +56,12 @@ def create_server(debug: bool = True) -> FastMCP:
     # Audiocpp manifest fill (E2): ONE line; adds apply_audiocpp_manifest and
     # touches nothing else. The bodies live in reaper_reapy_mcp/manifest/.
     setup_manifest_tools(mcp, controller)
+    # Vision (2026-10-18): ONE line; adds the 6 `vision_*` tools and touches
+    # nothing else. The bodies live in reaper_reapy_mcp/vision/ and take no
+    # controller - they reach the host through their own lazy `reapy` handle, so
+    # registration does no host work and a missing host is a typed error rather
+    # than a startup failure.
+    setup_vision_tools(mcp)
     # Startup preload (09 §4; owner Decision 4): when a provider is configured,
     # the prepared profiles in the cache directory are loaded, validated and held
     # in memory - no host contact, no profile build, no writes, and no cost at all

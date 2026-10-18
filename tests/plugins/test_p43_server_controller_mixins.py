@@ -38,7 +38,12 @@ SRC = REPO_ROOT / "src"
 CONTROLLERS = SRC / "controllers"
 
 #: The layers whose tool bodies reach `controller.<name>` on the instance the server builds.
-TOOL_LAYERS = (SRC / "mcp_tools.py",) + tuple(sorted((SRC / "reaper_reapy_mcp" / "manifest").glob("*.py")))
+#: The vision layer (2026-10-18) is listed although it takes no controller at all: it is a TOOL
+#: layer, so if a future change reaches a controller method from there, this audit must see it
+#: rather than leaving one layer unchecked because it happens to be clean today.
+TOOL_LAYERS = ((SRC / "mcp_tools.py",)
+               + tuple(sorted((SRC / "reaper_reapy_mcp" / "manifest").glob("*.py")))
+               + tuple(sorted((SRC / "reaper_reapy_mcp" / "vision").glob("*.py"))))
 
 
 def _combined_classes() -> dict[str, type]:
