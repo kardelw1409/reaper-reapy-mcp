@@ -11,9 +11,11 @@ What the host API offers (all present in `reapy.reascript_api`, MEASURED by enum
 `TrackFX_GetPreset`, `TrackFX_GetPresetIndex`, `TrackFX_SetPreset`, `TrackFX_SetPresetByIndex`,
 `TrackFX_NavigatePresets`, `TrackFX_GetUserPresetFilename` - and **no save call at all**. Saving is
 therefore done by writing REAPER's own preset file in REAPER's own measured format, and it is
-VERIFIED against the host before it is reported as done: the preset count must grow, the new name
-must become selectable, and the state it applies must reproduce the bytes that were saved. Anything
-else restores the file and refuses with what was measured.
+VERIFIED against the host before it is reported as done (P43): the preset count must grow, the new
+name must become selectable, and the state the saved preset drives the plugin to must be a FIXED
+POINT of the same length as the bytes that were saved. Byte-identity to the blob is NOT asserted,
+because it is measurably not what this plugin does (see `save_fx_preset`); the byte difference is
+reported with its numbers. Anything that fails the chain restores the file and refuses.
 """
 
 from __future__ import annotations
@@ -37,6 +39,28 @@ from utils.reaper_presets import (
 
 #: Buffer size for the host's string out-parameters (a preset name is short; the filename is a path).
 _BUFFER = 1024
+
+
+def _byte_difference(saved: bytes, read_back: bytes | None) -> dict[str, Any]:
+    """How the state read back differs from the bytes that were saved - numbers, not a verdict.
+
+    A state read back through the track chunk is REPORTED as a difference rather than compared
+    for equality, because the plugin re-serializes what it holds (measured, P43). The numbers
+    are what a caller needs to judge it: length, first offset, how many bytes.
+    """
+    if read_back is None:
+        return {"comparable": False}
+    limit = min(len(saved), len(read_back))
+    first = next((index for index in range(limit) if saved[index] != read_back[index]), None)
+    differing = sum(1 for index in range(limit) if saved[index] != read_back[index])
+    return {
+        "comparable": True,
+        "saved_bytes": len(saved),
+        "read_back_bytes": len(read_back),
+        "length_matches": len(saved) == len(read_back),
+        "first_offset": first,
+        "differing_bytes": differing,
+    }
 
 #: The measured read ceiling of `GetTrackStateChunk` (past it the host faults, plugin layer P40).
 _CHUNK_CAPACITY = 4_100_000
@@ -96,13 +120,16 @@ class PresetController(BaseController):
     def _retval(self, result: Any, track_id: str) -> bool | None:
         """The host's own return value, or `None` when the container is not the measured shape.
 
-        MEASURED: a value-returning host call answers `[retval, track echo, arg echoes...,
+        MEASURED (P43): a call WITH out-parameters answers `[retval, track echo, arg echoes...,
         out values...]`, so the return value is the FIRST element - and `bool(result)` on that
         list is True whatever the host said, which is how a refused preset call used to report
-        `applied: true`. `None` means "not understood" and is never folded into True.
+        `applied: true`. A call with NO out-parameters (`TrackFX_SetPreset`, `ByIndex`,
+        `NavigatePresets`) answers the BARE retval instead, measured as the integer `1` - so a
+        scalar is a value, not an unreadable container. `None` means "not understood" and is
+        never folded into True.
         """
-        if isinstance(result, bool):
-            return result
+        if isinstance(result, (bool, int)):
+            return bool(result)
         if isinstance(result, (list, tuple)):
             if len(result) >= 2 and self._is_input_echo(result[1], track_id):
                 head = result[0]
@@ -172,8 +199,16 @@ class PresetController(BaseController):
         return None, None, "none"
 
     def _current_preset(self, track_index: int, fx_index: int) -> tuple[str | None, str]:
+        """The current preset's name; an EMPTY buffer is reported as `None`, never as a name.
+
+        MEASURED (1a): with no preset selected the host answers retval `1` with an empty buffer
+        and index `-1`; `""` is "no preset is current", and it must not read as a name.
+        """
         track = self._track(track_index)
-        return self._call_string(reapy.reascript_api.TrackFX_GetPreset, track.id, int(fx_index))
+        text, shape = self._call_string(
+            reapy.reascript_api.TrackFX_GetPreset, track.id, int(fx_index)
+        )
+        return (text or None), shape
 
     def _user_preset_file(self, track_index: int, fx_index: int) -> tuple[str | None, str]:
         track = self._track(track_index)
@@ -205,6 +240,17 @@ class PresetController(BaseController):
             return result
         raise RuntimeError("GetTrackStateChunk returned no text")
 
+    def _read_state(self, track_index: int, fx_index: int) -> bytes | None:
+        """The addressed FX's own state bytes (item A + item B) from the track chunk.
+
+        `None` when the block cannot be read at all - the caller reports that by its own numbers
+        instead of mistaking an unreadable state for an empty one.
+        """
+        try:
+            return extract_fx_state(self._read_chunk(track_index), int(fx_index))["data"]
+        except Exception:  # noqa: BLE001 - the caller reports the failure as a verification gap
+            return None
+
     # -- reading ------------------------------------------------------------
 
     def get_fx_presets(self, track_index: int, fx_index: int) -> dict[str, Any]:
@@ -222,9 +268,9 @@ class PresetController(BaseController):
             "track_index": int(track_index),
             "fx_index": int(fx_index),
             # MEASURED (P43): the name buffer comes back EMPTY for this FX while the retval says
-            # the call succeeded - an empty buffer is reported as null, and the layout in
+            # the call succeeded - `_current_preset` reports that as null, and the layout in
             # `read_shapes.current` shows that a `str` slot was there and was empty.
-            "current": name or None,
+            "current": name,
             "preset_index": index,
             "host_preset_count": count,
             "user_preset_file": path,
@@ -406,11 +452,27 @@ class PresetController(BaseController):
         """Save the FX's CURRENT state as a REAPER preset, verified before it is reported.
 
         The API has no save call (MEASURED by enumeration of `reapy.reascript_api`), so this writes
-        REAPER's own preset file in REAPER's own measured format and then makes the HOST prove it:
-        the preset count must grow, the new name must become selectable, and the state that comes
-        back after applying it must equal the bytes that were saved. Any step that fails restores
-        the file, re-applies the preset that was current, and refuses with what was measured -
-        a preset believed to be saved but not readable by REAPER would be a trap for the owner.
+        REAPER's own preset file in REAPER's own measured format and then makes the HOST prove the
+        file is one it can use.
+
+        What the proof can be is MEASURED, not assumed (P43, on the owner's own `BassHouse`):
+        byte-identity between the saved blob and the state the plugin shows after applying it is
+        NOT achievable on this plugin, and it is not a defect of the file -
+
+        * the FIRST application keeps the live runtime values of the sampler engine (measured:
+          `sample_on` 1.0 against the stored 0.0, `sample_level` 0.85 against 0.7071, `loop`,
+          `destination`), so the state read after ONE apply is 14 bytes off;
+        * the SECOND application reaches the stored values and the state has the SAME LENGTH as
+          the saved core (175,747 = 175,747); the one remaining difference is `sample.samples`,
+          the base64 PCM of the preset's own sample - equal length (117,600), shifted by ~4
+          int16 samples;
+        * a THIRD application changes nothing (byte-identical).
+
+        So the chain verifies what it can prove: the host re-read the file (count grew), the new
+        name became CURRENT (selector read back), the saved bytes drive the plugin to a FIXED
+        POINT, and that point has the same length as the bytes that were saved. The byte
+        difference is REPORTED with its numbers rather than asserted away. Any step that fails
+        restores the file and refuses with what was measured.
         """
         wanted = str(name).strip()
         if not wanted:
@@ -487,14 +549,20 @@ class PresetController(BaseController):
         grew = before_count is not None and after_count is not None and after_count > before_count
         applied = self.set_fx_preset(track_index, fx_index, name=wanted)
         applied_ok = bool(applied.get("applied"))
-        back_state: bytes | None = None
+        # The measured settling law (see the docstring): one application for the plugin to reach
+        # the STORED values, one more to prove the state is a fixed point. The first state is not
+        # read at all - it is the known-polluted one, and reading it would only cost a chunk read.
+        settled: bytes | None = None
+        settled_again: bytes | None = None
         if applied_ok:
-            try:
-                back_state = extract_fx_state(self._read_chunk(track_index), int(fx_index))["data"]
-            except Exception:  # noqa: BLE001 - the read-back below reports the failure
-                back_state = None
-        identical = back_state == payload
-        if not (grew and applied_ok and identical):
+            self.set_fx_preset(track_index, fx_index, name=wanted)
+            settled = self._read_state(track_index, fx_index)
+            self.set_fx_preset(track_index, fx_index, name=wanted)
+            settled_again = self._read_state(track_index, fx_index)
+        stable = settled is not None and settled == settled_again
+        length_matches = settled is not None and len(settled) == len(core)
+        byte_diff = _byte_difference(core, settled)
+        if not (grew and applied_ok and stable and length_matches):
             with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
                 handle.write(original)
             if before_name:
@@ -504,18 +572,23 @@ class PresetController(BaseController):
                 "message": (
                     "the saved preset was not confirmed by the host, so the file was restored: "
                     f"count {before_count} -> {after_count} (must grow), selected {applied_ok}, "
-                    f"state identical {identical}"
+                    f"fixed point {stable}, same length as saved {length_matches}"
                 ),
                 "restored": True,
                 "plan": plan,
                 "verification": {
                     "host_preset_count_after": after_count,
                     "applied": applied_ok,
-                    "state_identical": identical,
+                    "stable": stable,
+                    "length_matches": length_matches,
+                    "byte_difference": byte_diff,
                     "backup": backup if os.path.isfile(backup) else None,
                 },
             }
         if before_name:
+            # The settling law applies to the way back too (measured): two applications, so the
+            # previous preset reaches its stored values instead of keeping this one's runtime.
+            self.set_fx_preset(track_index, fx_index, name=before_name)
             self.set_fx_preset(track_index, fx_index, name=before_name)
         return {
             "status": "success",
@@ -523,7 +596,14 @@ class PresetController(BaseController):
             "verification": {
                 "host_preset_count_after": after_count,
                 "applied": applied_ok,
-                "state_identical": identical,
+                "settling": (
+                    "two applications for the plugin to reach the stored values, a third to prove "
+                    "they are a fixed point (measured P43 on the owner's own BassHouse)"
+                ),
+                "stable": stable,
+                "length_matches_saved": length_matches,
+                "byte_identical_to_saved": bool(settled == core),
+                "byte_difference": byte_diff,
                 "payload_bytes": len(payload),
                 "backup": backup if os.path.isfile(backup) else None,
                 "restored_current": before_name,

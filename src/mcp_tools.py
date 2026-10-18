@@ -1931,9 +1931,12 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         owner's own saved presets have (`[General] NbPresets`, then `[PresetK]` with 16,385-byte
         hex chunks, `Len`, `Name`) - and then makes the HOST confirm it, because an unconfirmed
         preset is a trap: the preset count must grow, the new name must become selectable, and the
-        state that comes back after applying it must equal the bytes that were saved. Any failure
-        restores the file, re-applies the preset that was current, and returns `status: error` with
-        the numbers it measured.
+        saved bytes must drive the plugin to a fixed state of the same length. Byte-identity to
+        the saved blob is NOT required - measured P43: this plugin re-serializes what it holds
+        (the first application keeps the live sampler runtime values, the second reaches the
+        stored ones, one PCM block stays shifted by ~4 samples); the byte difference is reported
+        with its numbers in `verification.byte_difference`. Any failure restores the file,
+        re-applies the preset that was current, and returns `status: error` with its numbers.
 
         A backup of the file is kept beside it as `<file>.reaper-mcp-backup` (written once, never
         overwritten), so the way back does not depend on this call.

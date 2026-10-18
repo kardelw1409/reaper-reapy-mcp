@@ -73,7 +73,7 @@ def test_the_echo_of_the_track_pointer_is_never_an_answer(monkeypatch):
     controller, module = preset_controller()
     fake_host(module, monkeypatch, **measured_reads(path=None))
     name, shape = controller._current_preset(0, 0)
-    assert name == "", "the measured buffer is EMPTY - that is the host's answer"
+    assert name is None, "the measured buffer is EMPTY - that is 'no preset is current'"
     assert POINTER not in shape and "echo" in shape, shape
     path, path_shape = controller._user_preset_file(0, 0)
     assert path is None, "a null path in the container is not the pointer"
@@ -87,16 +87,16 @@ def test_the_count_comes_from_the_out_parameter_not_the_fx_echo(monkeypatch):
     index, count, layout = controller._preset_index(0, 0)
     assert (index, count) == (-1, 4), layout
     # the fx index is not a preset count, whichever slot it sits in
-    module.reapy.reascript_api.TrackFX_GetPresetIndex = lambda *a: [7, POINTER, 3, 4]
+    fake_host(module, monkeypatch, TrackFX_GetPresetIndex=[7, POINTER, 3, 4])
     index, count, layout = controller._preset_index(0, 0)
     assert (index, count) == (7, 4), layout
     assert layout == "list:list[int,echo,int,int]", layout
 
 
-def test_a_container_that_is_not_the_measured_shape_reports_no_number():
+def test_a_container_that_is_not_the_measured_shape_reports_no_number(monkeypatch):
     """A guessed slot is what caused this: an unrecognised container answers None, not a value."""
     controller, module = preset_controller()
-    module.reapy.reascript_api.TrackFX_GetPresetIndex = lambda *a: [POINTER, 0, 4]
+    fake_host(module, monkeypatch, TrackFX_GetPresetIndex=lambda *a: [POINTER, 0, 4])
     index, count, layout = controller._preset_index(0, 0)
     assert (index, count) == (None, None), layout
     assert layout == "list:list[echo,int,int]", layout
@@ -149,6 +149,50 @@ def test_an_unrecognised_answer_is_never_folded_into_a_yes(monkeypatch):
     answer = controller.navigate_fx_presets(0, 0, step=1)
     assert answer["moved"] is None and answer["status"] == "error", answer
     assert "not a shape this layer understands" in answer["message"], answer
+
+
+def test_a_bare_scalar_retval_is_the_hosts_answer(monkeypatch):
+    """MEASURED (1b, 2026-10-18): `TrackFX_SetPreset` (no out-parameters) answers the bare 1.
+
+    The live call applied `BassHouse` for real (`after.name` read back, index `-1 -> 0`) and
+    still reported `applied: null` because only bool/list containers were understood. That is
+    not cosmetic: `save_fx_preset` reads this field, so a successful save would have been
+    rolled back as unconfirmed.
+    """
+    controller, module = preset_controller()
+    reads = measured_reads(preset="BassHouse")
+    reads["TrackFX_SetPreset"] = lambda *a: 1
+    fake_host(module, monkeypatch, **reads)
+    answer = controller.set_fx_preset(0, 0, name="BassHouse")
+    assert answer["applied"] is True and answer["verified"] is True, answer
+    assert answer["call_layout"] == "int", answer
+
+    # the bare zero is a refusal, and nothing became current: reported as the failure it is
+    refused = measured_reads()
+    refused["TrackFX_SetPreset"] = lambda *a: 0
+    fake_host(module, monkeypatch, **refused)
+    answer = controller.set_fx_preset(0, 0, name="BassHouse")
+    assert answer["applied"] is False and answer["status"] == "error", answer
+    assert answer["verified"] is False and answer["after"]["name"] is None, answer
+
+
+def test_navigation_reports_the_move_it_measured(monkeypatch):
+    """`TrackFX_NavigatePresets` answers the bare retval too; before/after come from the reads."""
+    controller, module = preset_controller()
+    indexes = iter([[1, POINTER, 0, 4], [2, POINTER, 0, 4]])
+    names = iter(["pad", "DirtyBassKongo"])
+    fake_host(
+        module,
+        monkeypatch,
+        TrackFX_GetPresetIndex=lambda *a: next(indexes),
+        TrackFX_GetPreset=lambda *a: [1, POINTER, 0, next(names), 1024],
+        TrackFX_NavigatePresets=lambda *a: 1,
+    )
+    answer = controller.navigate_fx_presets(0, 0, step=1)
+    assert answer["moved"] is True and answer["changed"] is True, answer
+    assert answer["before"] == {"name": "pad", "index": 1}, answer
+    assert answer["after"] == {"name": "DirtyBassKongo", "index": 2, "count": 4}, answer
+    assert answer["call_layout"] == "int", answer
 
 
 # ---------------------------------------------------------------------------
