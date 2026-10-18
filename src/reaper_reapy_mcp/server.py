@@ -12,6 +12,7 @@ from controllers.fx_controller import FXController
 from controllers.marker_controller import MarkerController
 from controllers.master_controller import MasterController
 from controllers.midi_controller import MIDIController
+from controllers.preset_controller import PresetController
 from controllers.project_controller import ProjectController
 from controllers.track_controller import TrackController
 from controllers.base_controller import BaseController
@@ -28,6 +29,12 @@ class ReaperController(
     AudioController,
     MasterController,
     ProjectController,
+    # P43: the four `get_fx_presets`/`set_fx_preset`/`navigate_fx_presets`/`save_fx_preset` tools
+    # were registered by `setup_mcp_tools` while THIS class - the one `create_server()`
+    # instantiates, and the one the tools call - did not carry the mixin. Every live call answered
+    # "'ReaperController' object has no attribute 'get_fx_presets'" until the mixin was added here;
+    # `tests/plugins/test_p43_server_controller_mixins.py` now pins the composed surface.
+    PresetController,
     BaseController,
 ):
     pass
