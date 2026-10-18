@@ -375,7 +375,12 @@ own controls ride the **same batch**, so `on` (default **true**: a load that lef
 off would put material in the plugin and never sound it), `loop`, `destination`, `level`, `transpose`,
 `tune`, `pan` and `keytrack` are addressed by name. `op='read'` reports what the sampler holds now
 (name, length, sample_rate, channels, seconds, payload bytes) plus the current value of those controls.
-Protocol, the block's exact shape and the measured limits: [24-sampler.md](24-sampler.md).
+`op='solo'` sends the provider's own "other sources off, sampler on" set in **one** control write with
+no state at all, so making the sampler the source that sounds does not require `plugin_write` (which can
+be disabled in a workspace config, and was); every control it addresses is validated against the live
+profile like any other knob, and a profile that declares none of them is refused rather than reported as
+a solo that wrote nothing. Protocol, the block's exact shape and the measured limits:
+[24-sampler.md](24-sampler.md).
 
 ### 9.4 The preset search ranks (P41)
 

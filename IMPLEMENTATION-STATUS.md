@@ -5449,3 +5449,48 @@ visible in the source so re-adding `refusals: []` to every answer fails a test i
 * The live confirmation of the new tool needs the MCP server restarted (the surface is registered at
   startup); the offline suite plus the measured live behaviour of the same channel are what this round
   rests on until then.
+
+### 43.8 The first real load said "loaded: false" while both state rows said "agrees: true"
+
+The owner asked for the sampler as the thing that sounds - init preset, sampler on, a 9.14 s float bass
+sample - and the live answer to a load that HAD worked came back `loaded: false, partial: true` with a
+gap named `sample_inflated_before_write`. The live evidence in the same envelope is what settles it:
+
+```
+outcome.channels.state.rows:  settings.sample:sample_balloon  agrees: true
+                              settings.sample:sample          agrees: true
+described: reader "riff", encoding "float", 403200 frames, 2 ch, payload 2150400 chars
+controls:  sample_on "On", loop "Off", destination "DIRECT OUT", level 0.85
+```
+
+The sample was IN the plugin - `plugin_sample(op="read")` answered `MCP Palm Tree (float)`, 9.142857 s,
+`sample_on: "On"` - and the flag that reports "did the value land" was wrong, not the value. The cause
+is a conflation: `sample_inflated_before_write` is the codec saying **how** a value arrives (the same
+bytes are written once as a balloon and once as the real block, because a value that grows the document
+beyond the headroom cannot land in a single write), and the response treated every notice that carried
+a path as a refusal.
+
+The fix separates the two by a DATA MARKER, not by a list of reason names in the core:
+
+* the codec marks the notice `informational: True` (with the live measurement in its comment) - it is
+  the layer that knows it is describing delivery rather than refusing it;
+* `_gaps_from_outcome` now splits `outcome.named_gaps` into `notices` (informational, marker stripped,
+  reported as `data.notes[]`) and `refusals` (`data.gaps[]` + `partial: true` + `write_gaps`), and
+  returns early when there are no refusals at all;
+* `loaded` and `delivered` are computed from the refusals only (`bool(result.ok) and not
+  _value_refused(gaps, path)`), so a delivered value can no longer be reported as a missing one.
+
+**`op="solo"` - the switch the owner could not reach.** The three oscillator switches live in the same
+plugin as the sampler, but switching them off is a `plugin_write` call, and `plugin_write`/`plugin_read`
+are disabled in this workspace's MCP config (`Tool ... is currently disabled by the user`). A tool whose
+job is "make the sampler the source that sounds" should be able to do that itself, so `plugin_sample`
+gained a third op: `solo` (also accepted as `solo=true` beside a `load`) sends the provider's own
+"other sources off, sampler on" set **in the same control write** as the load. The provider names the
+controls (`SampleCapability.solo_values()`, and a `sources` list), the core validates each of them
+against the live profile like every other knob - an undeclared control is skipped and NAMED, a label
+that is not one of the control's own members is refused with the legal list - and a profile that
+declares none of them is refused as "nothing could be switched" instead of reporting a solo that wrote
+nothing. Measured: the whole solo is one control write, with no state sent (verified twice: once through
+a captured request, once live).
+
+**1153 passed, 2 skipped** (43.6 recorded 1143; the new tests are the note/gap split and the solo op).
