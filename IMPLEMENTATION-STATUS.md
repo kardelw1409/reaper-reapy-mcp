@@ -5297,3 +5297,83 @@ sample pair scheduled after the write that makes room, the scheduler's arithmeti
 units that follow, the control that proves the drift test can fail, the carry never overriding a unit's
 own path, and the hook's call shape). `tests/plugins/test_p39c_audio_slots.py` gained the two ceiling
 ends, `tests/plugins/test_p40_write_gaps.py` the envelope rule.
+
+## 43. P41 - the sampler becomes a channel, and the preset search learns to rank (2026-10-18)
+
+This round came from the owner using the tool on a real lead: "I see you loaded the sample but you did
+not switch it on", plus a question about the search ("can it be smarter, so you do not pull every
+preset at once") and an instruction to commit everything that was still uncommitted.
+
+### 43.1 🔴 The sampler was loadable through the generic channel, but nothing said how
+
+What the layer already had: `settings.sample` is an ORDINARY state path, so the whole block can be
+written through `plugin_write` - which is exactly how a preset carries its sample (measured live: a
+block write with three sampler controls came back `committed: true`, `ALL_VERIFIED`, 2 write calls, 0
+unknown, with `name`/`length`/`sample_rate` read back exactly as written; the write SHRANK the state
+3,896,997 -> 3,739,653 characters, i.e. the displaced preset sample was 44,100 samples of inline PCM).
+
+What it did not have: any way to turn a FILE into that block, and no statement anywhere that
+`settings.sample.samples` alone is not addressable (it is a `DERIVED_LEAVES` entry - the plugin
+re-encodes it on every load, so a leaf write cannot be verified). And the owner's observation was
+right: after a preset apply the sampler control read `Off` while material sat in the slot.
+
+### 43.2 `plugin_sample` - the 11th tool, on the same verified channel
+
+`op='load'` takes `file_path` (a PCM WAV) or `samples` (raw int16 + `sample_rate`) and writes the
+block through the SAME transaction as every other write; `op='read'` reports what the sampler holds
+(name, length, sample_rate, channels, seconds, payload bytes) plus its controls' current values.
+
+The mapping is taken from the plugin's own source rather than inferred (`Sample::stateToJson`:
+`samples` encodes `left_buffers`, `samples_stereo` encodes `right_buffers`; `jsonToState` decodes
+exactly `length * sizeof(int16_t)` bytes, so a payload must carry exactly `length` samples per channel),
+and `Sample::loadSample` clamps a mono buffer to `kMaxSize` = 1,764,000 - the refusal names that bound
+instead of truncating the material.
+
+Three decisions worth keeping:
+
+* **`on` defaults to true.** A load that leaves the engine switched off is the mistake the owner
+  caught, so the default is the sounding outcome and the controls ride the SAME batch as the block.
+  A boolean for an enum control is translated to the control's OWN label ("On"/"Off", read from the
+  live profile) - a `True` written as `1` would be a guess at band positions.
+* **The core names no provider.** The knob -> control-id table comes from the capability
+  (`SampleCapability.controls`); the first version imported it from the provider module and the L0
+  boundary checker refused `api.py`/`tools.py` for containing the provider's name - the check the
+  architecture already had, doing its job on the first try.
+* **24-bit WAV is refused by name**, and float/compressed files with it: the stdlib `wave` reader is
+  the only decoder, and a wrong shift would be a silent amplitude error. A file longer than the bound,
+  a file with more than two channels (the extra ones are named, `dropped_channels`) and a request that
+  names both sources are all refusals rather than guesses. No `clear` op: an empty block was never
+  measured, and this channel is exactly where an unmeasured guess would be invisible.
+
+### 43.3 The preset search ranks, and says why
+
+MEASURED on the owner's library (2,226 files), through one real call each: the one-token query `ld`
+answered **140 rows** in ALPHABETICAL order - the true `LD …` presets interleaved with every name that
+merely contains the letters ("Battlefield", "Cold Planet") - and the `limit=40` answer was ~18 KB, of
+which ~11 KB was rows carrying `mtime_ns` (19 digits of nanoseconds) and an `embedded_name` that
+repeats the file-name-derived `name` in most of the corpus.
+
+The search now scores each token by the BEST field it hits (whole word > word prefix > substring,
+weighted name > embedded name > author > id), sorts by score then by how many tokens hit, names the
+fields that scored per row (`matched_in`), reports tokens that hit nothing (`unmatched_terms`), filters
+by `author`, and drops the two per-row fields no caller can act on. A word hit must outrank ANY number
+of substring hits - the tier weights are spaced for exactly that.
+
+### 43.4 Offline surface
+
+**1132 passed, 2 skipped** (43/42.10 recorded 1097). New: `tests/plugins/test_p41_samples.py` (26 - the
+WAV reader's channels/rates and every refusal, the block's exact shape, the clamp, the knob->label
+translation, a load through the real transaction with the payload compared at the measured reload
+delay, a growing load riding the balloon pair, and the two-source refusal) and
+`tests/plugins/test_p41_search.py` (8 - ranking, the prefix tier, `unmatched_terms`, the author filter,
+the row shape, and a differing embedded name kept). `test_p0_contracts.py`'s surface pins moved
+10 -> 11 tools and 70 -> 71 total.
+
+### 43.5 What is NOT closed, stated plainly
+
+* No resampling: the block declares the FILE's rate and the plugin plays the buffer at that rate.
+* No loop points (the state block carries none), no `clear`, and the audible result is not measured -
+  what is established is what the plugin STORES, read back through its own document.
+* The live confirmation of the new tool needs the MCP server restarted (the surface is registered at
+  startup); the offline suite plus the measured live behaviour of the same channel are what this round
+  rests on until then.

@@ -365,6 +365,28 @@ holds now, in the same numbers (peak/RMS/partials). Protocol, examples and the m
 The provider supplies the vocabulary (`WavetableCapability`); a provider without the hook is refused by
 name, and no plugin-specific fact lives in the tool layer.
 
+### 9.3 `plugin_sample` (P41 — implemented, not in the original V1 surface)
+
+The **sampler** as a channel: an extra oscillator whose payload is PCM rather than a single-cycle
+table. `op='load'` takes `file_path` (a PCM WAV) or `samples` (raw int16 values + `sample_rate`) and
+writes the plugin's sample **block** through the same verified state channel as every other write — the
+landing bound, the sample balloon, the read-back verification and the rollback all apply. The sampler's
+own controls ride the **same batch**, so `on` (default **true**: a load that left the engine switched
+off would put material in the plugin and never sound it), `loop`, `destination`, `level`, `transpose`,
+`tune`, `pan` and `keytrack` are addressed by name. `op='read'` reports what the sampler holds now
+(name, length, sample_rate, channels, seconds, payload bytes) plus the current value of those controls.
+Protocol, the block's exact shape and the measured limits: [24-sampler.md](24-sampler.md).
+
+### 9.4 The preset search ranks (P41)
+
+`plugin_presets(op='search')` scores each query token by the **best field** it hits (whole word > word
+prefix > substring, weighted name > embedded name > author > id), sorts by score, names the fields that
+scored per row (`matched_in`), reports tokens that hit nothing (`unmatched_terms`) and filters by
+`author`. Measured reason: the previous substring filter answered the one-token query `ld` with **140
+rows** in alphabetical order — the true `LD …` presets interleaved with every name that merely contains
+the letters — and ~11 KB of per-row payload, of which `mtime_ns` (19 digits) was not an argument to
+anything.
+
 ## 10. Registration & compatibility
 - **Registration:** `setup_plugin_tools(mcp: FastMCP, *, config)` called from `create_server()`
   immediately after `setup_mcp_tools(...)` [A: `server.py`]. Uses the proven SPEC-driven closure
