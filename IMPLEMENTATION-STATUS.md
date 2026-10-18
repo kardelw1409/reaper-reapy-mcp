@@ -5369,11 +5369,44 @@ delay, a growing load riding the balloon pair, and the two-source refusal) and
 the row shape, and a differing embedded name kept). `test_p0_contracts.py`'s surface pins moved
 10 -> 11 tools and 70 -> 71 total.
 
-### 43.5 What is NOT closed, stated plainly
+### 43.6 The WAV reader had to grow: sample packs are FLOAT (same day, after the owner's first try)
+
+The owner ran the tool on his own sample pack and it refused the file. Two measurements came out of
+that one call:
+
+* **all 120 WAVs of his packs are `fmt=3 ch=2 rate=44100 bits=32`** - 32-bit IEEE FLOAT stereo - and
+  the stdlib `wave` reader answers `unknown format: 3`. A loader that reads "PCM only" therefore does
+  not read sample packs at all;
+* the very first file the probe tried (`(C) - Bass - Micro.wav`, 3,225,644 bytes) decodes to 403,200
+  stereo frames of **pure zeroes**: LITE packs ship placeholder samples. The reader was right and the
+  material was silent - 119 of the 120 files in the same pack carry signal.
+
+So the layer gained its own RIFF reader (`read_riff_wav`), used when `wave` refuses: integer PCM at
+8/16/24/32 bits (24 keeps its top 16, since the plugin plays int16), IEEE float at 32/64, and either
+of those wrapped in `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE` - what most DAWs write above 16-bit, and the
+real code sits in the first two bytes of its SubFormat GUID). The float path mirrors the plugin's OWN
+scale - `utils::floatToPcmData` uses `kPcmScale = 32767.0f`, not 32768 - and rounds to the nearest
+step rather than truncating toward zero. The answer says which reader answered (`reader`) and what
+was read (`file_encoding`).
+
+**Verified against an independent decoder** (`scipy.io.wavfile`) on two files from the packs:
+403,200 frames x 2 channels each, **0 mismatching samples** on either channel. A truncated `data`
+chunk is clipped rather than raising, and a format code outside PCM/float/extensible is refused with
+the code it found.
+
+**1137 passed, 2 skipped** after the reader (43.4 recorded 1132); `test_p41_samples.py` grew to 32
+tests, including float32/float64/extensible/24-bit/truncated/unknown-code cases written by hand
+(the stdlib cannot WRITE float WAVs, so the tests build those headers byte by byte).
+
+### 43.7 What is NOT closed, stated plainly
 
 * No resampling: the block declares the FILE's rate and the plugin plays the buffer at that rate.
 * No loop points (the state block carries none), no `clear`, and the audible result is not measured -
   what is established is what the plugin STORES, read back through its own document.
+* Length against the ceiling: a sample lives in the state as base64, so 9.14 s of stereo (403,200
+  frames) is ~1.08 MB of document characters. Over an instance that already holds large tables such a
+  load is refused BY NAME (`state_ceiling_reached`, doc 22 2.3) rather than silently trimmed - free
+  room with a smaller table/preset, or load a shorter file.
 * The live confirmation of the new tool needs the MCP server restarted (the surface is registered at
   startup); the offline suite plus the measured live behaviour of the same channel are what this round
   rests on until then.
