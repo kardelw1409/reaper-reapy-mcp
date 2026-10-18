@@ -184,10 +184,11 @@ def test_every_error_serializes_code_message_detail():
 def test_spec_declares_exactly_the_seven_tools():
     assert set(SPEC) == set(TOOL_NAMES)
     # 9 since P38 added `plugin_presets` (the plugin's own preset library), 10 since P40
-    # added `plugin_wavetable` (building our OWN tables and reading a slot back). The name
-    # "seven" in this test is a historical label. The pin moves with the round,
+    # added `plugin_wavetable` (building our OWN tables and reading a slot back), 11 since P41
+    # added `plugin_sample` (the sampler as a channel: a WAV in, the engine switched on). The
+    # name "seven" in this test is a historical label. The pin moves with the round,
     # deliberately: the count is a measurement of the surface.
-    assert len(TOOL_NAMES) == 10
+    assert len(TOOL_NAMES) == 11
     assert all(name.startswith("plugin_") for name in TOOL_NAMES)
 
 
@@ -217,11 +218,12 @@ def test_tool_names_disjoint_from_existing_host_tools():
     assert len(existing) == 59, f"expected 59 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
     # 59 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
-    # manifest package since E2) + 10 plugin_* (8 until P38 added plugin_presets,
-    # 9 until P40 added plugin_wavetable) = the tools the running server advertises.
+    # manifest package since E2) + 11 plugin_* (8 until P38 added plugin_presets,
+    # 9 until P40 added plugin_wavetable, 10 until P41 added plugin_sample) = the tools
+    # the running server advertises.
     manifest = _manifest_tool_names()
     assert manifest == ["apply_audiocpp_manifest"], manifest
-    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 70
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 71
 
 
 def test_every_mutating_tool_declares_dry_run_true():

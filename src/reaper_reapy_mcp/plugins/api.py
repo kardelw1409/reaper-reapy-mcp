@@ -1860,6 +1860,7 @@ def plugin_presets(
     op: str | None = None,
     query: str | None = None,
     style: str | None = None,
+    author: str | None = None,
     preset: str | None = None,
     limit: int = 20,
     offset: int = 0,
@@ -1911,7 +1912,9 @@ def plugin_presets(
     data: dict[str, Any] = {"op": operation, "instance": _ref_dict(ref)}
 
     if operation == "search":
-        data.update(capability.search(query=query, style=style, limit=limit, offset=offset))
+        data.update(
+            capability.search(query=query, style=style, author=author, limit=limit, offset=offset)
+        )
         return ok_envelope("plugin_presets", data, meta=meta)
     if operation == "info":
         if not preset:
@@ -2162,6 +2165,223 @@ def _wavetable_capability(provider: Any) -> Any:
     return capability
 
 
+def plugin_sample(
+    *,
+    config: Any = None,
+    instance: Any = None,
+    op: str | None = None,
+    file_path: str | None = None,
+    samples: Any = None,
+    sample_rate: int | None = None,
+    name: str | None = None,
+    on: bool | None = True,
+    loop: Any = None,
+    destination: Any = None,
+    level: Any = None,
+    transpose: Any = None,
+    tune: Any = None,
+    pan: Any = None,
+    keytrack: Any = None,
+    dry_run: bool = True,
+    **_: Any,
+) -> dict[str, Any]:
+    """Load and read the plugin's SAMPLER - the sample engine as a channel (P41).
+
+    Two ops:
+
+    * ``load`` - put a waveform into the sampler: ``file_path`` (a PCM WAV) or ``samples``
+      (raw int16 values, with ``sample_rate``). The block is written through the SAME verified
+      state channel as every other write - the landing bound, the sample balloon, the read-back
+      verification and the rollback all apply - and the sampler's own controls travel in the
+      same batch, so one call both loads the material and switches the engine on
+      (``on`` defaults to true; that is the step a caller forgets);
+    * ``read`` - what the sampler HOLDS now: name, length, sample_rate, channels, seconds,
+      payload size, plus the current value of its controls.
+
+    The provider supplies the vocabulary and the conversions (``SampleCapability``); a provider
+    without the hook is refused by name, and nothing plugin-specific lives in this layer.
+    """
+    from .tools import error_envelope, ok_envelope
+
+    operation = str(op or "").strip().lower()
+    if operation not in ("read", "load"):
+        raise InvalidValue(
+            f"unknown sample op {op!r}",
+            detail={"op": op, "accepted": ["read", "load"]},
+        )
+    enabled = V.strict_bool(dry_run, "dry_run")
+    resolved_config = _config(config)
+    provider, resolution, bridge, registry, source = _resolution_any(
+        resolved_config,
+        instance,
+        require_writable=operation == "load",
+        tool="plugin_sample",
+    )
+    _requires_provider(source, "plugin_sample", "the provider's sampler vocabulary")
+    capability = _sampler_capability(provider)
+    meta = _meta(resolution, source=source)
+    ref = resolution.instance.ref
+    profile = resolution.profile
+
+    if operation == "read":
+        facts = bridge.fx_facts(ref.location["track_index"], ref.location["fx_index"])
+        chunk = bridge.read_state_chunk(ref)
+        slice_ = bridge.locate_state_slice(ref, facts, chunk)
+        document = provider.codec().decode(slice_)["document"]
+        data = capability.read(document)
+        controls = _sampler_control_state(
+            resolved_config, instance, profile, _sampler_mapping(capability)
+        )
+        data["op"] = operation
+        data["controls"] = controls
+        return ok_envelope("plugin_sample", data, meta=meta)
+
+    wanted, skipped = _sampler_controls(
+        profile,
+        {
+            "on": on,
+            "loop": loop,
+            "destination": destination,
+            "level": level,
+            "transpose": transpose,
+            "tune": tune,
+            "pan": pan,
+            "keytrack": keytrack,
+        },
+        _sampler_mapping(capability),
+    )
+    built = capability.load(file_path=file_path, samples=samples, sample_rate=sample_rate, name=name)
+    path = _sampler_slot_path(capability)
+    request: dict[str, Any] = {"state": {path: built["block"]}}
+    if wanted:
+        request["controls"] = wanted
+    data = {
+        "op": operation,
+        "path": path,
+        "described": built["described"],
+        "dry_run": enabled,
+        "controls": wanted,
+    }
+    if skipped:
+        data["controls_skipped"] = skipped
+    transaction = Transaction(
+        provider=provider,
+        codec=provider.codec(),
+        bridge=bridge,
+        profile=profile,
+        ref=ref,
+        request=request,
+        token=resolution.instance.token,
+        registry=registry,
+        dry_run=enabled,
+        label="plugin_sample:load",
+    )
+    result = transaction.run()
+    data.update(result.data)
+    _gaps_from_outcome(result.data, data)
+    data["loaded"] = bool(result.ok) and not [
+        gap for gap in data.get("gaps") or [] if str(gap.get("path")) == path
+    ]
+    if result.ok:
+        return ok_envelope("plugin_sample", data, meta=meta, outcome=result.data.get("outcome"))
+    error = result.error or PluginError("the sample load did not complete")
+    return error_envelope("plugin_sample", error, meta=meta, outcome=result.data.get("outcome"))
+
+
+def _sampler_mapping(capability: Any) -> dict[str, str]:
+    """The capability's knob -> control id map (the core never knows a provider's ids)."""
+    mapping = getattr(capability, "controls", None)
+    if not isinstance(mapping, dict) or not mapping:
+        raise UnsupportedProvider(
+            "this provider's sampler capability does not name its controls, so a knob cannot be "
+            "addressed on it",
+            detail={"missing": "SampleCapability.controls"},
+        )
+    return {str(knob): str(control) for knob, control in mapping.items()}
+
+
+def _sampler_controls(
+    profile: dict[str, Any], knobs: dict[str, Any], mapping: dict[str, str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The caller's knobs as `{control_id: value}`, with what could not be addressed.
+
+    A knob is named in the tool's own vocabulary (`on`, `loop`, `destination`, ...) and the
+    control id is the PROVIDER's - `mapping` is the capability's own table, so this layer never
+    names a provider's ids. A boolean for an enum control is translated to the control's own
+    label ("On"/"Off", read from the profile), because every declared enum takes a member id
+    and a `True` written as `1` would be a guess at band positions. A control the profile does
+    not declare is dropped and NAMED (`controls_skipped`) rather than silently narrowing the
+    batch.
+    """
+    wanted: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    for knob, value in knobs.items():
+        if value is None:
+            continue
+        control_id = mapping.get(knob)
+        if control_id is None:
+            skipped[str(knob)] = f"the capability declares no control for knob {knob!r}"
+            continue
+        control = _control_by_name(profile, control_id)
+        if control is None:
+            skipped[control_id] = f"the profile declares no control {control_id!r} for knob {knob!r}"
+            continue
+        if isinstance(value, bool):
+            members = [str(member.get("id")) for member in control.get("enum_values") or []]
+            label = next(
+                (
+                    member
+                    for member in members
+                    if member.strip().lower() == ("on" if value else "off")
+                ),
+                None,
+            )
+            if label is None:
+                raise InvalidValue(
+                    f"{control_id!r} declares no 'On'/'Off' member, so a boolean cannot address it",
+                    detail={"control": control_id, "knob": knob, "legal": members},
+                )
+            wanted[control_id] = label
+            continue
+        wanted[control_id] = value
+    return wanted, skipped
+
+
+def _sampler_control_state(
+    config: Any, instance: Any, profile: dict[str, Any], mapping: dict[str, str]
+) -> dict[str, Any]:
+    """The sampler's controls as they are NOW (one batched read; never a guess)."""
+    ids = [control for control in mapping.values() if _control_by_name(profile, control)]
+    if not ids:
+        return {}
+    envelope = plugin_read(config=config, instance=instance, controls=ids, include_display=True)
+    return (envelope.get("data") or {}).get("values") or {}
+
+
+def _sampler_capability(provider: Any) -> Any:
+    """The provider's sampler vocabulary, or a typed refusal naming the provider."""
+    hook = getattr(provider, "samples", None)
+    capability = hook() if callable(hook) else None
+    if capability is None:
+        raise UnsupportedProvider(
+            "this provider declares no sampler capability, so no sample can be loaded for it",
+            detail={"provider": str(getattr(provider, "id", "?")), "tool": "plugin_sample"},
+        )
+    return capability
+
+
+def _sampler_slot_path(capability: Any) -> str:
+    """The state path of the sampler block, through the provider's own vocabulary."""
+    hook = getattr(capability, "slot_path", None)
+    if not callable(hook):
+        raise UnsupportedProvider(
+            "this provider's sampler capability does not name its slot path, so a sample cannot "
+            "be addressed on it",
+            detail={"missing": "SampleCapability.slot_path"},
+        )
+    return str(hook())
+
+
 def _wavetable_slot_path(capability: Any, oscillator: Any) -> str:
     """The state path of an oscillator's table slot, through the provider's own vocabulary.
 
@@ -2192,6 +2412,7 @@ BODIES: dict[str, Any] = {
     "plugin_prepare": plugin_prepare,
     "plugin_presets": plugin_presets,
     "plugin_wavetable": plugin_wavetable,
+    "plugin_sample": plugin_sample,
 }
 
 

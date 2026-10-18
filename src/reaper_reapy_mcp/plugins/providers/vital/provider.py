@@ -924,6 +924,17 @@ class VitalProvider:
 
         return tables_module.WavetableCapability()
 
+    def samples(self) -> Any:
+        """The SAMPLER capability (P41) - what `plugin_sample` uses.
+
+        The sampler is its own engine (its payload is PCM, not a single-cycle table), so it has
+        its own vocabulary: how a file becomes the plugin's block, the channel mapping, the
+        buffer bound. A provider without the hook is refused by name, not silently.
+        """
+        from . import samples as samples_module
+
+        return samples_module.SampleCapability()
+
     def guarded_state_paths(self, profile: dict[str, Any]) -> list[str]:
         """State paths a DECLARED-BUT-NOT-EVALUATED hard rule refuses to enter (P38).
 

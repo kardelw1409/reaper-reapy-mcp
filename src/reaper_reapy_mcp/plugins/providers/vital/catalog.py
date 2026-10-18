@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,39 @@ CATALOG_SCHEMA_VERSION = 1
 CATALOG_REVISION = "vital-catalog-r1"
 
 _MAX_ROWS_RETURNED = 500
+
+
+#: How a token hit is weighed, per field: `weights[tier]` where the tier is
+#: 3 = the token IS one of the field's words, 2 = a word starts with it, 1 = it is a
+#: substring somewhere, 0 = no hit. The gap between tiers is deliberate (P41): a word hit
+#: has to outrank any number of substring hits, or a short query stays buried.
+#:
+#: `name` dominates because the file name is the primary match (measured: 549 of the 2,226
+#: corpus files carry no embedded name at all); `id` is the weakest because it carries the
+#: library's own folder words ("presets", "vital"), which are true but say little.
+_FIELD_WEIGHTS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
+    ("name", (0, 12, 30, 40)),
+    ("embedded_name", (0, 6, 15, 20)),
+    ("author", (0, 4, 9, 12)),
+    ("id", (0, 2, 4, 4)),
+)
+
+_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
+
+
+def _tier(text: str, token: str) -> int:
+    """How well one token hits one field: 3 whole word, 2 word prefix, 1 substring, 0 none."""
+    if not text or not token:
+        return 0
+    lowered = text.lower()
+    if token not in lowered:
+        return 0
+    words = _WORD_SPLIT.split(lowered)
+    if token in words:
+        return 3
+    if any(word.startswith(token) for word in words if word):
+        return 2
+    return 1
 
 
 def _user_data_root(env: Mapping[str, str]) -> Path:
@@ -194,15 +228,24 @@ class Catalog:
         *,
         query: str | None = None,
         style: str | None = None,
+        author: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Token search over name / embedded name / author, plus an exact style filter.
+        """RANKED token search over name / embedded name / author / id, plus exact style.
 
-        The tokens mirror the plugin's own browser filter (measured in its
-        source: file name + author) and additionally match the embedded
-        `preset_name` - 549 of the measured 2226 corpus files carry none, which is
-        why the file name is the primary match.
+        The tokens mirror the plugin's own browser filter (measured in its source: file name +
+        author) and additionally match the embedded `preset_name` and the id's own words.
+
+        **Ranked, not alphabetical** (P41, measured): a plain substring filter answers a short
+        query with every row that merely CONTAINS the letters - "ld" matched 140 of 2,226 files
+        ("battlefield", "cold", ...) and the caller had to page and judge. A token's hit now
+        carries a tier (whole word > word prefix > substring, weighted by the field), rows are
+        sorted by score, and each row says which fields it matched (`matched_in`) - so the row a
+        caller wants is first and a poor match is visibly poor rather than merely early.
+
+        The response is also leaner per row: `mtime_ns` is not carried (no caller can act on it)
+        and `embedded_name` appears only when it differs from the file-name-derived `name`.
         """
         try:
             limit = int(limit)
@@ -220,27 +263,64 @@ class Catalog:
         rows = self.rows()
         tokens = [token for token in str(query or "").lower().split() if token]
         wanted_style = str(style or "").strip().lower()
-        matched: list[dict[str, Any]] = []
+        wanted_author = str(author or "").strip().lower()
+        scored: list[tuple[int, int, str, dict[str, Any]]] = []
+        hits: dict[str, int] = {token: 0 for token in tokens}
         for row in rows:
             if wanted_style and str(row.get("style") or "").strip().lower() != wanted_style:
                 continue
-            haystack = " ".join(
-                str(row.get(key) or "").lower() for key in ("name", "embedded_name", "author")
-            )
-            if tokens and not all(token in haystack for token in tokens):
+            if wanted_author and wanted_author not in str(row.get("author") or "").lower():
                 continue
-            matched.append(row)
-        matched.sort(key=lambda row: (str(row.get("name") or "").lower(), str(row.get("id") or "")))
-        page = matched[offset:offset + limit]
+            if not tokens:
+                scored.append((0, 0, str(row.get("name") or "").lower(), row))
+                continue
+            total = 0
+            matched_in: list[str] = []
+            strong = 0
+            for token in tokens:
+                best_field = ""
+                best_weight = 0
+                for field, weights in _FIELD_WEIGHTS:
+                    weight = weights[_tier(str(row.get(field) or ""), token)]
+                    if weight > best_weight:
+                        best_weight, best_field = weight, field
+                if best_weight == 0:
+                    continue
+                hits[token] += 1
+                total += best_weight
+                strong += 1
+                if best_field not in matched_in:
+                    matched_in.append(best_field)
+            if not matched_in:
+                continue
+            enriched = dict(row)
+            enriched.pop("mtime_ns", None)
+            if not enriched.get("embedded_name") or enriched.get("embedded_name") == enriched.get("name"):
+                enriched.pop("embedded_name", None)
+            enriched["score"] = total
+            enriched["matched_in"] = matched_in
+            scored.append((total, strong, str(row.get("name") or "").lower(), enriched))
+        # score first, then how many tokens hit, then the name - deterministic at every step
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2], str(item[3].get("id") or "")))
+        page = [row for _score, _strong, _name, row in scored[offset:offset + limit]]
         styles = sorted({str(row.get("style")) for row in rows if row.get("style")})
+        unmatched = [token for token, count in hits.items() if count == 0]
         return {
-            "total": len(matched),
+            "total": len(scored),
             "offset": offset,
             "limit": limit,
-            "has_more": offset + len(page) < len(matched),
+            "has_more": offset + len(page) < len(scored),
             "rows": page,
+            "terms": tokens,
+            "unmatched_terms": unmatched,
             "styles": styles,
             "library": self.status(),
+            "ranking": (
+                "each token scores by the BEST field it hit (whole word > word prefix > substring, "
+                "weighted name > embedded_name > author > id); rows are sorted by score, then by how "
+                "many tokens hit. `matched_in` names the fields that scored, and a token that hit "
+                "nothing is reported in `unmatched_terms` instead of silently narrowing nothing."
+            ),
         }
 
     def row(self, preset_id: str) -> dict[str, Any] | None:

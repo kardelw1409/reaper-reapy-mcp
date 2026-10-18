@@ -52,6 +52,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "plugin_prepare",
     "plugin_presets",
     "plugin_wavetable",
+    "plugin_sample",
 )
 
 #: Tool-layer fault classification for an unexpected internal exception. This
@@ -264,13 +265,24 @@ SPEC: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "required": False,
                 "default": None,
-                "note": "search: whitespace-separated tokens, each must match the preset name, embedded name or author",
+                "note": (
+                    "search: whitespace-separated tokens matched against name, embedded name, author "
+                    "and id, RANKED (whole word beats word prefix beats substring). Each row says "
+                    "which fields scored (`matched_in`) and a token that hit nothing is reported "
+                    "in `unmatched_terms` - so a few rows are usually enough"
+                ),
             },
             "style": {
                 "type": "string",
                 "required": False,
                 "default": None,
-                "note": "search: exact style filter (the preset's own `preset_style`) ",
+                "note": "search: exact style filter (the preset's own `preset_style`)",
+            },
+            "author": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "search: substring filter on the author/pack name",
             },
             "preset": {
                 "type": "string",
@@ -359,6 +371,82 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": (
             "op, oscillator, table_id/described frames for write+read, preview{described, frames[]} "
             "for preview, gaps[] and outcome for a write"
+        ),
+    },
+    "plugin_sample": {
+        "purpose": (
+            "THE SAMPLER (the plugin's sample engine, an extra oscillator): put a waveform in and "
+            "switch it on. op='load' takes `file_path` (a PCM WAV) or `samples` (raw int16 values "
+            "+ `sample_rate`) and writes the plugin's sample BLOCK through the same verified "
+            "state channel as every other write (landing bound, sample balloon, read-back, "
+            "rollback); the sampler's controls ride the SAME batch, so `on` (default true), "
+            "`loop`, `destination`, `level`, `transpose`, `tune`, `pan`, `keytrack` address them "
+            "by name. op='read' reports what the sampler holds now (name, length, sample_rate, "
+            "channels, seconds, payload bytes) and the current value of those controls. The "
+            "payload is base64 int16 PCM inline in the state: `samples` is the LEFT channel and "
+            "`samples_stereo` the RIGHT, and the plugin's own buffer bound is 1,764,000 samples "
+            "(a longer file is refused by name, not truncated)."
+        ),
+        "args": {
+            "instance": {"type": "object", "required": False, "default": None},
+            "op": {
+                "type": "string",
+                "required": True,
+                "default": None,
+                "enum": ["read", "load"],
+            },
+            "file_path": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "load: a PCM WAV (8/16/32-bit); its own rate and channel count are used",
+            },
+            "samples": {
+                "type": "array",
+                "required": False,
+                "default": None,
+                "note": (
+                    "load: raw int16 values (one row = mono, or [left, right]); needs `sample_rate`"
+                ),
+            },
+            "sample_rate": {
+                "type": "integer",
+                "required": False,
+                "default": None,
+                "note": "load: the rate the buffer plays at (required with raw `samples`)",
+            },
+            "name": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "load: the name the plugin shows (defaults to the file stem)",
+            },
+            "on": {
+                "type": "boolean",
+                "required": False,
+                "default": True,
+                "note": "load: switch the sampler on (default true - a load that stays silent is a bug)",
+            },
+            "loop": {"type": "boolean", "required": False, "default": None},
+            "destination": {
+                "type": "string",
+                "required": False,
+                "default": None,
+                "note": "one of the control's own members, e.g. 'DIRECT OUT' or 'EFFECTS'",
+            },
+            "level": {"type": "number", "required": False, "default": None},
+            "transpose": {"type": "number", "required": False, "default": None},
+            "tune": {"type": "number", "required": False, "default": None},
+            "pan": {"type": "number", "required": False, "default": None},
+            "keytrack": {"type": "boolean", "required": False, "default": None},
+            "dry_run": {"type": "boolean", "required": False, "default": True},
+        },
+        "required": ("op",),
+        "destructive": True,
+        "mutating_ops": ("load",),
+        "returns": (
+            "op, path, described (name/length/channels/payload), controls sent, controls_skipped, "
+            "outcome; op='read' adds the sampler's current control values"
         ),
     },
 }

@@ -970,10 +970,13 @@ class PresetCapability:
         *,
         query: str | None = None,
         style: str | None = None,
+        author: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
-        return self._catalog_for().search(query=query, style=style, limit=limit, offset=offset)
+        return self._catalog_for().search(
+            query=query, style=style, author=author, limit=limit, offset=offset
+        )
 
     def info(self, preset_id: str) -> dict[str, Any]:
         path = safe_join(self.data_dir(), preset_id)
