@@ -747,4 +747,8 @@ def locate_block_span(
         ordinal=chosen_ordinal,
         block_text=chosen["block_text"],
         framing=None,
+        # The real bridge records the WHOLE chunk's length (P42): the host's read ceiling is a
+        # limit on the track's chunk text, so a plan that must stay readable has to know what else
+        # the same track carries. The mock mirrors the measured host, as everywhere else.
+        chunk_chars=len(chunk),
     )

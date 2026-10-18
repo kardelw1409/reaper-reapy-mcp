@@ -453,6 +453,14 @@ class TargetedStateSlice:
     ordinal: int
     block_text: str
     framing: dict[str, Any] | None = None
+    #: The WHOLE track chunk's text length at read time (P42, measured 2026-10-18).
+    #:
+    #: The read ceiling is a limit on what the host can RETURN for a track, not on one plugin's
+    #: block - so a plan that must stay readable has to know what else the same track carries.
+    #: Measured: two instances on one track, each inside the per-instance budget, put the track's
+    #: chunk past the limit, `GetTrackStateChunk` faulted, and the instance could be neither read
+    #: nor restored. Zero means "unknown", which a planner must not read as "nothing else here".
+    chunk_chars: int = 0
 
     def is_valid_for(self, chunk: str) -> bool:
         """The slice may only be used against the chunk it came from."""

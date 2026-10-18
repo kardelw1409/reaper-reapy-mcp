@@ -72,7 +72,9 @@ class DemoCodec:
             framing=None,
         )
 
-    def plan_state_writes(self, doc: dict[str, Any], changes: dict[str, Any]) -> StateWritePlan:
+    def plan_state_writes(
+        self, doc: dict[str, Any], changes: dict[str, Any], *, other_track_chars: int = 0
+    ) -> StateWritePlan:
         paths = dict(changes.get("paths") or {})
         route_ops = [
             {"op": "create", **spec} for spec in (changes.get("routes_create") or [])

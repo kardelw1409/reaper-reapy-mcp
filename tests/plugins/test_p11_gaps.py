@@ -151,7 +151,7 @@ def mock_provider_for_codec() -> MockProvider:
         def restore_changes(self, doc, snap):
             return super().restore_changes(doc, snap)
 
-        def plan_state_writes(self, doc, changes):
+        def plan_state_writes(self, doc, changes, *, other_track_chars: int = 0):
             from reaper_reapy_mcp.plugins.errors import InvalidValue
 
             for path in (changes.get("paths") or {}):

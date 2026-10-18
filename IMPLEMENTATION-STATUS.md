@@ -5618,3 +5618,53 @@ separate token, a caller-held token from before the replacement is still refused
 now lands `ALL_VERIFIED` with the write verbs exercised.
 
 **1164 passed, 2 skipped** (43.9 recorded 1157).
+
+### 44.4 The read ceiling belongs to the TRACK, and the second instance on it cost a rollback
+
+The owner's next request was a demonstration that the tool is location-agnostic ("we can ask for a
+sample change in another track, or in the same track on another fx"), and the demonstration found a
+real defect. Adding a second instance to the SAME track and loading a sample into it answered:
+
+```
+RollbackFailed: the restore attempt raised or produced an unverifiable read-back
+  cause: Unreadable "the host faulted while reading read_state_chunk: the plugin's state is larger
+         than this channel can read (measured: a track-chunk text past ~4 MB makes REAPER's
+         GetTrackStateChunk fault)"
+  outcome: verdict ROLLBACK_FAILED, write_effects_unknown: 1
+```
+
+Recovery had to come from OUTSIDE the layer - `remove_fx(track_index=14, fx_index=1)`, a host
+operation that reads no chunk - because the layer's own way back is a read. That is precisely the
+outcome the ceiling exists to prevent, and the arithmetic that produced it is a unit mix-up:
+
+* `_state_ceiling_chars()` budgeted ONE document (~3,056,250 document characters) and
+  `STATE_CHUNK_CEILING_CHARS = 4_100_000` is a limit on the **whole track's chunk text**, because
+  that is what `GetTrackStateChunk` returns. The track already carried an instance at ~3.06 M chunk
+  characters (75 % of the limit); the second instance's balloon added ~3.8 M more into the same
+  chunk. Each instance was inside its own budget and the SUM was not.
+
+The fix makes the budget what it always was - the track's:
+
+* `TargetedStateSlice.chunk_chars` carries the whole chunk's length from the bridge (`host/reaper.py`
+  for both slice constructors; the mock host mirrors it, as it mirrors every measured host fact).
+  `0` means "unknown", and unknown is treated as the historical behaviour, never as an empty track;
+* `Transaction._other_track_chars()` turns it into "everything that is not this block"
+  (`chunk_chars - len(block_text)`) and passes it to every `plan_state_writes` call, including the
+  rollback's;
+* `StateCodec.plan_state_writes(..., *, other_track_chars: int = 0)` declares it in the universal
+  contract, so a provider is never surprised by the keyword; providers with no such budget ignore it;
+* `_state_ceiling_chars(other_track_chars)` subtracts the deduction from the measured ceiling
+  **before** dividing by the base64 expansion (the two spaces are not the same size - mixing them is
+  how this happened), and the `state_ceiling_reached` notice now carries `other_track_chars` and says
+  whose budget it is: "The budget is the TRACK's and another plugin already holds N characters of it:
+  free room there ... or load a smaller table or preset first".
+
+`tests/plugins/test_p42_track_budget.py` (8 tests) pins it: the arithmetic in both spaces (including
+"a track already past the ceiling leaves zero, never a negative budget"), the transaction's deduction
+from a slice (and its `0` behaviour for an unknown chunk, a missing slice, and a nonsense slice),
+the bridge recording the whole chunk length, the live situation in one assertion (the same plan
+refused alone and refused beside a peer, with the peer's notice naming the deduction and keeping the
+measured `4,189,248`), a light plan that a peer does NOT refuse, both balloon planners taking the
+schedule's ceiling, and the protocol's own signature.
+
+**1172 passed, 2 skipped** (44.3's round recorded 1164).

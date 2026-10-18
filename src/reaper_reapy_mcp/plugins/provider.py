@@ -156,12 +156,20 @@ class StateCodec(Protocol):
         """The slice's own block text -> provider-shaped document view."""
         ...
 
-    def plan_state_writes(self, doc: DocumentView, changes: dict[str, Any]) -> StateWritePlan:
+    def plan_state_writes(
+        self, doc: DocumentView, changes: dict[str, Any], *, other_track_chars: int = 0
+    ) -> StateWritePlan:
         """Ordered ``StateWriteUnit`` rows + rollback plan + verification plan.
 
         Replaces the former ``structural_units()`` count: the codec must
         *decompose* multi-write structural limits explicitly (e.g. one route
         per state unit), never merely report a count.
+
+        ``other_track_chars`` is the text in the SAME track chunk that is not this instance's
+        block. The host's read limit applies to the whole track chunk, so a codec whose plan must
+        stay readable subtracts it (P42, measured live: two instances on one track each inside the
+        per-instance budget put the track past the limit and the chunk became unreadable). A
+        provider with no such budget ignores the argument.
         """
         ...
 

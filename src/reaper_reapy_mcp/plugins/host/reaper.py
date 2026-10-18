@@ -234,6 +234,7 @@ def locate_block_span(
         ordinal=chosen_ordinal,
         block_text=chosen["block_text"],
         framing=None,
+        chunk_chars=len(chunk),
     )
 
 
@@ -290,6 +291,7 @@ def locate_block_by_identity(
         ordinal=ordinal if len(matching) > 1 else 0,
         block_text=chosen["block_text"],
         framing=None,
+        chunk_chars=len(chunk),
     )
 
 

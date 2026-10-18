@@ -671,6 +671,25 @@ class Transaction:
             ]},
         )
 
+    def _other_track_chars(self) -> int:
+        """The TRACK chunk's text that is not this instance's block (P42, measured live).
+
+        The host's read ceiling applies to the whole track chunk, because that is what
+        `GetTrackStateChunk` returns. MEASURED (2026-10-18): two instances of one provider on a
+        single track - each one inside the per-instance budget - put the track past the limit,
+        every read of that track faulted, and the instance could be neither read nor restored
+        (`ROLLBACK_FAILED`). A codec whose plan must stay readable subtracts this; a codec with no
+        such budget ignores it.
+
+        ZERO means "unknown or nothing else", never "an empty track": the ceiling helper treats a
+        zero as no deduction, which is exactly the behaviour measured before this fix.
+        """
+        slice_ = self._last_slice
+        chunk_chars = int(getattr(slice_, "chunk_chars", 0) or 0)
+        if chunk_chars <= 0 or slice_ is None:
+            return 0
+        return max(0, chunk_chars - len(str(getattr(slice_, "block_text", "") or "")))
+
     def _build_units(
         self, document: Any, resolved: ResolvedRequest
     ) -> tuple[list[StateWriteUnit], list[tuple[Any, ...]]]:
@@ -687,7 +706,9 @@ class Transaction:
             state_units: list[StateWriteUnit] = []
         else:
             changes = P.state_changes(resolved)
-            state_plan = self.codec.plan_state_writes(document, changes)
+            state_plan = self.codec.plan_state_writes(
+                document, changes, other_track_chars=self._other_track_chars()
+            )
             state_units = list(state_plan.units)
             # A codec may decline a change it cannot land (P38: the sample block whose
             # growth exceeds the measured write budget). Declined changes are NAMED
@@ -1428,7 +1449,11 @@ class Transaction:
             )
             if str(path) not in self._rollback.excluded:
                 self._rollback.excluded.append(str(path))
-        units = list(self.codec.plan_state_writes(document, changes).units)
+        units = list(
+            self.codec.plan_state_writes(
+                document, changes, other_track_chars=self._other_track_chars()
+            ).units
+        )
         if not units:
             # nothing to write: prove the captured document is already in place
             # rather than assuming it (an empty change set is the comparison)

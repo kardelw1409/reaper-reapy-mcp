@@ -314,8 +314,8 @@ def test_without_the_carry_the_very_same_fixture_drifts_further(monkeypatch):
 
     real_plan = VC.VitalCodec.plan_state_writes
 
-    def sample_first(codec_self, document, changes):
-        plan = real_plan(codec_self, document, changes)
+    def sample_first(codec_self, document, changes, *, other_track_chars: int = 0):
+        plan = real_plan(codec_self, document, changes, other_track_chars=other_track_chars)
         units = list(plan.units)
         index = next(
             index

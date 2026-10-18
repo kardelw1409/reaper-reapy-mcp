@@ -770,7 +770,9 @@ class VitalCodec:
             "framing": _framing_summary(framing, headroom=_headroom_bytes(framing["B"], brace)),
         }
 
-    def plan_state_writes(self, doc: dict[str, Any], changes: dict[str, Any]) -> StateWritePlan:
+    def plan_state_writes(
+        self, doc: dict[str, Any], changes: dict[str, Any], *, other_track_chars: int = 0
+    ) -> StateWritePlan:
         """Plan the state channel as GROWTH-BUDGETED batches (measured law, P38/P39).
 
         Batching: route operations keep their own unit (declared structural limit);
@@ -792,7 +794,14 @@ class VitalCodec:
         as FULL frames, so the state becomes bigger than the table) and then the
         table is written as a SHRINK, which always lands. Measured end to end with
         a 16-frame / 175,497-byte table.
+
+        Readability is budgeted against the WHOLE TRACK, not against this block
+        (P42, measured live 2026-10-18): `other_track_chars` is subtracted from the
+        measured read ceiling first, so a plan cannot put the track's chunk past
+        what the host can return - which is what happened when a second instance on
+        the same track was loaded and the chunk became unreadable.
         """
+        ceiling = _state_ceiling_chars(other_track_chars)
         paths = dict(changes.get("paths") or {})
         units: list[StateWriteUnit] = []
         notices: list[dict[str, Any]] = []
@@ -965,7 +974,7 @@ class VitalCodec:
             planned: list[StateWriteUnit] = []
             for item in order:
                 projected = running_chars + int(item["overhead"])
-                if projected > _state_ceiling_chars():
+                if projected > ceiling:
                     notices.append(
                         {
                             "reason": "state_ceiling_reached",
@@ -974,14 +983,22 @@ class VitalCodec:
                             ),
                             "growth_chars": item["net"],
                             "projected_chars": projected,
-                            "ceiling_chars": _state_ceiling_chars(),
+                            "ceiling_chars": ceiling,
+                            "other_track_chars": other_track_chars,
                             "document_chars_now": _document_chars(document),
                             "message": (
                                 "this value was NOT written: delivering it would leave a state "
                                 "whose track chunk passes what REAPER can read back (measured: "
                                 "4,189,248 characters read fine, 4,240,000 faulted), and the read "
-                                "is what every later step, including the rollback, needs. Free "
-                                "room by loading a smaller table or preset first"
+                                "is what every later step, including the rollback, needs. "
+                                + (
+                                    "The budget is the TRACK's and another plugin already "
+                                    f"holds {other_track_chars} characters of it: free room "
+                                    "there (remove or lighten the other plugin on this track), "
+                                    "or load a smaller table or preset first"
+                                    if other_track_chars
+                                    else "Free room by loading a smaller table or preset first"
+                                )
                             ),
                         }
                     )
@@ -1028,6 +1045,7 @@ class VitalCodec:
                             budget,
                             document_chars=running_chars,
                             sizing=item["sizing"],
+                            ceiling=ceiling,
                         )
                         if balloon is not None and "unit" in balloon:
                             note["balloon"] = balloon["sizing"]
@@ -1384,6 +1402,7 @@ class VitalCodec:
         *,
         document_chars: int | None = None,
         sizing: dict[str, Any] | None = None,
+        ceiling: int | None = None,
     ) -> dict[str, Any] | None:
         """Plan the write that opens room for a table too big to land on its own (P39).
 
@@ -1426,11 +1445,12 @@ class VitalCodec:
             - max(0, int(sizing.get("replaced_chars") or 0))
             + int(sizing.get("room_chars") or 0)
         )
-        if projected > _state_ceiling_chars():
+        allowed = _state_ceiling_chars() if ceiling is None else int(ceiling)
+        if projected > allowed:
             return {
                 "blocked": "state_ceiling",
                 "projected_chars": projected,
-                "ceiling_chars": _state_ceiling_chars(),
+                "ceiling_chars": allowed,
                 "room_chars": int(sizing.get("room_chars") or 0),
             }
         unit = StateWriteUnit(
@@ -1633,14 +1653,14 @@ class VitalCodec:
         )
 
     def _plan_sample_balloon(
-        self, document: Any, target: Any, budget: int
+        self, document: Any, target: Any, budget: int, *, ceiling: int | None = None
     ) -> tuple[StateWriteUnit, dict[str, Any]] | None:
         """Size the sample balloon AND judge it against the live document.
 
         Kept as the self-contained form of the pair (the schedule calls the two halves separately, so
         it can order the pair against the other writes): returns ``None`` when the block cannot be
         inflated, when the balloon's own write would not land, or when its projection passes the read
-        ceiling on the LIVE document.
+        ceiling on the LIVE document - the TRACK's ceiling when the caller knows it.
         """
         sizing = self._sample_balloon_sizing(document, target)
         if sizing is None or sizing["growth_chars"] > budget:
@@ -1648,7 +1668,8 @@ class VitalCodec:
         projected = (
             _document_chars(document) - int(sizing["live_chars"]) + int(sizing["room_chars"])
         )
-        if projected > _state_ceiling_chars():
+        allowed = _state_ceiling_chars() if ceiling is None else int(ceiling)
+        if projected > allowed:
             return None
         return self._sample_balloon_pair(sizing), sizing
 
@@ -1902,14 +1923,22 @@ def _serialized_len(value: Any) -> int:
         return 0
 
 
-def _state_ceiling_chars() -> int:
+def _state_ceiling_chars(other_track_chars: int = 0) -> int:
     """The document size whose chunk text still stays inside the measured read limit.
 
     A plan that lands past this leaves an instance the layer can no longer READ - and the read is
     the first step of every operation, including the rollback. Measured, not estimated: see
     `STATE_CHUNK_CEILING_CHARS`.
+
+    MEASURED (2026-10-18, live) why `other_track_chars` comes off first: the ceiling is a limit on
+    the TRACK's chunk, because that is what `GetTrackStateChunk` returns. Two Vital instances on one
+    track - each one inside this per-instance budget - put the track's chunk past it, the host
+    faulted on every read of that track, and the instance could be neither read nor restored
+    (`ROLLBACK_FAILED`, `write_effects_unknown: 1`). The count is the chunk text that does not
+    belong to this instance's own block, so a track shared with another plugin is budgeted for both.
     """
-    return max(0, int((STATE_CHUNK_CEILING_CHARS - STATE_CEILING_MARGIN_CHARS) / STATE_CHUNK_EXPANSION))
+    allowed = STATE_CHUNK_CEILING_CHARS - STATE_CEILING_MARGIN_CHARS - max(0, int(other_track_chars))
+    return max(0, int(allowed / STATE_CHUNK_EXPANSION))
 
 
 def _document_chars(document: Any) -> int:
