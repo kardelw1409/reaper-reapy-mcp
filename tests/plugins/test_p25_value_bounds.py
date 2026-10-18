@@ -662,9 +662,11 @@ def test_a_widening_record_that_its_range_contradicts_is_refused(fixture_profile
     assert cache.status.quarantined
 
 
-def test_the_revision_is_r14():
-    # r13 -> r14 (P38): the preset library (`preset.py`, `catalog.py`) and the codec's
-    # measured write laws (growth-budgeted batching, writable labels, the sample
-    # block's reload-delay verification). The revision is a pin on purpose: the
-    # semantics changed, so the key must move with them (07 §3.4).
-    assert VitalProvider.implementation_revision == "vital-provider-2026.10-r14"
+def test_the_revision_is_r16():
+    # r15 -> r16 (P39, second half): every wave-carrying source type is supported. The guard
+    # used to accept only `Wave Source`, so an `Audio File Source` slot - how the whole
+    # growl/dubstep family stores its table - was refused; the balloon now replaces the first
+    # source component of ANY type, and an audio payload is verified through a measured
+    # requantization band. The revision is a pin on purpose: the semantics changed, so the key
+    # must move with them (07 §3.4).
+    assert VitalProvider.implementation_revision == "vital-provider-2026.10-r16"

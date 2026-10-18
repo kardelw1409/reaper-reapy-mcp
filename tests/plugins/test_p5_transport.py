@@ -500,12 +500,72 @@ def test_p5_4_sequential_units_rebase_on_the_read_back():
     assert_counters_consistent(result)
 
 
-def test_p5_4b_a_stale_slice_is_refused_by_the_transport():
+def test_p5_4b_a_slice_whose_block_is_unchanged_is_re_located_not_refused():
+    """MEASURED (2026-10-18, live): a changed TRACK is not a changed PLUGIN.
+
+    Starting the transport rewrote the track's chunk while a transaction was walking its units, so
+    a slice located a second earlier no longer matched its chunk. Refusing there failed the whole
+    transaction AND its rollback (the same guard fired in the rollback write, `state: false`),
+    which left a ballooned wavetable slot holding its stub - a broken instance caused by an edit
+    the caller never asked for. The transport now re-locates the block by its identity facts and
+    splices there, because what must hold is that the BLOCK still holds the bytes the plan was
+    built from.
+    """
     host = build_host()
     transaction, host = make(request={"state": {"settings.hq": False}}, host=host, dry_run=False)
     _slice, ref, facts, chunk = slice_and_ref(host)
+    # the track moved under us: a SIBLING plugin on the same track changed, so the chunk differs
+    # (and the target's span may shift) while the target's own block is untouched - the live case
+    # was the transport starting mid-transaction
+    foreign = host.slot(0, 0)
+    foreign.block = foreign.block.replace("Pk9uUFFy", "Pk9uUFFz")
+    assert "Pk9uUFFz" in foreign.block, "the fixture must contain the payload line this edits"
+    target_before = host.slot(0, ref.location["fx_index"]).block
+    moved = host.read_state_chunk(ref)
+    assert moved != chunk, "the fixture must actually move the chunk"
     stale = TargetedStateSlice(
-        chunk_digest=text_digest(chunk + "  "),
+        chunk_digest=text_digest(chunk),  # the CHUNK digest the plan was built against
+        line_start=_slice.line_start,
+        line_end=_slice.line_end,
+        header_line=_slice.header_line,
+        class_hex=_slice.class_hex,
+        ordinal=_slice.ordinal,
+        block_text=_slice.block_text,
+    )
+    new_block = M.TargetedStateSlice(
+        chunk_digest=stale.chunk_digest,
+        line_start=stale.line_start,
+        line_end=stale.line_end,
+        header_line=stale.header_line,
+        class_hex=stale.class_hex,
+        ordinal=stale.ordinal,
+        block_text=stale.block_text,
+    )
+    host.write_state_slice(ref, stale, new_block, timing=M.TimingProfile())
+    assert host.slot(0, ref.location["fx_index"]).block == target_before, (
+        "the re-located write must land on the target's span"
+    )
+    assert "Pk9uUFFz" in host.slot(0, 0).block, (
+        "the sibling's change must survive: only the target's span is spliced"
+    )
+
+
+def test_p5_4c_a_slice_whose_block_did_change_is_refused():
+    """The refusal that MUST stay: the plugin's own state moved since the plan.
+
+    A re-location is only safe while the block holds what the plan was built from; a block whose
+    bytes differ means someone else changed the plugin, and splicing our planned bytes over that
+    change would silently destroy it.
+    """
+    host = build_host()
+    transaction, host = make(request={"state": {"settings.hq": False}}, host=host, dry_run=False)
+    _slice, ref, facts, chunk = slice_and_ref(host)
+    # the plugin's OWN block changed: an external edit inside the addressed state
+    target = host.slot(0, ref.location["fx_index"])
+    target.block = target.block.replace("eyJtZXRhIjp7ImF1dGhvciI6ImRlbW8i", "eyJtZXRhIjp7ImF1dGhvciI6ImVkaXRlZCI")
+    assert target.block != _slice.block_text, "the fixture must actually change the block"
+    stale = TargetedStateSlice(
+        chunk_digest=text_digest(chunk),
         line_start=_slice.line_start,
         line_end=_slice.line_end,
         header_line=_slice.header_line,
@@ -526,8 +586,9 @@ def test_p5_4b_a_stale_slice_is_refused_by_the_transport():
         host.write_state_slice(ref, stale, new_block, timing=M.TimingProfile())
     except Exception as exc:  # noqa: BLE001 - typed refusal asserted by name
         assert type(exc).__name__ == "StateConflict"
+        assert "block changed" in str(exc) or "block changed" in str(getattr(exc, "message", ""))
     else:  # pragma: no cover
-        raise AssertionError("a stale slice must be refused by the transport")
+        raise AssertionError("a slice whose BLOCK changed must be refused by the transport")
 
 
 # ---------------------------------------------------------------------------

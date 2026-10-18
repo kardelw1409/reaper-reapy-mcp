@@ -553,8 +553,9 @@ def change_set(
                 "item": path,
                 "reason": "growth_over_budget",
                 "detail": (
-                    "the preset's value grows the document beyond the measured single-write "
-                    "band, and a write above it is silently ignored by the plugin (it reads "
+                    "the preset's value grows the document beyond the measured landing bound "
+                    "(the ~32 characters that follow the document inside the plugin's state, "
+                    "P39), and a write above it is silently ignored by the plugin (it reads "
                     "back unchanged), so this part of the preset is not carried"
                 ),
                 "growth_chars": growth,
@@ -693,7 +694,7 @@ def change_set(
                 gaps.append(
                     {
                         "item": f"settings.wavetables.{index}",
-                        "reason": "wavetable_growth_refused",
+                        "reason": "wavetable_unwritable",
                         "detail": str(exc.message),
                     }
                 )
@@ -717,24 +718,15 @@ def change_set(
 
     file_sample = file_settings.get("sample")
     if isinstance(file_sample, dict) and live_settings.get("sample") != file_sample:
+        # P39: a growing sample block is CARRIED, not dropped. Its payload may exceed what one
+        # write may grow the document by (measured: 99,508 and 132,300 characters on two real
+        # presets), and the state channel opens room for it with a wavetable slot's balloon -
+        # so the path is handed over and the codec decides. It names the gap itself when no
+        # slot can open enough room (`no_room_for_sample_growth`).
         growth = codec_module._growth_of(document, codec_module.SAMPLE_PATH, file_sample)
-        if growth <= codec_module.BATCH_GROWTH_BUDGET:
-            paths[codec_module.SAMPLE_PATH] = file_sample
-            counts["sample"] = 1
-        else:
-            gaps.append(
-                {
-                    "item": codec_module.SAMPLE_PATH,
-                    "reason": "sample_growth_over_budget",
-                    "detail": (
-                        f"the sample payload would grow the document by {growth} characters; "
-                        f"writes above the measured budget (~+40) silently do not land, so the "
-                        f"sample is not carried"
-                    ),
-                    "growth_chars": growth,
-                    "budget_chars": codec_module.BATCH_GROWTH_BUDGET,
-                }
-            )
+        paths[codec_module.SAMPLE_PATH] = file_sample
+        counts["sample"] = 1
+        counts["sample_growth_chars"] = growth
 
     return {
         "paths": paths,

@@ -1253,6 +1253,7 @@ def plugin_write(
         "dry_run": enabled,
         **result.data,
     }
+    _gaps_from_outcome(result.data, data)
     if result.plan is not None:
         data.setdefault(
             "plan",
@@ -1771,6 +1772,60 @@ def _plan_projection(plan: Any) -> dict[str, Any]:
     }
 
 
+def _gaps_from_outcome(result_data: dict[str, Any], data: dict[str, Any]) -> None:
+    """Fold the transaction's own named gaps into the response, and mark it PARTIAL.
+
+    MEASURED (2026-10-18, offline reproduction of a live batch): a wavetable the read ceiling
+    refused produced `outcome.named_gaps = [{reason: state_ceiling_reached, path: ...}]` while the
+    response carried `gaps: []`, `partial: false` and `verdict: ALL_VERIFIED`. The verdict is true
+    about the units the transaction RAN - it is not a statement that every requested change
+    arrived, and without this fold a caller cannot tell the difference. Two presets of a live
+    family batch lost exactly that way: `ALL_VERIFIED`, no reason, and the oscillator kept its old
+    table.
+
+    Gaps already present (a preset's own plan gaps) are kept and de-duplicated, so the two lists
+    read as one.
+    """
+    outcome = (result_data or {}).get("outcome")
+    if not isinstance(outcome, dict):
+        return
+    named = [gap for gap in (outcome.get("named_gaps") or []) if isinstance(gap, dict)]
+    if not named:
+        return
+    existing = [gap for gap in (data.get("gaps") or []) if isinstance(gap, dict)]
+    seen = {(str(gap.get("reason")), str(gap.get("path"))) for gap in existing}
+    added = 0
+    for gap in named:
+        key = (str(gap.get("reason")), str(gap.get("path")))
+        if key in seen:
+            continue
+        seen.add(key)
+        existing.append(
+            {
+                "channel": gap.get("channel"),
+                "reason": gap.get("reason"),
+                "path": gap.get("path"),
+                "message": gap.get("detail"),
+            }
+        )
+        added += 1
+    data["gaps"] = existing
+    reasons: dict[str, int] = {}
+    for gap in existing:
+        reason = str(gap.get("reason") or "unspecified")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    data["partial"] = True
+    data["write_gaps"] = {
+        "from_outcome": added,
+        "total": len(existing),
+        "reasons": reasons,
+        "note": (
+            "the outcome's verdict covers the units the transaction RAN; these gaps are the "
+            "requested changes that did not arrive, each with its reason"
+        ),
+    }
+
+
 def _preset_carry_flag(plan_view: dict[str, Any], data: dict[str, Any]) -> None:
     """Mark a preset apply PARTIAL whenever any part of the file was not carried.
 
@@ -1927,6 +1982,7 @@ def plugin_presets(
     )
     result = transaction.run()
     data.update(result.data)
+    _gaps_from_outcome(result.data, data)
     _preset_carry_flag(plan_view, data)
     if result.plan is not None:
         data.setdefault("plan", _plan_projection(result.plan))
@@ -1958,6 +2014,170 @@ def plugin_presets(
     return error_envelope("plugin_presets", error, meta=meta, outcome=result.data.get("outcome"))
 
 
+def plugin_wavetable(
+    *,
+    config: Any = None,
+    instance: Any = None,
+    op: str | None = None,
+    oscillator: int | None = 1,
+    table: dict[str, Any] | None = None,
+    frames: int = 2,
+    points: int = 8,
+    dry_run: bool = True,
+    **_: Any,
+) -> dict[str, Any]:
+    """Build, preview and read a wavetable - the SOUND DESIGN channel (P40).
+
+    Three ops over one small object (the spec, documented in the tool's own description and in the
+    provider's table module):
+
+    * ``write`` - build the plugin's table from the spec and deliver it through the state channel
+      that every other write uses: the growth bound, the balloon that opens room, the read-back
+      verification and the rollback all apply unchanged, so a table that cannot be delivered is
+      REFUSED with its reason rather than half-written;
+    * ``preview`` - render the spec with no host at all: what each described frame's peak, RMS and
+      first partials are, how many frames it makes, and what it will cost in state;
+    * ``read`` - what the addressed slot holds NOW, in the same numbers, so "did my waveform
+      arrive" is a comparison and not an opinion.
+
+    The provider supplies the vocabulary (`WavetableCapability`); a provider without it is refused
+    by name, and nothing plugin-specific lives in this layer.
+    """
+    from .tools import error_envelope, ok_envelope
+
+    operation = str(op or "").strip().lower()
+    if operation not in ("write", "read", "preview"):
+        raise InvalidValue(
+            f"unknown wavetable op {op!r}",
+            detail={"op": op, "accepted": ["write", "read", "preview"]},
+        )
+    enabled = V.strict_bool(dry_run, "dry_run")
+    resolved_config = _config(config)
+
+    if operation == "preview":
+        # host-free BY DESIGN: designing a waveform must not need a REAPER instance
+        providers = _providers(resolved_config)
+        if instance is None and len(providers) != 1:
+            raise InvalidValue(
+                "op='preview' with no instance needs exactly ONE configured provider: the spec's "
+                "vocabulary is the provider's, and the response must not guess which one was meant",
+                detail={
+                    "providers": [str(getattr(provider, "id", "?")) for provider in providers],
+                    "remedy": "pass `instance` (any resolved address) or configure one provider",
+                },
+            )
+        provider = providers[0] if instance is None else _resolution_any(
+            resolved_config, instance, tool="plugin_wavetable"
+        )[0]
+        capability = _wavetable_capability(provider)
+        if table is None:
+            raise InvalidValue(
+                "op='preview' needs `table` (the spec)", detail={"op": "preview"}
+            )
+        data = capability.preview(table, frames=int(frames), points=int(points))
+        data["op"] = operation
+        return ok_envelope("plugin_wavetable", data, meta={"instance": None})
+
+    provider, resolution, bridge, registry, source = _resolution_any(
+        resolved_config,
+        instance,
+        require_writable=operation == "write",
+        tool="plugin_wavetable",
+    )
+    _requires_provider(source, "plugin_wavetable", "the provider's table vocabulary")
+    capability = _wavetable_capability(provider)
+    meta = _meta(resolution, source=source)
+    ref = resolution.instance.ref
+
+    facts = bridge.fx_facts(ref.location["track_index"], ref.location["fx_index"])
+    chunk = bridge.read_state_chunk(ref)
+    slice_ = bridge.locate_state_slice(ref, facts, chunk)
+    document = provider.codec().decode(slice_)["document"]
+
+    if operation == "read":
+        data = capability.read(
+            document, oscillator=oscillator, frames=int(frames), points=int(points)
+        )
+        data["op"] = operation
+        return ok_envelope("plugin_wavetable", data, meta=meta)
+
+    if table is None:
+        raise InvalidValue(
+            "op='write' needs `table` (the spec: one of `shape`, `harmonics`, `samples`)",
+            detail={"op": "write", "shapes": list(getattr(capability, "shapes", ()))},
+        )
+    live_version = document.get("synth_version") if isinstance(document, dict) else None
+    built = capability.build(table, live_version=str(live_version) if live_version else None)
+    path = _wavetable_slot_path(capability, oscillator)
+    data: dict[str, Any] = {
+        "op": operation,
+        "oscillator": oscillator,
+        "path": path,
+        "described": built.get("described"),
+        "dry_run": enabled,
+        "shapes": list(getattr(capability, "shapes", ())),
+    }
+    transaction = Transaction(
+        provider=provider,
+        codec=provider.codec(),
+        bridge=bridge,
+        profile=resolution.profile,
+        ref=ref,
+        # The built table goes in as a whole-slot STATE write: the guard that judges a table, the
+        # growth bound, the balloon, the read-back verification and the rollback all live on that
+        # path, and a second way in would be a second set of rules. No `wavetable` spec travels
+        # with it - that vocabulary says "take the table from this preset file", and this table was
+        # BUILT here; the response's own `described` block is what a caller compares against.
+        request={"state": {path: built["table"]}},
+        token=resolution.instance.token,
+        registry=registry,
+        dry_run=enabled,
+        label="plugin_wavetable:write",
+    )
+    result = transaction.run()
+    data.update(result.data)
+    _gaps_from_outcome(result.data, data)
+    data["delivered"] = bool(result.ok) and not [
+        gap for gap in data.get("gaps") or [] if str(gap.get("path")) == path
+    ]
+    if result.ok:
+        return ok_envelope(
+            "plugin_wavetable", data, meta=meta, outcome=result.data.get("outcome")
+        )
+    error = result.error or PluginError("the wavetable write did not complete")
+    return error_envelope(
+        "plugin_wavetable", error, meta=meta, outcome=result.data.get("outcome")
+    )
+
+
+def _wavetable_capability(provider: Any) -> Any:
+    """The provider's table vocabulary, or a typed refusal naming the provider."""
+    hook = getattr(provider, "wavetables", None)
+    capability = hook() if callable(hook) else None
+    if capability is None:
+        raise UnsupportedProvider(
+            "this provider declares no wavetable capability, so no table can be built for it",
+            detail={"provider": str(getattr(provider, "id", "?")), "tool": "plugin_wavetable"},
+        )
+    return capability
+
+
+def _wavetable_slot_path(capability: Any, oscillator: Any) -> str:
+    """The state path of an oscillator's table slot, through the provider's own vocabulary.
+
+    The path is the codec's (`settings.wavetables.<n>`) and this layer must not hard-code it: a
+    provider that names its table list differently would otherwise be written to the wrong place.
+    """
+    hook = getattr(capability, "slot_path", None)
+    if not callable(hook):
+        raise UnsupportedProvider(
+            "this provider's wavetable capability does not name its slot path, so a table cannot "
+            "be addressed on it",
+            detail={"missing": "WavetableCapability.slot_path"},
+        )
+    return str(hook(oscillator))
+
+
 #: tool name -> production body. Registration is unconditional (AUD-013): the
 #: table is attached by `setup_plugin_tools`, and a call with no provider
 #: configured answers a typed `UnsupportedProvider` instead of being absent.
@@ -1971,6 +2191,7 @@ BODIES: dict[str, Any] = {
     "plugin_modulation": plugin_modulation,
     "plugin_prepare": plugin_prepare,
     "plugin_presets": plugin_presets,
+    "plugin_wavetable": plugin_wavetable,
 }
 
 

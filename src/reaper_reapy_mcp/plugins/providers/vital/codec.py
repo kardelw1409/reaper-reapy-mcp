@@ -29,6 +29,7 @@ import array
 import base64
 import copy
 import json
+import math
 import struct
 from dataclasses import dataclass
 from typing import Any
@@ -144,64 +145,104 @@ LABEL_PATHS: tuple[str, ...] = (
     "macro4",
 )
 
+#: The track-chunk TEXT a state may occupy before REAPER's own chunk read gives up on it.
+#:
+#: MEASURED (2026-10-18, live, two states on one track - one readable, one not):
+#:
+#:   * document 3,048,473 chars -> a COMPLETE 4,083,633-character chunk, returned identically at
+#:     every capacity at or above its length (so it was not truncated), decoded and verified;
+#:   * document 3,363,963 chars -> chunk 4,485,284, and `GetTrackStateChunk` answered
+#:     `OSError: exception: access violation writing 0x...` three runs in a row, while the same
+#:     capacities read light tracks (1,176 chars) fine.
+#:
+#: So the host's chunk channel dies somewhere between 4.08 and 4.49 MB of text, and the figure below
+#: is the largest text MEASURED READABLE rather than a guessed buffer size. A state past it risks an
+#: instance that no read can reach again - and the read is the first step of every later operation
+#: (verification, rollback). A capacity BELOW the real length is not a safe fallback either: it
+#: returns exactly `capacity - 1` characters, i.e. a silently truncated chunk.
+STATE_CHUNK_CEILING_CHARS = 4_100_000
+
+#: The chunk carries the document once as base64; measured chunk/document ratios are 1.3333 (the
+#: faulting state) and 1.3396 (the readable one), so the plain base64 step is the right model.
+STATE_CHUNK_EXPANSION = 4 / 3
+
+#: A small allowance for whatever else the track's chunk carries around the plugin block (name,
+#: items, envelopes, the wrapper). The measured readable case had 16,367 chars of slack under the
+#: ceiling, so this margin keeps a projection from planning right onto the measured edge.
+STATE_CEILING_MARGIN_CHARS = 25_000
+
+
 #: The sample object's key inside `settings` and its whole-block path.
 SAMPLE_BLOCK_KEY = "sample"
 SAMPLE_PATH = f"{MUTABLE_ROOT}.{SAMPLE_BLOCK_KEY}"
 
-#: The per-unit GROWTH BUDGET of one state write, in the packer's own ESTIMATE
-#: (serialized-JSON characters per path, measured live 2026-10-16/17, P38, 1.5.5).
+#: The keys of a sample block that carry PCM (`Sample::stateToJson` writes `samples_stereo`
+#: when the buffer is stereo). Both are payloads: both are re-encoded by the plugin, so both are
+#: verified through the measured band and neither is compared as an ordinary field.
+SAMPLE_PAYLOAD_KEYS: tuple[str, ...] = ("samples", "samples_stereo")
+
+#: The host's own trailer inside item B, in bytes (measured, P39). Item B is REAPER's
+#: "VstW" wrapper: a 16-byte header, a chunk magic, the plugin's JSON, a 40-byte trailer of
+#: which the first 32 bytes are inside the plugin-state region ("CcnK", whose own size field
+#: is `len(item B) - 40`) and the last 8 are the host's.
+HOST_TRAILER_BYTES = 8
+
+#: The characters that follow the document INSIDE the plugin's state - the headroom a state
+#: write may grow the document by, measured (P39, 2026-10-17, 1.5.5).
 #:
-#: The channel enforces a real BLOCK-TEXT delta, whose landing band was measured at
-#: +44 (lands) against +48 (silently ignored). The estimate is not that number: it
-#: ignores the base64 expansion of the payload and the wrapping, and the calibration
-#: probe (`probe_p38_batch_calibration.py`, `…194156Z…`) measured the conversion on the
-#: real document - a single control with estimate 14..16 lands at a real delta of
-#: 20..24, i.e. **real ~= 1.4 x estimate**.
+#: The rule the whole channel obeys, measured exactly on plain string fields with the block
+#: delta held constant: a write LANDS iff ``json_end_new <= len(item B, before) - 8``.
+#: Equivalently the document may grow by the bytes that follow its JSON inside the region the
+#: host hands the plugin - 32 characters in every state measured, because the trailer after
+#: the JSON is 40 bytes and the host keeps its last 8. Measured ladder (probe
+#: `probe_p39_wrapper_sizes.py`, evidence `…20261017T211512Z…`): +8/+16/+24/+31 land, +32
+#: lands EXACTLY on the bound, +33/+40/+64 are ignored and leave the state byte-identical.
+#: Patching item B's own size fields does NOT move the bound (measured), so the number the
+#: host uses is its own remembered length, not a field in the text we send.
+STATE_HEADROOM_BYTES = 32
+
+#: Room kept unused so an estimate that undershoots by a few characters cannot silently miss
+#: the bound above. Every measured batch was packed with the resulting number.
+HEADROOM_MARGIN_BYTES = 8
+
+#: The per-unit GROWTH BUDGET of one state write (serialized-JSON characters per unit).
 #:
-#: The budget is set from that conversion rather than from taste. Measured on a
-#: 43-path change set (the Cyberline control diff):
-#:
-#:   budget 12 -> 21 batches, max real delta 24  (the old value: one control per unit,
-#:                because a typical control's estimate alone (14..16) exceeds it)
-#:   budget 24 -> 12 batches, max real delta 25  <- chosen: 19 chars inside the band
-#:   budget 36 ->  6 batches, max real delta 45  (at/over the measured landing band)
-#:   budget 48 ->  4 batches, max real delta 65  (over)
-#:
-#: Fewer units is the dominant saving - every unit costs a base read, a write, a
-#: read-back and a full parameter-vector re-read (the measured reset law) - so the
-#: budget is as high as the band allows with room to spare for a document whose
-#: values serialise differently.
-BATCH_GROWTH_BUDGET = 24
+#: P39 corrected what this number IS. It was originally read off the BLOCK-TEXT delta (+44
+#: lands, +48 does not) and treated as an estimate-conversion problem (real ~= 1.4 x estimate,
+#: see `GROWTH_ESTIMATE_TO_REAL`). Both numbers were the same 32-character DOCUMENT bound seen
+#: through base64 expansion and wrapping: the block delta of a 32-character growth is +44, and
+#: a 33-character growth has the SAME +44 - which is why the boundary looked like a band.
+#: The budget is therefore the measured headroom minus a margin, and the live value is
+#: `decode()["framing"]["headroom_bytes"]` when the framing is available.
+BATCH_GROWTH_BUDGET = STATE_HEADROOM_BYTES - HEADROOM_MARGIN_BYTES
 
 #: Safety cap on paths per batch. The BUDGET, not the count, is the measured
 #: constraint; the cap only stops a pathological single batch.
 BATCH_MAX_PATHS = 60
 
-#: The measured conversion from the packer's ESTIMATE to the real block-text delta
+#: The measured conversion from a per-path ESTIMATE to the real BLOCK-TEXT delta
 #: (2026-10-17, `probe_p38_batch_calibration.py` `…194156Z…`: single controls estimated
-#: at 14..16 landed at 20..24). It exists as a number, not as prose, so the packing
-#: constants can be CHECKED against the measured landing band instead of trusted.
+#: at 14..16 landed at 20..24). Kept because the calibration is still what a block-text
+#: delta is predicted with; it is NOT what the landing rule is made of (see P39):
+#: `BATCH_GROWTH_BUDGET` is a document-growth budget, not an estimate to convert.
 GROWTH_ESTIMATE_TO_REAL = 1.4
 
 #: The largest real block-text delta measured to LAND (and the smallest measured to be
-#: ignored is 48): the cliff the packing constants have to stay under.
+#: ignored is 48): the block-text face of the P39 bound.
 MEASURED_LANDING_BAND = 44
 
-#: The growth ONE path may carry on its own, in the packer's own ESTIMATE (the same
-#: unit as `BATCH_GROWTH_BUDGET`, and deliberately the same value).
+#: The growth ONE path may carry on its own (the same unit and value as `BATCH_GROWTH_BUDGET`).
 #:
-#: No batching can rescue a single path bigger than the band, and the measured outcome
-#: of sending one is a SILENT ignore - the write is accepted, the block is rejected, the
-#: value reads back unchanged - so such a path is named as a gap instead of failing a
-#: transaction that would then roll back everything that DID land. Measured 2026-10-17
-#: (P38 acceptance + calibration): 7 element arrays (`settings.lfos.N.points`/`.powers`,
-#: estimated +140..+372) and a 725-character `comments` label all read back UNCHANGED,
-#: while every control at estimate 14..16 (real delta 20..24) landed and verified.
-#:
-#: At the measured conversion (real ~= 1.4 x estimate, see `BATCH_GROWTH_BUDGET`) a path
-#: at this estimate lands around +34, inside the +44 band; anything above it cannot be
-#: shown to be inside, so it is not attempted.
-SINGLE_PATH_GROWTH_LIMIT = 24
+#: No batching can rescue a single path bigger than the headroom, and the measured outcome of
+#: sending one is a SILENT ignore - the write is accepted, the block is rejected, the value
+#: reads back unchanged - so such a path is named as a gap instead of failing a transaction
+#: that would then roll back everything that DID land. Measured 2026-10-17 (P38 acceptance +
+#: calibration): 7 element arrays (`settings.lfos.N.points`/`.powers`, estimated +140..+372)
+#: and a 725-character `comments` label all read back UNCHANGED. A WAVETABLE slot is the one
+#: exception: it is deliverable by opening room first (`balloon`), so it is planned, not
+#: dropped, when it grows past this.
+SINGLE_PATH_GROWTH_LIMIT = BATCH_GROWTH_BUDGET
+
 
 #: The delay the plugin introduces into the sample payload on EVERY state load
 #: (measured repeatedly 2026-10-16/17: the read-back payload equals the written
@@ -209,6 +250,19 @@ SINGLE_PATH_GROWTH_LIMIT = 24
 #: the captured payload by this much, so the landed sample reproduces the
 #: captured timing exactly (measured: byte-exact restore of the sample slot).
 SAMPLE_RELOAD_DELAY = 4
+
+#: The `length` a sample BALLOON asks for, as a multiple of the file's own sample count.
+#: The plugin re-serializes 8/3 characters per sample (`Sample::stateToJson` writes int16
+#: base64), so 1.2 leaves the file's own payload a comfortable shrink margin to land inside.
+SAMPLE_BALLOON_MARGIN = 1.2
+
+#: Samples a sample balloon's OWN payload carries: the file's opening samples, so the seconds the
+#: balloon is live play the target's own head rather than the memory the plugin preallocated.
+SAMPLE_BALLOON_SAMPLES = 8
+
+#: `Sample::loadSample` clamps its buffer to this (`kMaxSize` in the plugin's source), so a
+#: `length` beyond it cannot be honoured - and a file bigger than it cannot be delivered this way.
+SAMPLE_MAX_SAMPLES = 1_764_000
 
 #: How much of a written sample payload the plugin's OWN re-encode may move.
 #:
@@ -702,7 +756,7 @@ class VitalCodec:
         framing = slice.framing if isinstance(slice.framing, dict) and "B" in slice.framing else None
         if framing is None:
             framing = parse_block_framing(slice.block_text)
-        document, _brace = decode_document(framing["B"])
+        document, brace = decode_document(framing["B"])
         routes = list_routings(document, include_empty=True)
         return {
             "document": document,
@@ -710,25 +764,31 @@ class VitalCodec:
             "routes": list(routes.values()),
             "synth_version": document.get("synth_version"),
             "preset_name": document.get("preset_name"),
-            "framing": _framing_summary(framing),
+            "framing": _framing_summary(framing, headroom=_headroom_bytes(framing["B"], brace)),
         }
 
     def plan_state_writes(self, doc: dict[str, Any], changes: dict[str, Any]) -> StateWritePlan:
-        """Plan the state channel as GROWTH-BUDGETED batches (measured law, P38).
+        """Plan the state channel as GROWTH-BUDGETED batches (measured law, P38/P39).
 
         Batching: route operations keep their own unit (declared structural limit);
-        a wavetable slot rides its own unit (its whole-table guard - not this
-        estimator - bounds its growth); the remaining paths are greedy-packed so
-        each unit's estimated serialized growth stays inside
-        `BATCH_GROWTH_BUDGET`. Measured live on the 1.5.5 build: one big unit
-        (+168 and up) silently does not land, while the same changes split into
-        small batches all land and verify - so the batch, not the request size,
-        is what the channel enforces.
+        a wavetable slot rides its own unit (with a balloon ahead of it when it
+        grows); the remaining paths are greedy-packed so each unit's estimated
+        serialized growth stays inside the channel's budget.
 
-        A single path above `SINGLE_PATH_GROWTH_LIMIT` is NOT attempted at all: no
-        batching can make it land, and the measured outcome is a silent ignore, so
-        it is named as a gap instead of failing a transaction that would then roll
-        back everything else.
+        The budget is a MEASURED landing bound (P39): a state write lands iff the
+        new document is at most `headroom` characters longer than the one the host
+        holds (`len(item B) - 8 - the document's end`, 32 in every state measured;
+        `decode()` reports the live value). One big unit silently does not land, so
+        the batch - not the request size - is what the channel enforces.
+
+        A single path above the budget is NOT attempted: no batching can make it
+        land and the measured outcome is a silent ignore, so it is named as a gap
+        instead of failing a transaction that would then roll back everything that
+        DID land. A WAVETABLE slot is the one exception, and the reason a balloon
+        exists: the slot is inflated first (the plugin re-serializes stub keyframes
+        as FULL frames, so the state becomes bigger than the table) and then the
+        table is written as a SHRINK, which always lands. Measured end to end with
+        a 16-frame / 175,497-byte table.
         """
         paths = dict(changes.get("paths") or {})
         units: list[StateWriteUnit] = []
@@ -738,8 +798,12 @@ class VitalCodec:
                 str(row.get("path")): row for row in (changes.get("wavetable") or [])
             }
             document = doc["document"] if isinstance(doc, dict) and "document" in doc else doc
+            budget = _growth_budget(doc)
             pending: dict[str, Any] = {}
             table_units: list[tuple[str, dict[str, Any]]] = []
+            sample_pair: list[StateWriteUnit] = []
+            sample_pending: Any = None
+            sample_growth = 0
             for path in paths:
                 key = str(path)
                 _check_root(key)
@@ -749,17 +813,23 @@ class VitalCodec:
                     paths[key] = note.pop("normalized_value")
                     table_units.append((key, note))
                     continue
-                limit = BATCH_GROWTH_BUDGET if key == SAMPLE_PATH else SINGLE_PATH_GROWTH_LIMIT
+                limit = budget if key == SAMPLE_PATH else budget
                 growth = _growth_of(document, key, paths[key])
+                if key == SAMPLE_PATH and growth > limit:
+                    # P39: the sample block is carried by OPENING ROOM for it, not dropped. Its
+                    # growth is real (measured 99,508 / 132,300 characters on two presets) and a
+                    # wavetable slot's balloon provides it; the room plan is built below, once
+                    # the table units are known (the sample write has to follow its balloon
+                    # immediately - see the ordering note there).
+                    sample_pending = paths[key]
+                    sample_growth = growth
+                    continue
                 if growth > limit:
-                    # Measured (P38): a write whose OWN growth exceeds the band is
-                    # silently IGNORED by the plugin - the block grows too much for
-                    # its parser to accept, and the value reads back unchanged. The
-                    # sample payload is held to the tighter batching budget (its
-                    # reload behaviour is its own measured law); every other path
-                    # gets the measured single-write boundary. Attempting such a
-                    # write can only fail verification and roll the transaction
-                    # back, so the path is dropped HERE and named as a gap.
+                    # Measured (P38/P39): a write whose OWN growth exceeds the bound is
+                    # silently IGNORED by the plugin - the document ends past the point the
+                    # host hands over, and the value reads back unchanged. Attempting such a
+                    # write can only fail verification and roll the transaction back, so the
+                    # path is dropped HERE and named as a gap.
                     notices.append(
                         {
                             "reason": "growth_over_budget",
@@ -768,26 +838,169 @@ class VitalCodec:
                             "budget_chars": limit,
                             "message": (
                                 "this value was NOT written: its growth exceeds the measured "
-                                "single-write boundary of this channel (a write that grows the "
-                                "document beyond the band is silently ignored by the plugin "
-                                "on this build)"
+                                "landing bound of this channel (a write that grows the document "
+                                "past it is silently ignored by the plugin on this build)"
                             ),
                         }
                     )
                     continue
                 pending[key] = paths[key]
-            for batch in _batch_paths(document, pending):
-                units.append(
-                    StateWriteUnit(order_index=len(units), kind="state", payload={"paths": batch})
-                )
+            # ORDER THE TABLE WRITES SO EVERY BALLOON MEETS THE SMALLEST DOCUMENT IT CAN (P40).
+            #
+            # MEASURED (2026-10-18, live):
+            #   * a preset whose slot must SHRINK was refused a balloon for a second slot when the
+            #     balloon was planned against the live document - which still held the first slot's
+            #     OLD, bigger table. A strict shrink always lands (measured), so a non-balloon write
+            #     that shrinks is free room for everything after it: those go FIRST, biggest shrink
+            #     first.
+            #   * a balloon's peak is `document + room - replaced`, so among the writes that NEED a
+            #     balloon the biggest room must meet the emptiest document: those go next, ordered by
+            #     DESCENDING room. (Ordering them by the smallest first instead cost the fresh-state
+            #     case its third table - measured: 2/3 slots instead of 3/3.)
+            #
+            # The deltas are exact for table writes (both sizes are known from the live document and
+            # the target), and the projection below is computed against the RUNNING size, so a plan is
+            # judged against the document it will actually meet.
+            needs: dict[str, bool] = {}
+            rooms: dict[str, int] = {}
             for key, note in table_units:
-                units.append(
+                growth = _table_growth(note)
+                needs[key] = bool(growth is not None and growth > budget)
+                if needs[key]:
+                    try:
+                        sizing = wavetables_module.balloon_sizing(
+                            paths[key],
+                            dig(document, str(note.get("path"))),
+                            budget_chars=budget,
+                            stub=wavetables_module.frame_stub(paths[key]),
+                        )
+                    except InvalidValue:
+                        sizing = {}
+                    rooms[key] = int(sizing.get("room_chars") or 0)
+            schedule = sorted(
+                table_units,
+                key=lambda item: (
+                    0 if not needs.get(item[0]) else 1,
+                    (_table_growth(item[1]) or 0) if not needs.get(item[0]) else -rooms.get(item[0], 0),
+                ),
+            )
+            running_chars = _running_document_chars(document, sample_pending, sample_growth)
+            planned: list[StateWriteUnit] = []
+            for key, note in schedule:
+                growth = _table_growth(note)
+                if needs.get(key):
+                    balloon = self._plan_balloon(
+                        document, note, paths[key], budget, document_chars=running_chars
+                    )
+                    if isinstance(balloon, dict) and balloon.get("blocked") == "state_ceiling":
+                        notices.append(
+                            {
+                                "reason": "state_ceiling_reached",
+                                "path": note["path"],
+                                "growth_chars": growth,
+                                "projected_chars": balloon.get("projected_chars"),
+                                "ceiling_chars": balloon.get("ceiling_chars"),
+                                "document_chars_now": _document_chars(document),
+                                "message": (
+                                    "this table was NOT written: delivering it would leave a "
+                                    "state whose track chunk passes ~4 MB, which REAPER can no "
+                                    "longer read back (measured) - and the read is what every "
+                                    "later step, including the rollback, needs. Free room by "
+                                    "loading a smaller table (or a normal preset) first"
+                                ),
+                            }
+                        )
+                        continue
+                    if balloon is None:
+                        notices.append(
+                            {
+                                "reason": "no_room_for_growth",
+                                "path": note["path"],
+                                "growth_chars": growth,
+                                "budget_chars": budget,
+                                "message": (
+                                    "this table was NOT written: it grows the document past "
+                                    "the measured landing bound and no balloon can open "
+                                    "enough room for it on this build"
+                                ),
+                            }
+                        )
+                        continue
+                    note["balloon"] = balloon["sizing"]
+                    note["balloon"]["unit"] = len(planned)
+                    planned.append(balloon["unit"])
+                planned.append(
                     StateWriteUnit(
-                        order_index=len(units),
+                        order_index=len(planned),
                         kind="state",
                         payload={"paths": {key: paths[key]}, "wavetable": [note]},
                     )
                 )
+                if growth is not None:
+                    running_chars += growth
+            for batch in _batch_paths(document, pending):
+                units.append(
+                    StateWriteUnit(order_index=len(units), kind="state", payload={"paths": batch})
+                )
+            # P39: a value that is not a table may also outgrow one write - the SAMPLE block
+            # does on real presets (measured: 99,508 and 132,300 characters on two family files).
+            # The room comes from the SAMPLE layer's own amplifier and nowhere else: the plugin
+            # sizes its sample buffer from the JSON's `length` and re-serializes that many
+            # samples (`Sample::jsonToState`), so a block written with a small payload and a
+            # larger `length` reads back BIGGER. Borrowing a wavetable slot's room does NOT work
+            # (measured live: the sample's growth is a growth of the whole document, which the
+            # slot's inflation has already spent) - the sample block has to inflate ITSELF.
+            if sample_pending is not None:
+                room = self._plan_sample_balloon(document, sample_pending, budget)
+                if room is None:
+                    notices.append(
+                        {
+                            "reason": "no_room_for_sample_growth",
+                            "path": SAMPLE_PATH,
+                            "growth_chars": sample_growth,
+                            "budget_chars": budget,
+                            "message": (
+                                "the sample payload was NOT written: it grows the document past "
+                                "the measured landing bound, and the sample block could not be "
+                                "inflated first (its `length` is beyond what this build holds, the "
+                                "live block is too small for the balloon write itself to land, or "
+                                "the result would pass the measured read ceiling)"
+                            ),
+                        }
+                    )
+                else:
+                    unit, sizing = room
+                    sample_unit = StateWriteUnit(
+                        order_index=0,
+                        kind="state",
+                        payload={"paths": {SAMPLE_PATH: sample_pending}},
+                    )
+                    # the balloon and the sample must be ADJACENT: every other unit shrinks the
+                    # document again, and a shrinking document takes the room away
+                    sample_pair = [unit, sample_unit]
+                    notices.append(
+                        {
+                            "reason": "sample_inflated_before_write",
+                            "path": SAMPLE_PATH,
+                            "growth_chars": sample_growth,
+                            "balloon_length": sizing["length"],
+                            "balloon_room_chars": sizing["room_chars"],
+                            "message": (
+                                "the sample block was written in two writes: the live block was "
+                                "first re-declared with a longer `length` and a tiny payload (a "
+                                "shrink, so it lands), which makes the plugin re-serialize a "
+                                "bigger buffer than the file's - and the file's own payload then "
+                                "lands as a shrink of that"
+                            ),
+                        }
+                    )
+            # P40 ORDERING (measured 2026-10-18): the SAMPLE pair (its own balloon and its write,
+            # adjacent - a shrinking document takes its room away), then the TABLE schedule, then
+            # the plain batches. Inside the schedule each balloon sits immediately before the
+            # table it opens room for, and the SHRINKING table writes come first, so every balloon
+            # meets the smallest document the plan can give it - which is what turned a live
+            # `state_ceiling_reached` refusal into a delivered table.
+            units = list(sample_pair) + planned + units
         route_ops = (
             [{"op": "create", **spec} for spec in (changes.get("routes_create") or [])]
             + [{"op": "update", **spec} for spec in (changes.get("routes_update") or [])]
@@ -829,6 +1042,35 @@ class VitalCodec:
         framing = parse_block_framing(current.block_text)
         document = copy.deepcopy(doc["document"] if isinstance(doc, dict) and "document" in doc else doc)
         payload = unit.payload or {}
+        balloon = payload.get("balloon")
+        if isinstance(balloon, dict):
+            # The balloon is built HERE, from the live document: it inflates the table the
+            # engine holds right now, with the stub payload the plan sized it with.
+            slot_path = str(balloon.get("path") or "")
+            table = wavetables_module.balloon_table(
+                dig(document, slot_path),
+                frames=int(balloon.get("frames") or 1),
+                stub=balloon.get("stub"),
+            )
+            set_path(document, slot_path, table)
+        sample_balloon = payload.get("sample_balloon")
+        if isinstance(sample_balloon, dict):
+            # The sample block is re-declared with a longer `length` and a few samples of the
+            # TARGET (P39: the plugin sizes its buffer from `length`, so the read-back is bigger).
+            block = dig(document, SAMPLE_PATH)
+            if not isinstance(block, dict):
+                raise InvalidValue(
+                    "the live document carries no sample block to re-declare",
+                    detail={"path": SAMPLE_PATH},
+                )
+            block["length"] = int(sample_balloon.get("length") or 0)
+            written_payloads = sample_balloon.get("payload")
+            written_payloads = written_payloads if isinstance(written_payloads, dict) else {}
+            for key in SAMPLE_PAYLOAD_KEYS:
+                if key in written_payloads:
+                    block[key] = str(written_payloads[key])
+                else:
+                    block.pop(key, None)
         for path, value in (payload.get("paths") or {}).items():
             try:
                 set_path(document, str(path), value)
@@ -853,6 +1095,44 @@ class VitalCodec:
             framing=parse_block_framing(block_text),
         )
 
+    def _verify_balloon(self, document: Any, balloon: dict[str, Any]) -> VerificationReport:
+        """Verify a balloon by its EFFECT: room for the table it is opening it for.
+
+        The read-back is NOT the value that was written - the plugin re-serializes each stub
+        keyframe as a FULL frame - so the balloon cannot be verified by equality (and that is
+        the whole mechanism). What is verified is the quantity the next write needs: the
+        read-back table's serialized size covers the table being delivered, and it carries at
+        least the keyframes the balloon wrote.
+        """
+        slot_path = str(balloon.get("path") or "")
+        current = dig(document, slot_path)
+        frames_read_back = len(wavetables_module.frame_positions(current))
+        room = wavetables_module.payload_bytes(current)
+        wanted_frames = int(balloon.get("frames") or 0)
+        target_chars = int(balloon.get("target_chars") or 0)
+        ok = frames_read_back >= wanted_frames and room >= target_chars
+        row = {
+            "path": slot_path,
+            "kind": "balloon",
+            "frames_written": wanted_frames,
+            "frames_read_back": frames_read_back,
+            "target_chars": target_chars,
+            "room_chars": room,
+            "growth_chars": balloon.get("growth_chars"),
+            "budget_chars": balloon.get("budget_chars"),
+            "why": balloon.get("why"),
+            "agrees": ok,
+            "channel": "state",
+        }
+        return VerificationReport(
+            ok=ok,
+            rows=[row],
+            mismatched=[] if ok else [row],
+            comparators={"state.balloon": "room >= the table being delivered, read back"},
+            tolerances={"state.float": 1e-05},
+            space="state",
+        )
+
     def verify(
         self, readback: dict[str, Any], unit: StateWriteUnit, policy: VerificationPolicy
     ) -> VerificationReport:
@@ -860,43 +1140,71 @@ class VitalCodec:
         document = readback["document"] if isinstance(readback, dict) and "document" in readback else readback
         routes = {row["slot"]: row for row in list_routings(document, include_empty=True).values()}
         payload = unit.payload or {}
+        if isinstance(payload.get("balloon"), dict) and not payload.get("paths"):
+            return self._verify_balloon(document, payload["balloon"])
+        if isinstance(payload.get("sample_balloon"), dict) and not payload.get("paths"):
+            return self._verify_sample_balloon(document, payload["sample_balloon"])
         rows: list[dict[str, Any]] = []
         notes = {str(row.get("path")): row for row in (payload.get("wavetable") or [])}
         for path, value in (payload.get("paths") or {}).items():
             actual = dig(document, str(path))
             note = notes.get(str(path))
             if note is not None:
-                # A wavetable row reports CONTENT IDENTITIES, not two 11 KB blobs: the
-                # outcome must stay readable, and the identity (a digest over the frame
-                # data) is what a caller can compare. `agrees` is still exact equality
-                # of the whole value, with the numeric tolerance applied field-wise.
-                differing = _differing_fields(value, actual, tolerance)
-                rows.append(
-                    {
-                        "path": str(path),
-                        "kind": "wavetable",
-                        "oscillator": note.get("oscillator"),
-                        "table_id_before": note.get("table_id_before"),
-                        "table_id_written": note.get("table_id_after"),
-                        "table_id_read_back": wavetables_module.table_id(actual)
-                        if isinstance(actual, dict)
-                        else None,
+                # A wavetable row reports CONTENT IDENTITIES, not two multi-kilobyte blobs: the
+                # outcome must stay readable, and the identity (a digest over the wave data) is
+                # what a caller can compare. `agrees` is exact equality of the whole value with
+                # the numeric tolerance applied field-wise - EXCEPT for an `Audio File Source`
+                # payload, which the plugin cannot return byte-identical (measured requant band,
+                # P39e) and which is therefore reported as its own comparison.
+                differing, audio = _table_agreement(value, actual, tolerance)
+                row: dict[str, Any] = {
+                    "path": str(path),
+                    "kind": "wavetable",
+                    "oscillator": note.get("oscillator"),
+                    "table_id_before": note.get("table_id_before"),
+                    "table_id_written": note.get("table_id_after"),
+                    "table_id_read_back": wavetables_module.table_id(actual)
+                    if isinstance(actual, dict)
+                    else None,
+                    "n_frames": note.get("n_frames"),
+                    "payload_bytes": note.get("payload_bytes"),
+                    "rule": note.get("rule"),
+                    "source": note.get("source"),
+                    "stamped_version_to": note.get("stamped_version_to"),
+                    "differing_fields": differing[:12],
+                    "written": {
+                        "table_id": note.get("table_id_after"),
                         "n_frames": note.get("n_frames"),
                         "payload_bytes": note.get("payload_bytes"),
-                        "rule": note.get("rule"),
-                        "source": note.get("source"),
-                        "stamped_version_to": note.get("stamped_version_to"),
-                        "differing_fields": differing[:12],
-                        "written": {
-                            "table_id": note.get("table_id_after"),
-                            "n_frames": note.get("n_frames"),
-                            "payload_bytes": note.get("payload_bytes"),
-                        },
-                        "read_back": wavetables_module.describe(actual),
-                        "agrees": not differing,
-                        "channel": "state",
-                    }
+                        "source_types": note.get("source_types"),
+                    },
+                    "read_back": wavetables_module.describe(actual),
+                    "balloon": note.get("balloon"),
+                    "agrees": not differing,
+                    "channel": "state",
+                }
+                if audio is not None:
+                    row["audio_payload"] = audio
+                    row["read_back"]["table_id_note"] = (
+                        "the id covers the audio payload as WRITTEN: the plugin's own requantization "
+                        "moves up to a step of it (measured), which is what `audio_payload` reports"
+                    )
+                row["table_id_agrees"] = (
+                    row["table_id_read_back"] is not None
+                    and row["table_id_read_back"] == row["table_id_written"]
                 )
+                if not row["table_id_agrees"] and audio is not None and audio.get("within_band"):
+                    # Honest reporting: for an audio-file slot the id CANNOT be expected to match.
+                    # The id is a digest over the payload, and the plugin's int16 round trip moves
+                    # up to a step of it (measured), so a landed write has a different id. What
+                    # proves the write is the masked field comparison plus the band.
+                    row["table_id_agrees_note"] = (
+                        "expected to differ for an audio-file slot: the id is a digest of the "
+                        "payload and the plugin's round trip moves up to 1 step of it, which "
+                        "`audio_payload` measures; the write is verified by the field comparison "
+                        "with the audio taken out, plus that band"
+                    )
+                rows.append(row)
                 continue
             if str(path) == SAMPLE_PATH:
                 # The plugin re-encodes the sample buffer on every state load; a
@@ -992,6 +1300,88 @@ class VitalCodec:
 
     # -- internals ----------------------------------------------------------
 
+    def _plan_balloon(
+        self,
+        document: Any,
+        note: dict[str, Any],
+        target: Any,
+        budget: int,
+        *,
+        document_chars: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Plan the write that opens room for a table too big to land on its own (P39).
+
+        The mechanism is NOT "the bound grows": the bound follows the state's own length, so
+        the room after the JSON is the same headroom for ever. It is that the balloon's
+        RE-SERIALIZATION is bigger than the table being delivered - the plugin writes one full
+        frame per stub keyframe (`WaveSourceKeyframe::jsonToState` memcpys a whole frame from a
+        buffer sized for one) - so the table's own write becomes a SHRINK, and a shrink always
+        lands (measured, 16 frames / 175,497 bytes; P39d measured the same for an `Audio File
+        Source` slot: the stub replaces the audio source, the write drops ~1.4 MB and the
+        read-back is `frames x 10,924` characters).
+
+        The balloon writes into the SAME slot, so the table's write replaces it: nothing
+        survives except the table, and the slot is one the transaction is already changing.
+        While the balloon is live the slot renders the stub (a few seconds), which is why the
+        stub carries the TARGET's own opening samples rather than noise.
+
+        Returns ``{"unit", "sizing"}``, ``{"blocked": "state_ceiling", "projected_chars"}`` when the
+        plan would land past what the host can read, or ``None`` when the live slot cannot afford
+        enough stub keyframes - which the planner names as a gap rather than guessing a smaller one.
+        """
+        slot_path = str(note.get("path") or "")
+        current = dig(document, slot_path)
+        stub = wavetables_module.frame_stub(target)
+        try:
+            sizing = wavetables_module.balloon_sizing(
+                target, current, budget_chars=budget, stub=stub
+            )
+        except InvalidValue:
+            return None
+        if not sizing.get("ok"):
+            return None
+        # The MEASURED read ceiling (2026-10-18): a state whose chunk text passes ~4 MB cannot be
+        # read back at all, so the plan must not go there - the read is what every later step
+        # (verification, rollback) needs. The projection is the document the balloon will MEET
+        # (`document_chars`: the live size, plus the net effect of the units scheduled before it),
+        # minus the slot the balloon rewrites, plus the room it will have afterwards.
+        projected = (
+            (document_chars if document_chars is not None else _document_chars(document))
+            - max(0, int(sizing.get("replaced_chars") or 0))
+            + int(sizing.get("room_chars") or 0)
+        )
+        if projected > _state_ceiling_chars():
+            return {
+                "blocked": "state_ceiling",
+                "projected_chars": projected,
+                "ceiling_chars": _state_ceiling_chars(),
+                "room_chars": int(sizing.get("room_chars") or 0),
+            }
+        unit = StateWriteUnit(
+            order_index=0,
+            kind="state",
+            payload={
+                "balloon": {
+                    "path": slot_path,
+                    "frames": sizing["frames"],
+                    "stub": stub,
+                    "target_chars": sizing["target_chars"],
+                    "room_chars": sizing["room_chars"],
+                    "growth_chars": _table_growth(note),
+                    "write_growth_chars": sizing.get("write_growth_chars"),
+                    "next_write_growth_chars": sizing.get("next_write_growth_chars"),
+                    "budget_chars": budget,
+                    "why": (
+                        "a table whose write grows the document past the landing bound is "
+                        "delivered in two writes: this one makes the state BIGGER than the "
+                        "table (the plugin re-serializes one full frame per stub keyframe), so "
+                        "the table's own write is a shrink - and a shrink always lands"
+                    ),
+                }
+            },
+        )
+        return {"unit": unit, "sizing": sizing}
+
     def _check_wavetable_change(
         self,
         document: Any,
@@ -1060,8 +1450,10 @@ class VitalCodec:
             "table_id_after": verdict["table_id"],
             "n_frames": verdict["n_frames"],
             "payload_bytes": verdict["payload_bytes"],
+            "source_types": verdict.get("source_types"),
             "current_n_frames": (verdict.get("current") or {}).get("n_frames"),
             "current_payload_bytes": (verdict.get("current") or {}).get("payload_bytes"),
+            "current_source_types": (verdict.get("current") or {}).get("source_types"),
             "rule": verdict.get("rule"),
             "source": row.get("source"),
             "preset": row.get("preset"),
@@ -1069,6 +1461,138 @@ class VitalCodec:
         }
         note.update(stamp_note)
         return note
+
+    def _plan_sample_balloon(
+        self, document: Any, target: Any, budget: int
+    ) -> tuple[StateWriteUnit, dict[str, Any]] | None:
+        """The write that opens room for a growing SAMPLE block (P39b mechanism, measured live).
+
+        The plugin sizes its sample buffer from the JSON's ``length`` and re-serializes exactly
+        that many samples (``Sample::jsonToState``). So a block written with a SHORT payload and
+        a LONGER ``length`` reads back bigger than what was written - and the file's own payload
+        then lands as a shrink of that.
+
+        Requirements, both checked here:
+
+        * the balloon's own write must land: it may grow the document by at most `budget`, and it
+          replaces the live payload with a few samples, so the live block must have at least that
+          much payload to give up;
+        * the ``length`` must stay inside what the engine holds (`Sample::loadSample` clamps to
+          1,764,000 samples) and must exceed the target's own sample count, so the read-back is
+          bigger than what the file needs.
+
+        Returns ``(unit, sizing)`` or ``None`` (the caller names the gap).
+        """
+        if not isinstance(target, dict):
+            return None
+        target_length = target.get("length")
+        payloads = {key: target.get(key) for key in SAMPLE_PAYLOAD_KEYS}
+        payloads = {key: value for key, value in payloads.items() if isinstance(value, str) and value}
+        if not isinstance(target_length, int) or target_length <= 0:
+            return None
+        if not payloads:
+            return None
+        live = dig(document, SAMPLE_PATH)
+        if not isinstance(live, dict):
+            return None
+        #: The room the read-back must have: EVERY channel the target carries, because the plugin
+        #: re-serializes each channel at `length` samples (8/3 characters per sample).
+        target_chars = sum(len(value) for value in payloads.values())
+        channels = len(payloads)
+        want_chars = target_chars + HEADROOM_MARGIN_BYTES
+        length = max(
+            int(target_length * SAMPLE_BALLOON_MARGIN),
+            math.ceil(want_chars * 3 / (8 * channels)),
+        )
+        length = max(length, target_length + 1)
+        if length > SAMPLE_MAX_SAMPLES:
+            return None
+        balloon_block = copy.deepcopy(live)
+        balloon_block["length"] = length
+        #: A few samples of the TARGET, so the window is the file's own head, not noise, and the
+        #: same CHANNEL COUNT, so the read-back has the channels the target will need.
+        for key in SAMPLE_PAYLOAD_KEYS:
+            if key in payloads:
+                balloon_block[key] = _sample_head(payloads[key], samples=SAMPLE_BALLOON_SAMPLES)
+            else:
+                balloon_block.pop(key, None)
+        growth = _growth_of(document, SAMPLE_PATH, balloon_block)
+        if growth > budget:
+            return None
+        room = (length * 8 * channels) // 3
+        #: The measured read ceiling applies here too: the balloon's own room is what pushes the
+        #: document up, so a sample balloon can cross the ~4 MB line exactly as a table one can.
+        projected = _document_chars(document) - len(live.get("samples") or "") - len(
+            live.get("samples_stereo") or ""
+        ) + room
+        if projected > _state_ceiling_chars():
+            return None
+        unit = StateWriteUnit(
+            order_index=0,
+            kind="state",
+            payload={
+                "sample_balloon": {
+                    "path": SAMPLE_PATH,
+                    "length": length,
+                    "payload": {key: balloon_block[key] for key in payloads},
+                    "target_length": target_length,
+                    "target_chars": target_chars,
+                    "channels": channels,
+                    "room_chars": room,
+                    "growth_chars": growth,
+                    "budget_chars": budget,
+                    "why": (
+                        "the file's sample payload grows the document past the landing bound, so "
+                        "the live block is first re-declared with a longer `length` and a tiny "
+                        "payload; the plugin then re-serializes that many samples and the file's "
+                        "payload lands as a shrink of it"
+                    ),
+                }
+            },
+        )
+        return unit, {"length": length, "room_chars": room, "target_chars": target_chars,
+                      "growth_chars": growth}
+
+    def _verify_sample_balloon(self, document: Any, balloon: dict[str, Any]) -> VerificationReport:
+        """Verify a sample balloon by its EFFECT: the read-back block is the room it promised.
+
+        The room is EVERY channel's payload, because the plugin re-serializes each channel at
+        ``length`` samples (`Sample::stateToJson` writes `samples_stereo` for a stereo buffer).
+        Measuring only `samples` under-reports it by half - which is how a stereo preset's write
+        was refused while the room it needed was actually there (measured live).
+        """
+        live = dig(document, SAMPLE_PATH)
+        length_read = live.get("length") if isinstance(live, dict) else None
+        channels = {
+            key: len(live[key]) for key in SAMPLE_PAYLOAD_KEYS
+            if isinstance(live, dict) and isinstance(live.get(key), str)
+        }
+        chars = sum(channels.values())
+        wanted = int(balloon.get("length") or 0)
+        target_chars = int(balloon.get("target_chars") or 0)
+        ok = length_read == wanted and chars >= target_chars
+        row = {
+            "path": SAMPLE_PATH,
+            "kind": "sample_balloon",
+            "length_written": wanted,
+            "length_read_back": length_read,
+            "target_chars": target_chars,
+            "room_chars": chars,
+            "room_by_channel": channels,
+            "growth_chars": balloon.get("growth_chars"),
+            "budget_chars": balloon.get("budget_chars"),
+            "why": balloon.get("why"),
+            "agrees": ok,
+            "channel": "state",
+        }
+        return VerificationReport(
+            ok=ok,
+            rows=[row],
+            mismatched=[] if ok else [row],
+            comparators={"state.sample_balloon": "read-back lengthened to `length`, payload >= the file's"},
+            tolerances={"state.float": 1e-05},
+            space="state",
+        )
 
     def _apply_route_op(
         self, document: dict[str, Any], route_op: dict[str, Any], payload: dict[str, Any]
@@ -1229,14 +1753,33 @@ class VitalCodec:
         return rows
 
 
-def _framing_summary(framing: dict[str, Any]) -> dict[str, Any]:
+def _headroom_bytes(B: bytes, brace: int) -> int | None:
+    """The room a state write has left after the document, in characters.
+
+    ``len(item B) - HOST_TRAILER_BYTES - (the end of the JSON)``: the measured landing rule
+    (P39) says a write lands iff the NEW document ends at or before ``len(item B) - 8``, so a
+    write may grow the document by at most this. ``None`` when the document's end cannot be
+    located, which is not the same as "no room" and must not be treated as one.
+    """
+    decoded = _decode_at(B, brace)
+    if decoded is None:
+        return None
+    _obj, consumed = decoded
+    return len(B) - HOST_TRAILER_BYTES - (brace + consumed)
+
+
+def _framing_summary(framing: dict[str, Any], *, headroom: int | None = None) -> dict[str, Any]:
     """What may travel in a DocumentView: sizes and widths, never the bytes."""
-    return {
+    out = {
         "item_a_bytes": len(framing["A"]),
         "item_b_bytes": len(framing["B"]),
         "b64_width": framing.get("b64_width"),
         "b64_artifact_len": len(framing.get("b64_artifact") or ""),
     }
+    if headroom is not None:
+        out["headroom_bytes"] = headroom
+        out["headroom_source"] = "measured: len(item B) - 8 - the document's end (P39)"
+    return out
 
 
 def _agrees(written: Any, read_back: Any, tolerance: float) -> bool:
@@ -1260,6 +1803,29 @@ def _serialized_len(value: Any) -> int:
         return 0
 
 
+def _state_ceiling_chars() -> int:
+    """The document size whose chunk text still stays inside the measured read limit.
+
+    A plan that lands past this leaves an instance the layer can no longer READ - and the read is
+    the first step of every operation, including the rollback. Measured, not estimated: see
+    `STATE_CHUNK_CEILING_CHARS`.
+    """
+    return max(0, int((STATE_CHUNK_CEILING_CHARS - STATE_CEILING_MARGIN_CHARS) / STATE_CHUNK_EXPANSION))
+
+
+def _document_chars(document: Any) -> int:
+    """The serialized size of the whole document (what the chunk text scales from)."""
+    return max(0, payload_size(document))
+
+
+def payload_size(value: Any) -> int:
+    """`len(json.dumps(value, separators))` without materializing a 3 MB string twice."""
+    try:
+        return len(json.dumps(value, separators=(",", ":"), default=str))
+    except Exception:  # noqa: BLE001 - an unencodable document is not measurable
+        return 0
+
+
 def _growth_of(document: Any, path: str, value: Any) -> int:
     """The serialized growth a single path change is expected to add.
 
@@ -1269,6 +1835,52 @@ def _growth_of(document: Any, path: str, value: Any) -> int:
     """
     current = dig(document, path)
     return _serialized_len(value) - (_serialized_len(current) if current is not None else 0)
+
+
+def _growth_budget(doc: Any) -> int:
+    """The growth ONE write may add, from the LIVE framing when it is known.
+
+    `decode()` reports the exact headroom (`len(item B) - 8 - the end of the document`, P39);
+    the constant is the offline fallback, and `HEADROOM_MARGIN_BYTES` is what keeps an
+    estimate that undershoots by a few characters inside the measured bound.
+    """
+    headroom: int | None = None
+    if isinstance(doc, dict):
+        framing = doc.get("framing")
+        if isinstance(framing, dict):
+            candidate = framing.get("headroom_bytes")
+            if isinstance(candidate, int) and candidate > 0:
+                headroom = candidate
+    if headroom is None:
+        headroom = STATE_HEADROOM_BYTES
+    return max(0, headroom - HEADROOM_MARGIN_BYTES)
+
+
+def _table_growth(note: dict[str, Any]) -> int | None:
+    """The document growth a wavetable note's write produces, when both sizes are known.
+
+    ``None`` - never 0 - when either size is unavailable: "unknown" must not read as "fits".
+    """
+    after = note.get("payload_bytes")
+    before = note.get("current_payload_bytes")
+    if not isinstance(after, int) or after < 0:
+        return None
+    if not isinstance(before, int) or before < 0:
+        return None
+    return after - before
+
+
+def _running_document_chars(document: Any, sample_pending: Any, sample_growth: int) -> int:
+    """The document size the TABLE schedule will start from.
+
+    The sample pair runs first, so its own growth is already in the document by the time the first
+    balloon runs; the balloon's transient is released by the sample write that follows it, so only
+    the sample's net growth counts here. A sample that is not being written contributes nothing.
+    """
+    size = _document_chars(document)
+    if sample_pending is not None and sample_growth > 0:
+        size += int(sample_growth)
+    return size
 
 
 def _batch_paths(document: Any, pending: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1292,6 +1904,16 @@ def _batch_paths(document: Any, pending: dict[str, Any]) -> list[dict[str, Any]]
     if current:
         batches.append(current)
     return batches
+
+
+def _sample_head(payload: str, *, samples: int) -> str:
+    wanted = 2 * max(1, int(samples))
+    head = payload[: 4 * ((wanted + 2) // 3)]
+    try:
+        raw = base64.b64decode(head + "=" * (-len(head) % 4))
+    except Exception:  # noqa: BLE001 - a malformed payload starts the balloon on silence
+        raw = b""
+    return base64.b64encode((raw + b"\x00" * wanted)[:wanted]).decode("ascii")
 
 
 def _sample_restore_value(sample: dict[str, Any], delay: int = SAMPLE_RELOAD_DELAY) -> dict[str, Any]:
@@ -1382,37 +2004,149 @@ def _sample_alignment(written: Any, read_back: Any) -> dict[str, Any] | None:
     }
 
 
+def _audio_payload_band(written: Any, read_back: Any) -> dict[str, Any]:
+    """Compare two ``audio_file`` payloads by what the plugin can preserve (measured band).
+
+    MEASURED (P39e, 2026-10-17, live 1.5.5, twice on a 1,409,808-byte growl table): the plugin
+    converts int16 -> float on load and float -> int16 on save, so 8,856 of 528,388 samples
+    (1.676 %) come back moved by EXACTLY one step (histogram: `{1: 8856}`, identical in both
+    trials). A byte comparison would therefore report a landed write as a failure, and a
+    looser one would hide a wrong table. The verdict is: same LENGTH always, and every moved
+    sample within `AUDIO_REQUANT_STEP`.
+    """
+    if not isinstance(written, str) or not isinstance(read_back, str):
+        return {
+            "n_samples": None,
+            "within_band": False,
+            "reason": "payload_missing" if not isinstance(read_back, str) else "written_missing",
+        }
+    if written == read_back:
+        return {
+            "n_samples": len(written) // 4,
+            "differing": 0,
+            "differing_fraction": 0.0,
+            "max_abs_delta": 0,
+            "step": wavetables_module.AUDIO_REQUANT_STEP,
+            "within_band": True,
+            "exact": True,
+        }
+    try:
+        left = array.array("h")
+        left.frombytes(base64.b64decode(written + "=" * (-len(written) % 4)))
+        right = array.array("h")
+        right.frombytes(base64.b64decode(read_back + "=" * (-len(read_back) % 4)))
+    except Exception:  # noqa: BLE001 - an undecodable payload is not a comparison
+        return {"n_samples": None, "within_band": False, "reason": "payload_undecodable"}
+    if len(left) != len(right):
+        return {
+            "n_samples": [len(left), len(right)],
+            "within_band": False,
+            "reason": "payload_length_mismatch",
+        }
+    differing = 0
+    worst = 0
+    for index, (one, other) in enumerate(zip(left, right)):
+        if one != other:
+            differing += 1
+            worst = max(worst, abs(int(one) - int(other)))
+    return {
+        "n_samples": len(left),
+        "differing": differing,
+        "differing_fraction": round(differing / max(1, len(left)), 6),
+        "max_abs_delta": worst,
+        "step": wavetables_module.AUDIO_REQUANT_STEP,
+        "within_band": worst <= wavetables_module.AUDIO_REQUANT_STEP,
+        "exact": differing == 0,
+    }
+
+
+def _table_agreement(written: Any, read_back: Any, tolerance: float) -> tuple[list[str], dict[str, Any] | None]:
+    """Field-wise comparison of two tables, with the AUDIO payload taken out and banded.
+
+    An `Audio File Source` slot (P39: how the growl/dubstep family stores its table) carries
+    one multi-hundred-kilobyte payload that the plugin cannot return byte-identical, so it is
+    compared separately and everything else - the component graph, the keyframe positions, the
+    window and rate fields, the sample layer - stays exact.
+    """
+    written_audio = wavetables_module.audio_payload(written) if isinstance(written, dict) else None
+    read_audio = wavetables_module.audio_payload(read_back) if isinstance(read_back, dict) else None
+    if written_audio is None and read_audio is None:
+        return _differing_fields(written, read_back, tolerance), None
+    masked_written = _without_audio(written)
+    masked_read = _without_audio(read_back)
+    differing = _differing_fields(masked_written, masked_read, tolerance)
+    band = _audio_payload_band(written_audio, read_audio)
+    if not band.get("within_band"):
+        differing.append("audio_file (outside the measured requantization band)")
+    return differing, band
+
+
+def _without_audio(table: Any) -> Any:
+    """The table with every ``audio_file`` payload replaced by a marker (no 1.4 MB copies)."""
+    if not isinstance(table, dict):
+        return table
+    stripped = copy.deepcopy(table)
+    for group in stripped.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for comp in group.get("components") or []:
+            if isinstance(comp, dict) and isinstance(comp.get("audio_file"), str):
+                comp["audio_file"] = "<compared separately>"
+    return stripped
+
+
 def _sample_row(path: str, written: Any, read_back: Any, tolerance: float) -> dict[str, Any]:
-    """The verification row for the whole sample block (never embeds the payloads)."""
-    written_fields = {k: v for k, v in written.items() if k != "samples"} if isinstance(written, dict) else {}
-    read_fields = {k: v for k, v in read_back.items() if k != "samples"} if isinstance(read_back, dict) else {}
+    """The verification row for a sample block (never embeds the payloads).
+
+    EVERY payload key is taken out of the field comparison and compared through the measured
+    alignment/requant band - not just `samples`: a preset's sample may be STEREO, and then
+    `samples_stereo` is a second payload the plugin re-encodes just the same (measured on a
+    family preset whose stereo sample refused the write when its second channel was compared as
+    a plain field).
+    """
+    written = written if isinstance(written, dict) else {}
+    read_back = read_back if isinstance(read_back, dict) else {}
+    written_fields = {k: v for k, v in written.items() if k not in SAMPLE_PAYLOAD_KEYS}
+    read_fields = {k: v for k, v in read_back.items() if k not in SAMPLE_PAYLOAD_KEYS}
     differing = _differing_fields(written_fields, read_fields, tolerance)
-    alignment = _sample_alignment(
-        written.get("samples") if isinstance(written, dict) else None,
-        read_back.get("samples") if isinstance(read_back, dict) else None,
+    payloads: dict[str, Any] = {}
+    for key in SAMPLE_PAYLOAD_KEYS:
+        if not isinstance(written.get(key), str) and not isinstance(read_back.get(key), str):
+            continue
+        payloads[key] = _sample_alignment(written.get(key), read_back.get(key))
+    agrees = (
+        not differing
+        and bool(payloads)
+        and all(row is not None and row.get("within_delay") for row in payloads.values())
     )
-    agrees = not differing and bool(alignment) and bool(alignment.get("within_delay"))
     row: dict[str, Any] = {
         "path": path,
         "kind": "sample",
         "written_fields": written_fields,
         "read_back_fields": read_fields,
         "differing_fields": differing[:8],
-        "payload_written_chars": len(written["samples"]) if isinstance(written, dict) and isinstance(written.get("samples"), str) else None,
-        "payload_read_back_chars": len(read_back["samples"]) if isinstance(read_back, dict) and isinstance(read_back.get("samples"), str) else None,
-        "payload_compared": alignment,
+        "payload_written_chars": {
+            key: len(written[key]) for key in SAMPLE_PAYLOAD_KEYS if isinstance(written.get(key), str)
+        },
+        "payload_read_back_chars": {
+            key: len(read_back[key]) for key in SAMPLE_PAYLOAD_KEYS if isinstance(read_back.get(key), str)
+        },
+        "payloads": payloads,
         "agrees": agrees,
         "channel": "state",
     }
-    if agrees and alignment is not None and not alignment.get("exact"):
+    #: the single-payload shape is kept for the rows written before a second channel existed
+    first = payloads.get("samples")
+    row["payload_compared"] = first
+    if agrees and first is not None and not first.get("exact"):
         row["unverifiable"] = {
             "leaf": f"{path}.samples",
             "reason": (
                 "the plugin re-encodes the sample buffer on every state load: the read-back "
-                f"payload equals the written one delayed by {alignment.get('shift')} sample(s) "
+                f"payload equals the written one delayed by {first.get('shift')} sample(s) "
                 f"(measured reload delay {SAMPLE_RELOAD_DELAY}), with "
-                f"{alignment.get('residual_differing')} of {alignment.get('n_samples')} samples "
-                f"moved by at most {alignment.get('residual_max_abs')} step(s) - the plugin's own "
+                f"{first.get('residual_differing')} of {first.get('n_samples')} samples "
+                f"moved by at most {first.get('residual_max_abs')} step(s) - the plugin's own "
                 "truncating int16 requantization (measured). Byte equality is not obtainable on "
                 "this channel even though the write landed; this row states what was measured."
             ),

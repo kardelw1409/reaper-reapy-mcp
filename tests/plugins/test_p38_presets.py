@@ -22,6 +22,7 @@ if str(PLUGINS.parents[1]) not in sys.path:
 
 from reaper_reapy_mcp.plugins.errors import InvalidValue  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital import catalog as CAT  # noqa: E402
+from reaper_reapy_mcp.plugins.providers.vital import codec as VC  # noqa: E402
 from reaper_reapy_mcp.plugins.providers.vital import preset as PRESET  # noqa: E402
 
 
@@ -217,14 +218,24 @@ def test_change_set_skips_a_guarded_state_path_with_a_gap():
     assert outcome["counts"]["guarded_skipped"] == 1
 
 
-def test_change_set_names_an_oversized_sample_as_a_gap():
+def test_change_set_carries_an_oversized_sample():
+    """P39: a growing sample block is no longer dropped - the state channel opens room for it.
+
+    Measured on two real presets (`BASS Broken Circuit`, `BASS - Deep 2`): the file's sample
+    payload grows the document by 99,508 and 132,300 characters, which no single write may do -
+    and a wavetable slot's balloon provides exactly that room (its write is a shrink of the live
+    table, its read-back is `frames x 10,924` characters). The change set therefore hands the
+    path over; the codec plans the balloon, the sample and the slot's write-back, and names
+    `no_room_for_sample_growth` only when no slot can open enough room.
+    """
     file_doc = preset_document(sample_len=4096)
     live = preset_document(sample_len=64)
     outcome = PRESET.change_set(live, file_doc)
     assert PRESET.__name__  # silence linters about the import alias
-    assert all(path != "settings.sample" for path in outcome["paths"])
-    reasons = [gap["reason"] for gap in outcome["gaps"]]
-    assert "sample_growth_over_budget" in reasons
+    assert outcome["paths"]["settings.sample"]["length"] == 4096
+    assert outcome["counts"]["sample"] == 1
+    assert outcome["counts"]["sample_growth_chars"] > VC.BATCH_GROWTH_BUDGET
+    assert "sample_growth_over_budget" not in [gap["reason"] for gap in outcome["gaps"]]
 
 
 def test_change_set_carries_a_same_size_sample():
@@ -387,7 +398,17 @@ def test_an_unreadable_drops_memo_degrades_to_nothing_known(tmp_path: Path):
     assert PRESET.known_dropped_destinations(tmp_path, "1.5.5") == []
 
 
-def test_change_set_declines_a_growing_wavetable_slot(tmp_path: Path):
+def test_change_set_carries_a_growing_wavetable_slot(tmp_path: Path):
+    """P39: a growing table is CARRIED, not declined.
+
+    The change set used to drop this slot with `wavetable_growth_refused`, because a
+    growing table could not land and one such attempt had aborted the host (P30). P39
+    measured what it had hit - a state write may grow the document by ~32 characters, and
+    patching item B's size fields does not move it - and then landed a 16-frame /
+    175,497-byte table by writing an inflated table first and the real one as a shrink.
+    The guard no longer caps a table's size, so this slot travels and the STATE CHANNEL
+    plans the two writes (asserted in `test_p39_balloon.py`).
+    """
     table = {
         "name": "T",
         "version": "1.5.5",
@@ -424,8 +445,23 @@ def test_change_set_declines_a_growing_wavetable_slot(tmp_path: Path):
     live = preset_document()
     live["settings"]["wavetables"] = [live_table]
     outcome = PRESET.change_set(live, file_doc, data_dir_path=tmp_path, preset_id="User/Presets/x.vital")
+    assert [spec["preset_slot"] for spec in outcome["wavetables"]] == [1]
+    assert outcome["counts"]["wavetables_declined"] == 0
+    assert "wavetable_unwritable" not in [gap["reason"] for gap in outcome["gaps"]]
+
+
+def test_change_set_still_declines_a_slot_without_wave_frames(tmp_path: Path):
+    """What the guard refuses now is the VALUE, not its size: a table with no wave source."""
+    processing_only = {"name": "T", "version": "1.5.5", "groups": [{"components": [{"type": "Wave Folder"}]}]}
+    file_doc = preset_document()
+    file_doc["settings"]["wavetables"] = [processing_only]
+    outcome = PRESET.change_set(
+        preset_document(), file_doc, data_dir_path=tmp_path, preset_id="User/Presets/x.vital"
+    )
     assert outcome["wavetables"] == []
-    assert "wavetable_growth_refused" in [gap["reason"] for gap in outcome["gaps"]]
+    assert outcome["counts"]["wavetables_declined"] == 1
+    gap = [row for row in outcome["gaps"] if row["reason"] == "wavetable_unwritable"]
+    assert gap and "Wave Source" in gap[0]["detail"]
 
 
 # ---------------------------------------------------------------------------

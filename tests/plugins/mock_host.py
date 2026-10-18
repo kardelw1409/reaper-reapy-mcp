@@ -24,6 +24,7 @@ from reaper_reapy_mcp.plugins.errors import (
     Unreadable,
     Wedged,
 )
+from reaper_reapy_mcp.plugins.host import reaper as R
 from reaper_reapy_mcp.plugins.model import (
     FxHostFacts,
     PluginInstanceRef,
@@ -190,6 +191,7 @@ class MockHostBridge:
         *,
         sleeper: Callable[[float], None] | None = None,
         reset_params_on_state_write: dict[str, float] | None = None,
+        state_write_transform: Callable[[str], str] | None = None,
     ) -> None:
         self.tracks = list(tracks) if tracks else [self.default_track()]
         self.log: list[tuple[str, dict[str, Any]]] = []
@@ -197,6 +199,13 @@ class MockHostBridge:
         self.sleeps: list[float] = []
         self.sleeper = sleeper or self.sleeps.append
         self.reset_params_on_state_write = dict(reset_params_on_state_write or {})
+        #: A block transform applied before a state write is stored, so a test can mirror a
+        #: PLUGIN behaviour the layer depends on (measured example: Vital re-serializes a
+        #: wavetable keyframe as a FULL frame whatever payload it was written with, so a
+        #: write whose read-back is the padding-inclusive value can be exercised offline).
+        #: `None` (the default) stores exactly what was sent, which is what the other
+        #: suites want.
+        self.state_write_transform = state_write_transform
         self._injections: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._after_hooks: dict[tuple[str, int], Callable[[], None]] = {}
 
@@ -541,16 +550,24 @@ class MockHostBridge:
         track = self.track(int(ref.location.get("track_index", 0)))
         chunk = track.chunk()
         self._record("write_state_slice")
+        span = slice
+        relocated = False
         if not slice.is_valid_for(chunk):
-            raise StateConflict(
-                "the slice no longer matches the live chunk; it must be re-located",
-                detail={"slice_chunk_digest": slice.chunk_digest, "live_chunk_digest": text_digest(chunk)},
-            )
+            # The REAL bridge's rule, shared rather than copied: a chunk that moved for reasons
+            # outside this plugin (the mock models it by mutating the track between the read and
+            # the write) is re-located by identity, and only a changed BLOCK is a conflict. Using
+            # the bridge's own function here is what makes an offline test evidence about the
+            # shipping path instead of about the mock.
+            span = R.relocate_unchanged_block(chunk, slice)
+            relocated = True
         sent_digest = text_digest(new_block.block_text)
         if mode != "store-nothing":
+            block_text = new_block.block_text
+            if self.state_write_transform is not None:
+                block_text = self.state_write_transform(block_text)
             lines = chunk.split("\n")
-            replacement = new_block.block_text.split("\n")
-            spliced = "\n".join(lines[: slice.line_start] + replacement + lines[slice.line_end + 1 :])
+            replacement = block_text.split("\n")
+            spliced = "\n".join(lines[: span.line_start] + replacement + lines[span.line_end + 1 :])
             track.set_chunk(spliced)
             if self.reset_params_on_state_write:
                 target = self.slot(

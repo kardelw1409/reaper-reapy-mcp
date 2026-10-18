@@ -6,9 +6,11 @@ wave-related controls are `*_wave_frame`, the position INSIDE a table), and the 
 channel is the only way to change it. What these tests pin is not "a table can be
 written" - it is the three things that make such a write safe:
 
-1. the **guard** (schema, no growth beyond what the engine holds, `version` stamped from
+1. the **guard** (schema, a whole table with `Wave Source` frames, `version` stamped from
    the live document, the slot must exist) fires on the semantic op AND on the raw state
-   path, because the raw path is a way to reach the same slot;
+   path, because the raw path is a way to reach the same slot. Its old size cap is gone
+   (P39): a table that grows the document is DELIVERED, by the balloon the state channel
+   plans ahead of it (`test_p39_balloon.py`);
 2. the **verification row** reports content identities (and, when it disagrees, WHICH
    field) rather than two multi-kilobyte blobs;
 3. the **rollback** expresses a slot as one whole-table change, never as its leaves -
@@ -192,7 +194,13 @@ def test_a_non_growing_sine_table_replaces_the_saw_end_to_end(tmp_path):
 
 
 def test_the_raw_state_path_is_guarded_too(tmp_path):
-    """A caller cannot bypass the guard by writing the dotted path directly."""
+    """A caller cannot bypass the guard by writing the dotted path directly.
+
+    P39 changed what the guard DOES with a growing table (it is planned as a balloon plus the
+    table instead of being refused), so the growing half of this test moved to
+    `test_p39_balloon.py`; what it still pins here is that the RAW path reaches the same
+    guard - the structural refusals fire on it, and a whole table through it is planned.
+    """
     preset = preset_file(tmp_path, [table(sine())])
     key = f"settings.wavetables.{WT.SETTINGS_KEY and 0}"
     sine_table = table(sine())
@@ -200,29 +208,56 @@ def test_the_raw_state_path_is_guarded_too(tmp_path):
     assert ok.ok is True, ok.error and ok.error.to_dict()
     assert [row for row in host.log if row[0] == "write_state_slice"]
 
-    # ... and a GROWING table through the same raw path is refused before any write
-    growing = table(sine(), frames=[frame(0, sine()), frame(128, sine())])
-    refused, host2 = vital_transaction({"state": {key: growing}}, dry_run=False)
-    assert refused.ok is False
-    assert refused.error.code == "InvalidValue"
-    assert "growing payload" in refused.error.message or "larger" in refused.error.message
-    assert refused.outcome.host.write_calls_attempted == 0
-    assert [row for row in host2.log if row[0].startswith("write")] == []
+    # the guard is not bypassed: a slot the engine does not hold is refused on this path too
+    codec = T7.provider_on_fixtures().codec()
+    doc = document()
+    del doc["settings"]["wavetables"][2]
+    with pytest.raises(InvalidValue) as exc:
+        codec.plan_state_writes(doc, {"paths": {"settings.wavetables.2": table(sine())}})
+    assert "does not address wavetable slot" in exc.value.message
+
+    # ... and a write INSIDE a slot is refused here as well
+    with pytest.raises(InvalidValue) as exc:
+        codec.plan_state_writes(document(), {"paths": {"settings.wavetables.0.groups": []}})
+    assert "inside" in exc.value.message
 
 
-def test_a_growing_table_is_refused_on_the_dry_run_too(tmp_path):
+def test_a_growing_table_is_planned_with_a_balloon_on_the_dry_run_too(tmp_path):
+    """A dry run reports the two writes a growing table needs (P39), never a refusal."""
     preset = preset_file(tmp_path, [table(sine())])
     growing = table(sine(), frames=[frame(0, sine()), frame(128, sine())])
     result, host = vital_transaction(
         {"wavetable": [{"oscillator": 1, "from_preset": preset}]}, dry_run=True
     )
     assert result.ok is True, "the fixture preset is non-growing: the dry run must be available"
-    refused, _host = vital_transaction({"state": {"settings.wavetables.0": growing}}, dry_run=True)
-    assert refused.ok is False and refused.error.code == "InvalidValue"
-    detail = refused.error.detail
-    assert detail["growth_in_frames"] == 1
-    assert detail["current"]["n_frames"] == 1
-    assert "aborted" in json.dumps(detail), "the refusal carries the measurement that produced the bound"
+
+    planned, host2 = vital_transaction({"state": {"settings.wavetables.0": growing}}, dry_run=True)
+    assert planned.ok is True
+    assert [row for row in host2.log if row[0].startswith("write")] == []
+
+    # the plan itself, from the codec that builds it, over the fixture's own state
+    codec = T7.provider_on_fixtures().codec()
+    host3 = MH.MockHostBridge(tracks=[MH.MockTrack(0, "Track 1", [vitals_slot()])])
+    ref = M.PluginInstanceRef(
+        host="reaper", location=dict(INSTANCE), provider="vital", identity=T7.IDENTITY
+    )
+    live = codec.decode(
+        host3.locate_state_slice(ref, host3.fx_facts(0, 0), host3.read_state_chunk(ref))
+    )
+    plan = codec.plan_state_writes(live, {"paths": {"settings.wavetables.0": growing}})
+    payloads = [sorted((unit.payload or {}).keys()) for unit in plan.units]
+    assert payloads == [["balloon"], ["paths", "wavetable"]], payloads
+    balloon = plan.units[0].payload["balloon"]
+    assert balloon["frames"] >= 1
+    # one full re-serialized frame per stub keyframe: the room has to cover the table
+    assert balloon["room_chars"] >= balloon["target_chars"]
+    # and BOTH writes are inside the channel's measured landing bound
+    assert balloon["write_growth_chars"] <= VC.BATCH_GROWTH_BUDGET
+    assert balloon["target_chars"] - balloon["room_chars"] <= VC.BATCH_GROWTH_BUDGET
+    assert balloon["path"] == "settings.wavetables.0"
+    assert balloon["budget_chars"] == VC.BATCH_GROWTH_BUDGET
+    assert plan.notices == []
+    assert plan.units[1].payload["paths"].keys() == {"settings.wavetables.0"}
 
 
 def test_a_table_without_wave_frames_is_refused():

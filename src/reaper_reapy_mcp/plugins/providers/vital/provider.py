@@ -145,7 +145,21 @@ __all__ = ["IMPLEMENTATION_REVISION", "VitalProvider"]
 #: plugin's measured 4-sample reload delay. The provider now owns a capability
 #: (`presets()`) and its label/sample write surface - both are behaviour the profile and
 #: the tool layer depend on, so the key must move (07 §3.4).
-IMPLEMENTATION_REVISION = "vital-provider-2026.10-r14"
+#: r15 (2026-10-17): **the landing bound was measured** (P39). A growing table is no longer
+#: refused: a state write may grow the document by the ~32 characters that follow it inside
+#: the plugin's state, and a table that needs more is delivered in two writes (an inflated
+#: table, then the table as a shrink) - measured with a 16-frame / 175,497-byte table. The
+#: codec reports the live headroom, plans the balloon, verifies it by room, and the wavetable
+#: guard judges the value instead of its size. A behaviour-affecting fact, so the key moves.
+#: r16 (2026-10-18): **every wave-carrying source type is supported** (P39, second half). The
+#: guard used to accept only `Wave Source`, so an `Audio File Source` slot - how the whole
+#: growl/dubstep family stores its table, one base64 int16 PCM payload of up to ~1.4 MB - was
+#: refused; it is carried now (`carries_waves`, `audio_payload`, `audio_samples`, a generalized
+#: `table_id`), the balloon replaces the first source component of ANY type, and the audio
+#: payload is verified through a measured requantization band (1.676 % of samples move by one
+#: step) instead of a byte comparison. Four fields and one verification rule changed, so the
+#: key must move (07 §3.4).
+IMPLEMENTATION_REVISION = "vital-provider-2026.10-r16"
 
 _PROVIDER_FILES = (
     "provider.py",
@@ -898,6 +912,18 @@ class VitalProvider:
 
         return preset_module.PresetCapability()
 
+    def wavetables(self) -> Any:
+        """The table CONSTRUCTION capability (P40) - what `plugin_wavetable` uses.
+
+        A caller describes a waveform (a named shape, an additive spectrum, raw samples) and this
+        side turns it into the plugin's own table object. Everything plugin-specific stays here:
+        the frame width, the 0..256 axis, the component shape, the version stamp. A provider
+        without the hook is refused by name, not silently.
+        """
+        from . import tables as tables_module
+
+        return tables_module.WavetableCapability()
+
     def guarded_state_paths(self, profile: dict[str, Any]) -> list[str]:
         """State paths a DECLARED-BUT-NOT-EVALUATED hard rule refuses to enter (P38).
 
@@ -939,10 +965,11 @@ class VitalProvider:
             f"only the measured version(s) {sorted(SUPPORTED_VERSIONS)} are accepted",
             "one route per state write",
             "no line_mapping writes",
-            "a wavetable write replaces the table the engine holds and may not GROW it "
-            "(measured host-abort boundary: a larger payload does not land and once aborted "
-            "the host); the table is selected by content, and `*_wave_frame` only moves "
-            "INSIDE the selected table",
+            "a wavetable write replaces the whole table the engine holds (a write INSIDE a "
+            "slot is refused); a table that grows the document is delivered in two writes - "
+            "an inflated table first, then the table as a shrink (P39, measured with a "
+            "16-frame / 175,497-byte table); the table is selected by content, and "
+            "`*_wave_frame` only moves INSIDE the selected table",
             "a control write is issued only when the host's parameter name at the declared "
             "index matches the control (verified live on every write; a mismatch refuses)",
         ]

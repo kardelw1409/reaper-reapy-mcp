@@ -51,6 +51,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "plugin_modulation",
     "plugin_prepare",
     "plugin_presets",
+    "plugin_wavetable",
 )
 
 #: Tool-layer fault classification for an unexpected internal exception. This
@@ -299,6 +300,64 @@ SPEC: dict[str, dict[str, Any]] = {
         "returns": (
             "op, preset(s), counts, gaps[], plan/outcome for apply, file info for save; "
             "`partial` and `dropped_routes` name the routings the plugin itself discarded"
+        ),
+    },
+    "plugin_wavetable": {
+        "purpose": (
+            "SOUND DESIGN: the waveform an oscillator reads, described in one small object and "
+            "written into a wavetable slot. op='write' builds a table from a spec and delivers it "
+            "through the same verified state channel as any other write (dry-run by default); "
+            "op='preview' renders the spec host-free (per-frame peak/RMS/partials, plus the frame "
+            "count and the state cost); op='read' reports what the addressed slot HOLDS now "
+            "(source type, frames, table_id, and the same per-frame numbers). "
+            "THE SPEC: exactly one of `shape` (one name or a list for a morph), `harmonics` "
+            "([[partial, amplitude], ...] or one such list per frame) or `samples` (raw, "
+            "resampled to the plugin's frame width); optional `frames` (1..256, default = the "
+            "number of items listed, interpolated when larger), `duty` (pulse), `phase` "
+            "(degrees), `name`, `full_normalize`, `remove_all_dc`. The response carries `shapes` "
+            "so the vocabulary is discoverable without guessing, and every refusal names what it "
+            "accepted."
+        ),
+        "args": {
+            "instance": {"type": "object", "required": False, "default": None},
+            "op": {
+                "type": "string",
+                "required": True,
+                "default": None,
+                "enum": ["write", "read", "preview"],
+            },
+            "oscillator": {
+                "type": "integer",
+                "required": False,
+                "default": 1,
+                "note": "which oscillator's table slot (1..3)",
+            },
+            "table": {
+                "type": "object",
+                "required": False,
+                "default": None,
+                "note": "write/preview: the spec described above",
+            },
+            "frames": {
+                "type": "integer",
+                "required": False,
+                "default": 2,
+                "note": "preview/read: how many frames of the morph to describe (first and last)",
+            },
+            "points": {
+                "type": "integer",
+                "required": False,
+                "default": 8,
+                "note": "preview/read: how many sample values per described frame",
+            },
+            "dry_run": {"type": "boolean", "required": False, "default": True},
+        },
+        "required": ("op",),
+        "destructive": True,
+        "mutating_ops": ("write",),
+        "returns": (
+            "op, oscillator, table_id/described frames for write+read, preview{described, frames[]} "
+            "for preview, gaps[] and outcome for a write"
         ),
     },
 }

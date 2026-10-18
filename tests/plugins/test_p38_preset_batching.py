@@ -167,18 +167,146 @@ def test_sample_block_of_equal_size_is_carried():
     assert plan.notices == []
 
 
-def test_a_growing_sample_block_is_dropped_with_a_named_notice():
-    """Measured: a write growing the document past the band silently does not land.
+def test_a_growing_sample_block_is_carried_by_inflating_the_sample():
+    """P39: the sample block inflates ITSELF - a wavetable slot's room cannot help it.
 
-    The codec therefore declines it BEFORE the write and names the gap - an
-    attempt would fail verification and roll the whole transaction back.
+    Measured live: borrowing a slot's room does not work (the sample's growth is a growth of the
+    whole document, which the slot's inflation has already spent), while re-declaring the live
+    block with a longer `length` and a tiny payload does - the plugin sizes its buffer from
+    `length` and re-serializes that many samples, so the file's payload lands as a shrink.
     """
     doc = document()
     bigger = sample_block(length=4096, fill=3)
     plan = codec().plan_state_writes(doc, {"paths": {VC.SAMPLE_PATH: bigger}})
+    kinds = [sorted((unit.payload or {}).keys()) for unit in plan.units]
+    assert kinds == [["sample_balloon"], ["paths"]], kinds
+    balloon = plan.units[0].payload["sample_balloon"]
+    assert balloon["path"] == VC.SAMPLE_PATH
+    assert balloon["target_length"] == 4096
+    assert balloon["length"] > balloon["target_length"], "the balloon must be the bigger one"
+    assert balloon["room_chars"] >= balloon["target_chars"], "its read-back covers the file's payload"
+    assert balloon["growth_chars"] <= VC.BATCH_GROWTH_BUDGET, "and the balloon write itself lands"
+    assert plan.units[1].payload["paths"].keys() == {VC.SAMPLE_PATH}, "the sample follows it"
+    assert plan.units[0].payload["sample_balloon"]["payload"], "the window plays the target's own head"
+
+
+def test_the_sample_balloon_chain_lands_end_to_end():
+    """The two writes, against a host double that mirrors the MEASURED sample behaviour.
+
+    `Sample::jsonToState` sizes its buffer from the JSON's `length` and `Sample::stateToJson`
+    then writes that many samples, so a block written short reads back full. Without that mirror
+    the balloon would look pointless; with it, the file's payload lands as a shrink of the
+    inflated block - which is exactly what the live measurement shows.
+    """
+
+    def inflate_sample(block_text: str) -> str:
+        framing = VC.parse_block_framing(block_text)
+        doc, _brace = VC.decode_document(framing["B"])
+        block = (doc.get("settings") or {}).get("sample")
+        if isinstance(block, dict):
+            length = block.get("length")
+            payload = block.get("samples")
+            if isinstance(length, int) and isinstance(payload, str):
+                raw = base64.b64decode(payload + "=" * (-len(payload) % 4))
+                have = len(raw) // 2
+                if length > have:
+                    block["samples"] = base64.b64encode(raw + b"\x00" * (2 * (length - have))).decode("ascii")
+        new_b = VC.encode_item_b(framing["B"], doc, mode="grow")
+        item_a = VC.encode_item_a(framing["A"], len(new_b))
+        lines = [framing["header"], base64.b64encode(item_a).decode("ascii")]
+        lines.extend(VC.wrap_lines(base64.b64encode(new_b).decode("ascii"), framing.get("b64_width") or 280))
+        if framing.get("b64_artifact"):
+            lines.append(framing["b64_artifact"])
+        lines.extend(framing["tail_lines"])
+        return "\n".join(lines)
+
+    import mock_host as MH
+
+    from reaper_reapy_mcp.plugins import model as M
+    from reaper_reapy_mcp.plugins.providers.vital import wavetables as WT
+
+    import test_p7_vital as T7
+    import test_p30_wavetable as P30
+
+    frame = WT.full_frame_chars()
+    live_table = P30.table(P30.saw())
+    doc = document(wavetables=[dict(live_table), dict(live_table), dict(live_table)])
+    host = MH.MockHostBridge(
+        tracks=[MH.MockTrack(0, "Track 1", [T7.vitals_slot(block=T7.build_block(doc))])],
+        state_write_transform=inflate_sample,
+    )
+    provider = T7.provider_on_fixtures()
+    registry = T7.TargetTokenRegistry()
+    ref = M.PluginInstanceRef(
+        host="reaper", location={"track_index": 0, "fx_index": 0}, provider="vital", identity=T7.IDENTITY
+    )
+    bigger = sample_block(length=4096, fill=3)
+    result = T7.Transaction(
+        provider=provider,
+        codec=provider.codec(),
+        bridge=host,
+        profile=provider.build_profile(dict(T7.IDENTITY)),
+        ref=ref,
+        request={"state": {VC.SAMPLE_PATH: bigger}},
+        token=registry.issue(facts=host.fx_facts(0, 0)),
+        registry=registry,
+        dry_run=False,
+    ).run()
+    assert result.ok is True, result.error and result.error.to_dict()
+    writes = [row for row in host.log if row[0] == "write_state_slice"]
+    assert len(writes) == 2, "the sample balloon, then the sample"
+    rows = result.outcome.channels["state"].rows
+    balloons = [row for row in rows if row.get("kind") == "sample_balloon"]
+    assert len(balloons) == 1 and balloons[0]["agrees"] is True, rows
+    assert balloons[0]["length_read_back"] == balloons[0]["length_written"]
+    assert balloons[0]["room_chars"] >= balloons[0]["target_chars"]
+    stored = P30.decode_chunk(host)["settings"]["sample"]
+    assert stored["length"] == 4096, "the file's own block is in the instance"
+    assert len(stored["samples"]) >= len(bigger["samples"])
+
+
+def test_a_sample_balloon_measures_every_channel_it_opens_room_for():
+    """A stereo sample writes TWO payloads: the room is both, or a stereo preset is refused.
+
+    Measured live: the plugin re-serialized both channels (112,454 samples each = 299,880
+    characters per channel) while the verification measured only `samples` - and refused a write
+    whose room was actually there.
+    """
+    written = {
+        "name": "S",
+        "length": 4096,
+        "sample_rate": 44100,
+        "samples": "A" * 300,
+        "samples_stereo": "B" * 300,
+    }
+    read_back = {
+        "name": "S",
+        "length": 8192,
+        "sample_rate": 44100,
+        "samples": "A" * 500,
+        "samples_stereo": "B" * 700,
+    }
+    report = codec()._verify_sample_balloon(
+        document(sample=read_back), {"length": 8192, "target_chars": 1000}
+    )
+    assert report.ok is True, report.mismatched
+    row = report.rows[0]
+    assert row["room_chars"] == 1200, "1200 chars >= the 1000 the target needs"
+    assert row["room_by_channel"] == {"samples": 500, "samples_stereo": 700}
+    report = codec()._verify_sample_balloon(
+        document(sample=read_back), {"length": 8192, "target_chars": 1300}
+    )
+    assert report.ok is False, "and it can still fail"
+
+
+def test_a_sample_block_beyond_what_the_engine_holds_is_named():
+    """A `length` past the plugin's own clamp (`kMaxSize`) cannot be honoured: named, not tried."""
+    doc = document()
+    bigger = sample_block(length=VC.SAMPLE_MAX_SAMPLES + 1000, fill=3)
+    plan = codec().plan_state_writes(doc, {"paths": {VC.SAMPLE_PATH: bigger}})
     paths = {path for unit in plan.units for path in (unit.payload.get("paths") or {})}
     assert VC.SAMPLE_PATH not in paths
-    assert [notice["reason"] for notice in plan.notices] == ["growth_over_budget"]
+    assert [notice["reason"] for notice in plan.notices] == ["no_room_for_sample_growth"]
     assert plan.notices[0]["path"] == VC.SAMPLE_PATH
     assert plan.notices[0]["growth_chars"] > VC.BATCH_GROWTH_BUDGET
 

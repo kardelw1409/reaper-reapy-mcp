@@ -278,12 +278,21 @@ class Transaction:
             )
             for position, unit in enumerate(units, start=1):
                 unit_started = time.perf_counter()
+                balloon = (unit.payload or {}).get("balloon")
                 shape = {
                     "label": self.label,
                     "index": position,
                     "of": len(units),
                     "kind": unit.kind,
                     "paths": len((unit.payload or {}).get("paths") or {}),
+                    # P39: a wavetable too big to land in one write rides in two, and the
+                    # first one is a balloon - named here so a long chain says which unit
+                    # is opening room rather than looking like a stray state write.
+                    "balloon": (
+                        {"path": balloon.get("path"), "frames": balloon.get("frames")}
+                        if isinstance(balloon, dict)
+                        else None
+                    ),
                     "route": (unit.payload or {}).get("route_op", {}).get("op")
                     if isinstance((unit.payload or {}).get("route_op"), dict)
                     else None,

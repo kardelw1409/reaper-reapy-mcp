@@ -237,6 +237,110 @@ def locate_block_span(
     )
 
 
+def locate_block_by_identity(
+    chunk: str, *, class_hex: str | None, module: str | None, ordinal: int
+) -> TargetedStateSlice:
+    """Locate the block a write belongs to, by class **and module**, plus the ordinal.
+
+    Separate from :func:`locate_block_span` because the caller already knows which block it
+    means (it holds the slice it wrote into) and does not need the unique-or-refuse ceremony
+    over the FX-slot count. The module comes from the slice's own recorded header line and is
+    load-bearing: the ordinal was computed among blocks matching class *and* module (the module
+    string is what separates two builds that share a class id), so matching on the class alone
+    could select a sibling block and report **its** digest as this write's read-back evidence -
+    or refuse a write that landed.
+    """
+    if class_hex is None and module is None:
+        raise Unreadable(
+            "no identity evidence to re-locate the written block",
+            detail={"class_hex": class_hex, "module": module},
+        )
+    blocks = parse_blocks(chunk)
+    matching = [
+        block
+        for block in blocks
+        if (class_hex is None or block["class_hex"] == class_hex.upper())
+        and (module is None or block["module"] == module)
+    ]
+    if not matching:
+        raise Unreadable(
+            "the written block is not present in the read-back chunk",
+            detail={"class_hex": class_hex, "module": module, "n_vst_blocks": len(blocks)},
+        )
+    if len(matching) == 1:
+        if ordinal not in (0, None):
+            raise TargetSliceAmbiguous(
+                "the read-back places the written block at a different position",
+                detail={"ordinal": ordinal, "matching_blocks": 1},
+            )
+        chosen = matching[0]
+    elif ordinal is not None and 0 <= ordinal < len(matching):
+        chosen = matching[ordinal]
+    else:
+        raise TargetSliceAmbiguous(
+            "the read-back does not identify which matching block was written",
+            detail={"ordinal": ordinal, "matching_blocks": len(matching)},
+        )
+    return TargetedStateSlice(
+        chunk_digest=text_digest(chunk),
+        line_start=chosen["line_start"],
+        line_end=chosen["line_end"],
+        header_line=chosen["header"],
+        class_hex=chosen["class_hex"],
+        ordinal=ordinal if len(matching) > 1 else 0,
+        block_text=chosen["block_text"],
+        framing=None,
+    )
+
+
+def relocate_unchanged_block(chunk: str, slice: TargetedStateSlice) -> TargetedStateSlice:
+    """The span to splice into when the CHUNK moved: same identity, same block bytes.
+
+    The slice's whole-chunk digest is a cheap guard against splicing into a span that has
+    shifted, but it is too strong a claim about the *target*: a track chunk changes for reasons
+    that have nothing to do with this plugin. MEASURED (2026-10-18, live): starting the transport
+    rewrites the track's chunk while a transaction walks its units, so a slice located a second
+    earlier no longer matched its chunk - the write was refused, the transaction failed, and the
+    ROLLBACK hit the same guard (`channels.state = false`), which left a ballooned wavetable slot
+    holding its stub. A changed TRACK is not a changed PLUGIN.
+
+    What must hold for the splice to be the planned write is that the addressed block still holds
+    the bytes the plan was built from, so this re-locates the block by identity and compares it.
+    Returns the fresh slice, or raises ``StateConflict`` naming which of the two things went
+    wrong: the block is gone/ambiguous, or its bytes differ.
+
+    Pure: parses the given chunk, touches no host.
+    """
+    module = _header_module(slice.header_line)
+    try:
+        fresh = locate_block_by_identity(
+            chunk, class_hex=slice.class_hex, module=module, ordinal=slice.ordinal
+        )
+    except PluginError as exc:
+        raise StateConflict(
+            "the plugin's state block could not be re-located after the track changed",
+            detail={
+                "cause": exc.code,
+                "slice_digest": slice.chunk_digest,
+                "chunk_digest": text_digest(chunk),
+                "class_hex": slice.class_hex,
+                "module": module,
+                "ordinal": slice.ordinal,
+            },
+        ) from exc
+    if text_digest(fresh.block_text) != slice.block_digest:
+        raise StateConflict(
+            "the plugin's state block changed since the slice was located; the slice is stale",
+            detail={
+                "slice_digest": slice.chunk_digest,
+                "chunk_digest": text_digest(chunk),
+                "block_digest": slice.block_digest,
+                "fresh_block_digest": text_digest(fresh.block_text),
+            },
+        )
+    return fresh
+
+
 # ---------------------------------------------------------------------------
 # Pure chunk splicing (no host access)
 # ---------------------------------------------------------------------------
@@ -535,6 +639,21 @@ class ReaperHostBridge:
     def _classify(exc: BaseException, label: str) -> Exception:
         name = type(exc).__name__
         module = type(exc).__module__ or ""
+        message = str(exc)
+        # MEASURED (2026-10-18): a plugin state whose CHUNK TEXT passes ~4 MB makes REAPER's own
+        # `GetTrackStateChunk` fault - `OSError: exception: access violation writing 0x...` - and a
+        # 4 MB buffer then returns a TRUNCATED chunk. reapy hands that back as a `DistError` (its
+        # module), which the transport branch below would call NotConnected and RETRY: a
+        # state-size problem must not be dressed as a transport loss.
+        if "access violation" in message:
+            return Unreadable(
+                f"the host faulted while reading {label}: the plugin's state is larger than this "
+                "channel can read (measured: a track-chunk text past ~4 MB makes REAPER's "
+                "GetTrackStateChunk fault). Nothing was written - the state must be shrunk from "
+                "the host side (load a normal preset in the plugin's own browser, or revert the "
+                "project) before this instance can be addressed again.",
+                detail={"label": label, "error": message[:400], "reason": "state_too_large_to_read"},
+            )
         if module.startswith("reapy") or name in ("ReapyError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError"):
             return NotConnected(
                 f"host transport failure during {label}", detail={"error": f"{name}: {exc}"}
@@ -927,21 +1046,27 @@ class ReaperHostBridge:
         def _write() -> dict[str, Any]:
             track = self._track(R, track_index)
             chunk = self._read_chunk(R, track)
+            span = slice
+            relocated = False
             if not slice.is_valid_for(chunk):
-                raise StateConflict(
-                    "the state chunk changed since the slice was located; the slice is stale",
-                    detail={
-                        "slice_digest": slice.chunk_digest,
-                        "chunk_digest": text_digest(chunk),
-                    },
-                )
-            spliced = splice_block_text(chunk, slice, new_block.block_text)
+                # The TRACK changed under us. MEASURED (2026-10-18, live): starting the transport
+                # rewrites the track's chunk while a transaction walks its units, so a slice
+                # located a second earlier no longer matches its chunk. Refusing there cost the
+                # whole transaction AND its rollback (the same guard fired in the rollback write,
+                # `channels.state = false`), which left a ballooned slot holding a stub table - a
+                # broken instance caused by an edit the caller never asked for. A changed TRACK is
+                # not a changed PLUGIN: re-locate this instance's own block by its identity facts
+                # and splice there. Only a changed BLOCK is a real conflict, raised below.
+                span = self._relocate_unchanged_block(chunk, slice)
+                relocated = True
+            spliced = splice_block_text(chunk, span, new_block.block_text)
             returned = R.SetTrackStateChunk(track, spliced, False)
             return {
                 "setter_returned": returned,
                 "pre_digest": text_digest(chunk),
                 "sent_digest": text_digest(spliced),
                 "sent_bytes": len(spliced),
+                "relocated": relocated,
             }
 
         data = self.call(_write, timeout=self.timeout, label="write_state_slice")
@@ -1000,58 +1125,17 @@ class ReaperHostBridge:
         if settle > 0:
             self._sleeper(settle)
 
+    def _relocate_unchanged_block(self, chunk: str, slice: TargetedStateSlice) -> TargetedStateSlice:
+        """Re-locate a slice whose CHUNK moved, refusing only when its BLOCK moved (pure rule,
+        see :func:`relocate_unchanged_block`)."""
+        return relocate_unchanged_block(chunk, slice)
     def _locate_by_class(
         self, chunk: str, *, class_hex: str | None, module: str | None, ordinal: int
     ) -> TargetedStateSlice:
-        """Re-locate the just-written block by class **and module**, plus the ordinal.
-
-        The module comes from the slice's own recorded header line. It is
-        load-bearing: the locator computed ``ordinal`` among blocks matching
-        class *and* module (the module string is what separates two builds that
-        share a class id), so matching on the class alone could select a
-        sibling block and report **its** digest as this write's read-back
-        evidence - or refuse a write that landed.
-        """
-        if class_hex is None and module is None:
-            raise Unreadable(
-                "no identity evidence to re-locate the written block",
-                detail={"class_hex": class_hex, "module": module},
-            )
-        blocks = parse_blocks(chunk)
-        matching = [
-            block
-            for block in blocks
-            if (class_hex is None or block["class_hex"] == class_hex.upper())
-            and (module is None or block["module"] == module)
-        ]
-        if not matching:
-            raise Unreadable(
-                "the written block is not present in the read-back chunk",
-                detail={"class_hex": class_hex, "module": module, "n_vst_blocks": len(blocks)},
-            )
-        if len(matching) == 1:
-            if ordinal not in (0, None):
-                raise TargetSliceAmbiguous(
-                    "the read-back places the written block at a different position",
-                    detail={"ordinal": ordinal, "matching_blocks": 1},
-                )
-            chosen = matching[0]
-        elif ordinal is not None and 0 <= ordinal < len(matching):
-            chosen = matching[ordinal]
-        else:
-            raise TargetSliceAmbiguous(
-                "the read-back does not identify which matching block was written",
-                detail={"ordinal": ordinal, "matching_blocks": len(matching)},
-            )
-        return TargetedStateSlice(
-            chunk_digest=text_digest(chunk),
-            line_start=chosen["line_start"],
-            line_end=chosen["line_end"],
-            header_line=chosen["header"],
-            class_hex=chosen["class_hex"],
-            ordinal=ordinal if len(matching) > 1 else 0,
-            block_text=chosen["block_text"],
-            framing=None,
+        """Re-locate a block by class **and module**, plus the ordinal (pure; see the module
+        level function of the same rule)."""
+        return locate_block_by_identity(
+            chunk, class_hex=class_hex, module=module, ordinal=ordinal
         )
 
     def locate_state_slice(
