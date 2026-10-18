@@ -5801,3 +5801,152 @@ each blob under a new name leaves the state byte-for-byte identical (`bytes 1757
 `BassHouse` -> `MCP Renamed`, i.e. exactly the name-length difference).
 
 **1197 passed, 2 skipped** (the round's earlier count was 1189).
+
+## 46. P43 - the four preset tools at first light: three defects of one kind, and the settling law of a preset (2026-10-18)
+
+The owner's request for this pass, verbatim: "попереключаешь сначала пресеты в рипере для витал, потом
+пересоздашь вст плагин в треке, применеш уже какой нибудь пресет бас из тулы мсп плагинов, потом опять
+пересоздаш вст и попробуешь уже только семплер, закинув как-нибудь семпл из моих семплов, кик какой или
+клэп". The four tools written in §45 had never been called through the product surface; this is what
+their first calls answered.
+
+### 46.1 The first call answered "no attribute", because two classes carry the name
+
+```
+get_fx_presets(track_index=14, fx_index=0)
+    -> {"status": "error", "message": "Failed to read FX presets: 'ReaperController' object has no
+        attribute 'get_fx_presets'"}
+```
+
+Two classes are named `ReaperController`. The legacy wrapper in `src/reaper_controller.py` (imported
+by `src/__init__.py`, `src/reaper_reapy_mcp.py` and four `tests/test_*.py` files) received
+`PresetController` in §45 - the class `reaper_reapy_mcp.server.create_server()` instantiates, the one
+the running MCP server's tools call, did not. Its MRO carried 8 bases: Track, FX, Marker, MIDI,
+Audio, Master, Project, Base - no `PresetController`. An AST pass over the tool layers found **59
+`controller.<name>` references and exactly four that the served class could not answer**:
+`get_fx_presets` (`mcp_tools.py:1882`), `set_fx_preset` (:1904), `navigate_fx_presets` (:1919),
+`save_fx_preset` (:1947). So the tools registered, the client listed all 75, and every call died on
+the attribute lookup - an inventory of tool NAMES says nothing about the instance behind them.
+
+The offline suite stayed green because `tests/test_reaper_presets.py` asked the WRAPPER
+(`"PresetController" in ReaperController.__mro__`), which was true. `tests/plugins/test_p43_server_controller_mixins.py`
+(2 tests) pins the two invariants that fail for the DEFECT rather than for one of its instances:
+
+* every controller module under `src/controllers/` must be composed by BOTH combined classes;
+* every `controller.<name>` in the tool layers must resolve on the SERVED class.
+
+Control run before the fix: **2 failed**, naming `PresetController` and all four methods with their
+call sites. After the fix (one import, one base): **2 passed**. `1197 -> 1199`; commit `0c64243`.
+
+### 46.2 reapy returns the WHOLE argument list, and the layer read the wrong slots
+
+The second live call produced numbers that were wrong in a way only a live run shows: `current` came
+back as `"(MediaTrack*)0x0000000005D9AAA0"` - the track POINTER - and `host_preset_count` as `0`
+while the host was answering **4**. Measured directly against the host (read-only) to settle it:
+
+| call | host answer |
+|---|---|
+| `TrackFX_GetPreset(track.id, 0, "", 1024)` | `[1, '(MediaTrack*)0x…', 0, '', 1024]` |
+| `TrackFX_GetPresetIndex(track.id, 0, 0)` | `[-1, '(MediaTrack*)0x…', 0, 4]` |
+| `TrackFX_GetUserPresetFilename(track.id, 0, "", 1024)` | `['(MediaTrack*)0x…', 0, 'C:\REAPER\presets\vst3-Vital.ini', 1024]` |
+| `GetTrackStateChunk(track.id, "", 4100000, False)` | `[1, '(MediaTrack*)0x…', '<TRACK\n…', 4100000, False]` |
+
+The container is the **whole argument list with out-parameters updated in place, retval first**. The
+layer's selectors were written against a guessed `(retval, buffer)` shape:
+
+* "the first string after the first element" is the track id echo, which is why `current` was a
+  pointer and the file path was right only by accident (the echoed int preceded it);
+* "the second integer" of `[-1, echo, 0, 4]` is the FX-ELEMENT ECHO - the preset count is the
+  out-parameter (last), and the misread `0` also made `disagreement` fire against a file that agreed
+  (both said 4);
+* `bool(result)` on that list is True whatever the host said, so a refused `TrackFX_SetPreset`
+  reported `applied: true`;
+* `_read_chunk` returned the pointer for any track whose chunk was shorter than 100 characters.
+
+Fixed with three helpers the answers now carry: `_is_input_echo` (a returned string that IS the input
+- the address form or the track id - is never an answer), `_layout` (a readable description of the
+container actually returned, e.g. `list[int,echo,int,str,int]`), `_retval` (the first element when the
+container is the measured shape; `None` - "not understood" - is never folded into True). An
+unrecognised container reports its layout instead of a number from a guessed slot, and the live
+answer's `read_shapes` showed `with_buffer:list[int,echo,int,str,int]` for the name,
+`list:list[int,echo,int,int]` for the index and `with_buffer:list[echo,int,str,int]` for the file.
+
+`tests/plugins/test_p43_preset_read_conventions.py` (10 tests) runs the controller against containers
+copied from that measurement: the pointer is never an answer, the count comes from the out-parameter
+(and the FX echo is not a count), an unrecognised container reports no number, a SHORT chunk is still
+the text, a refused write is not `applied`, an understood yes is verified against the read-back, an
+unrecognised answer is never a yes (and no state read follows), the end-to-end read reports host/file
+numbers with no pointer anywhere in the answer, and both bare-retval paths (below). With the live
+numbers: `current: null` (empty name buffer), `preset_index: -1`, `host_preset_count: 4`, file 4/4, no
+`disagreement`, `problems: []` - the P38 question is closed from the other side: the VST3 program
+channel is empty, while REAPER's own count is real and the file is intact. `1199 -> 1207`; commit
+`d1ce6d1`.
+
+### 46.3 The bare retval, and the save that would have rolled back its own success
+
+Applying `BassHouse` worked - `after = {name: 'BassHouse', index 0}`, `verified: true` - and still
+reported `applied: null`, `status: error`: `TrackFX_SetPreset` has **no out-parameters** and answers
+the bare integer `1`, which the layer did not understand (`call_layout: "int"`). That is not
+cosmetic: `save_fx_preset` reads this field, so the first real save would have restored the file and
+refused a preset the host had confirmed. Fixed: a scalar retval is a value; `None` remains "not
+understood". Re-run live: `applied: true`, `verified: true`, message "preset applied and read back:
+'BassHouse' (index 0)". Both bare paths are pinned (yes, and the bare zero as a refusal).
+
+### 46.4 Byte-identity was never the criterion, and the file's own preset proves it
+
+The save chain demanded that the state applied back equal the bytes saved. Measured on the owner's
+OWN `BassHouse` (so it is not an artifact of anything this layer writes), by applying it through the
+tool three times and reading the state out of the track chunk:
+
+| application | state | what it holds |
+|---|---|---|
+| #1 | 175,761 bytes | the preset, plus the LIVE runtime sampler values |
+| #2 | 175,747 bytes = the stored core's own length | the stored values |
+| #3 | byte-identical to #2 (`sha256 8f6a920e62fab826`) | a fixed point |
+
+The four sampler settings that differ between #1's runtime state and the file:
+
+| setting | file | live after #1 |
+|---|---|---|
+| `sample_on` | 0.0 | 1.0 |
+| `sample_level` | 0.7071067690849304 | 0.8500000238418579 |
+| `sample_loop` | 1.0 | 0.0 |
+| `sample_destination` | 3.0 | 4.0 |
+
+After #2, a decoded-key comparison of the whole document found **one** differing key out of 781
+(`settings`) keys: `settings.sample.samples` - the base64 PCM of the preset's own sample ("White
+Noise"): same length
+(117,600 characters), first difference at character 11,221 (~4 int16 samples of shifted waveform).
+So "the state comes back byte-for-byte" is **not achievable on this plugin**, and the honest chain
+verifies what it can prove: the count grew, the new name is current, applying the saved preset twice
+reaches a fixed point, and that point is the same LENGTH as the bytes saved. The byte difference is
+REPORTED with its numbers (`verification.byte_difference`: `saved_bytes`, `read_back_bytes`,
+`length_matches`, `first_offset`, `differing_bytes`), never asserted away; the way back applies the
+previous preset twice for the same reason. A consistency probe from the same measurement: the dry-run
+plan for a new preset of the settled state reports `payload_bytes 175,762 = state_bytes 175,747 + 15`
+(exactly `44 + A[0x20] + len("MCP Check") + 6`), `nb_presets 4 -> 5`.
+
+`tests/plugins/test_p43_save_verification.py` (5 tests, scripted host + a real temp file): the settled
+state is the criterion and the runtime-polluted first read is never taken; a never-settling state
+restores the file; a settled state of the wrong length restores; a refused apply reads no state twice;
+the dry run writes nothing. **1214 passed, 2 skipped**; commit `7c0cbc8`.
+
+### 46.5 The live pass end to end, through the product surface only
+
+| step | measured answer |
+|---|---|
+| `navigate_fx_presets` `+1` x3, `+1` (wrap), `-1` | `0->1->2->3->0->3`, each `moved/changed: true`, names read back, `count 4` |
+| `set_fx_preset(name="BassHouse")` | `applied: true`, `verified: true`, before `Bass 808/3` -> after `BassHouse/0`; the track chunk **2,958,676 -> 239,648** characters (the host applied the preset; the balloon was the previous state) |
+| `save_fx_preset("MCP Check", dry_run=true)` | plan only, no write: `Preset4`, payload 175,762, file 3,912,003 -> 4,263,532 characters |
+| `remove_fx` + `add_fx("VST3i: Vital (Vital Audio)")` | fresh instance, 1 FX on the track; the profile came from the CACHE (`prepared: true, built: false`) - the startup preload served a re-created instance with no re-measure |
+| `plugin_presets apply "BA - Bro Bass"` | `ALL_VERIFIED`, committed, reads 285, writes 31/31, `partial: true` with **14 named gaps**: 1 tempo-owned value, 2 `fm_needs_modulator` rules, 1 value beyond the measured single-write band, 9 routings this build drops, 1 gap covering 10 fields of routing slots whose pair the build does not carry |
+| witness that the PLUGIN re-read the document | `plugin_read filter_1_cutoff` native **43.2878303527832** = the `.vital` file's own value (and resonance `0.49047619104385376`) |
+| `remove_fx` + `add_fx` again | `plugin_sample(op="read")` = factory default exactly as §44.2 recorded: `White Noise`, 44,100 frames, 1 channel, `sample_on Off`, `loop On`, `EFFECTS`, `0.7071067690849304` |
+| `plugin_sample(op="load", file_path=<the owner's kick>, solo=true)` | `ALL_VERIFIED`, `partial: false`, `gaps: 0`, 2 writes verified, no notes (payload 45,624 chars - small enough that no balloon note was needed): `GS_MRVP2_Kick_04_V2.wav`, 8,554 frames, stereo, 24-bit, peak 32760, RMS 18053.6 -> `solo` controls `sample_on On`, `osc_1..3_on Off` in the same batch |
+| `plugin_sample(op="solo", dry_run=false)` | the control-only path: `n_state_paths: 0` (the sample is NOT re-sent), 4 controls, ONE parameter write, `ALL_VERIFIED` |
+| final `plugin_sample(op="read")` | `GS Kick`, 8,554 frames, 2 channels, 0.193968 s, `sample_on On`, `loop On`, `EFFECTS` |
+| the owner listened | "Да, кик звучит как надо" - the sampler played his own kick through Vital's EFFECTS path |
+
+Left open by the owner's re-scope (he asked to finish after this chain): the wavetable probes from
+the same request, and a fresh state-only write (the state witness was exercised live as a READ -
+`filter_1_cutoff`; the write direction was last proven in §44.1).

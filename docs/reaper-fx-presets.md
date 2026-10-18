@@ -27,8 +27,10 @@ Name=BassHouse
 * `Len` = payload size in **bytes** (so a parse is checkable without decoding: the stored hex is
   `2 * (Len + number of chunks)`);
 * line endings are **CRLF** (measured: 140 CRLF, 0 lone LF), and the file is written back that way;
-* the decoded payload reaches the ASCII `VstW` marker at ~offset 48 - the same wrapper the plugin's
-  state carries inside REAPER's track chunk, i.e. the file stores the FX's own VST3 state.
+* the decoded payload reaches the ASCII `VstW` marker at offset **52** - the same wrapper the plugin's
+  state carries inside REAPER's track chunk, i.e. the file stores the FX's own VST3 state (an
+  earlier note said 48: it came from a truncated hex dump and was wrong; the tests pin 52 and the
+  plugin document's start at 228 against the real file and the live block).
 
 **How the layout was proved** (not assumed): joining the chunks raw, or dropping their FIRST byte,
 corrupts the plugin document at every boundary - only "drop the last byte of each chunk" decodes to
@@ -80,16 +82,40 @@ REAPER's own file in REAPER's own format, and then **the host has to confirm it*
 
 Honest edges, all reported rather than hidden:
 
-* a plugin that manages its own presets exposes none here - the answer carries `channel_empty`
-  (measured earlier in the plugin layer: Vital's VST3 program channel answers empty/`-1`; the file
-  above exists because presets were saved **through REAPER**, which is why this channel is the useful
-  one);
+* a plugin that manages its own presets exposes none here - with NO preset selected the measured
+  answer is: retval `1`, an EMPTY name buffer (`current: null`), `preset_index: -1` - while
+  `host_preset_count` is real (`4` on Vital). The channel is alive and empty, not dead; P38's
+  "answers empty/`-1`" measurement is about the plugin's VST3 *program* channel, and the file above
+  exists because presets were saved **through REAPER**, which is why this channel is the useful one;
 * when the host's count and the file's names disagree, the answer carries `disagreement` and says
-  which selector uses which numbering (index → the host, name → the file);
+  which selector uses which numbering (index -> the host, name -> the file);
 * `set_fx_preset` requires exactly one of `name`/`index`: a call naming both would have to pick one
   silently;
 * `verified` is only true when the selector BECAME current - a host that answers `true` without
-  changing the preset is reported as not verified.
+  changing the preset is reported as not verified;
+* the answers carry the container the host actually returned (`read_shapes`, `call_layout`, e.g.
+  `list[int,echo,int,str,int]`): reapy's distributed API returns the WHOLE argument list with
+  out-parameters updated in place and `retval` FIRST, and `TrackFX_SetPreset` (no out-parameters)
+  answers the bare `1` - a `bool(list)` reading of it would be true forever (all measured live, P43).
+
+## The settling law of an applied preset (measured live, P43)
+
+Byte-identity between a saved blob and the state the plugin shows after applying it is **not
+achievable on this plugin**, and the file's own `BassHouse` behaves exactly like one this layer
+writes. Measured by applying the preset three times and reading the state out of the track chunk:
+
+| application | state | what it holds |
+|---|---|---|
+| #1 | 175,761 bytes | the preset, plus the LIVE runtime sampler values (`sample_on` 1.0 vs stored 0.0, `sample_level` 0.85 vs 0.7071067690849304, `loop` 0 vs 1, `destination` 4 vs 3) |
+| #2 | 175,747 bytes = the stored core's own length | the stored values |
+| #3 | byte-identical to #2 (`sha256 8f6a920e62fab826`) | a fixed point |
+
+After #2 the decoded document differs from the file in ONE key of 781 (`settings.sample.samples`,
+the base64 PCM of the preset's own sample): same length (117,600 characters), first difference at
+character 11,221 (~4 int16 samples of shift). So the verified chain is: count grows -> the name
+becomes current -> TWO applications reach a fixed point -> that point has the same LENGTH as the
+bytes saved; the byte difference is reported with its numbers (`verification.byte_difference`),
+never asserted away, and the way back applies the previous preset twice for the same reason.
 
 ## Saving: why it is verified
 
@@ -103,10 +129,12 @@ and refuses at the first step that does not hold:
    depend on this call);
 3. `dry_run` stops here and returns the plan;
 4. otherwise the file is written and the HOST must confirm: the preset count grows, the new name
-   becomes selectable (`TrackFX_SetPreset`), and the state that comes back after applying it equals
-   the bytes that were saved;
-5. any failure restores the file, re-applies the preset that was current, and answers
-   `status: error` with the numbers it measured.
+   becomes current, and the state the saved bytes drive the plugin to is a **fixed point** (two
+   applications reach it; a third changes nothing) of the **same length** as the bytes that were
+   saved - byte-identity is NOT required (see the settling law above) and the difference goes into
+   `verification.byte_difference` with its numbers;
+5. any failure restores the file, re-applies the preset that was current (twice, for the same
+   settling reason), and answers `status: error` with the numbers it measured.
 
 `append_preset` refuses to touch a file that does not match the measured format: appending to
 something REAPER would then misread is worse than not saving.
