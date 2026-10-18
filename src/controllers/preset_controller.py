@@ -53,17 +53,78 @@ class PresetController(BaseController):
             return project.master_track
         return project.tracks[int(track_index)]
 
-    def _call_string(self, function, *args: Any) -> tuple[str | None, str]:
-        """Call a host function that fills a char* buffer; returns (text, shape).
+    @staticmethod
+    def _is_input_echo(value: Any, track_id: str) -> bool:
+        """Whether a returned string is the INPUT this call was given, not a host answer.
 
-        reapy's generated wrappers expose an out-string either as a second tuple element
-        (`(retval, buffer)`) or as the call's own result. Both shapes are tried and the one that
-        produced a string is reported, so a live run says which convention this build uses instead
-        of the layer pretending to know.
+        MEASURED 2026-10-18 (P43, first live call): reapy's distributed API returns the WHOLE
+        argument list with out-parameters updated in place - `[retval, track echo, fx echo,
+        buffer, size echo]` - so the address-form string the caller passed (`track.id`, e.g.
+        `(MediaTrack*)0x0000000005D9AAA0`) comes back INSIDE the answer. A selector that took
+        "the first string after the first element" reported that pointer as the preset name.
         """
+        if not isinstance(value, str):
+            return False
+        return value == track_id or (value.startswith("(") and "*)0x" in value)
+
+    def _layout(self, result: Any, track_id: str) -> str:
+        """A readable description of what the host actually returned, for the answer to carry.
+
+        This is the diagnostic that makes the convention auditable on a live run: the misread
+        slots of P43 were invisible because the layer described the container it EXPECTED
+        ("tuple"/"direct") rather than the one it got.
+        """
+        if not isinstance(result, (list, tuple)):
+            return type(result).__name__
+        parts: list[str] = []
+        for item in result:
+            if isinstance(item, str):
+                if self._is_input_echo(item, track_id):
+                    parts.append("echo")
+                elif len(item) > 200:
+                    parts.append("text")
+                else:
+                    parts.append("str")
+            elif isinstance(item, bool):
+                parts.append("bool")
+            elif isinstance(item, int):
+                parts.append("int")
+            else:
+                parts.append(type(item).__name__)
+        return "list[" + ",".join(parts) + "]"
+
+    def _retval(self, result: Any, track_id: str) -> bool | None:
+        """The host's own return value, or `None` when the container is not the measured shape.
+
+        MEASURED: a value-returning host call answers `[retval, track echo, arg echoes...,
+        out values...]`, so the return value is the FIRST element - and `bool(result)` on that
+        list is True whatever the host said, which is how a refused preset call used to report
+        `applied: true`. `None` means "not understood" and is never folded into True.
+        """
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 2 and self._is_input_echo(result[1], track_id):
+                head = result[0]
+                if isinstance(head, bool):
+                    return head
+                if isinstance(head, int):
+                    return bool(head)
+            return None
+        return None
+
+    def _call_string(self, function, *args: Any) -> tuple[str | None, str]:
+        """Call a host function that fills a char* buffer; returns (text, layout).
+
+        MEASURED (P43): the out-buffer is the LAST non-echo string of the returned argument
+        list, and the input echo is never an answer. Both call conventions reapy uses for
+        out-buffers are still tried, and the one that answered is reported with the container
+        it produced, so a live run says what the build did instead of the layer pretending.
+        """
+        track_id = args[0] if args and isinstance(args[0], str) else ""
         attempts = (
-            ("tuple", lambda: function(*args, "", _BUFFER)),
-            ("direct", lambda: function(*args, "")),
+            ("with_buffer", lambda: function(*args, "", _BUFFER)),
+            ("without_buffer", lambda: function(*args, "")),
         )
         for shape, call in attempts:
             try:
@@ -71,16 +132,25 @@ class PresetController(BaseController):
             except Exception:  # noqa: BLE001 - a wrong shape is not a failure of the channel
                 continue
             if isinstance(result, (list, tuple)):
-                for item in result[1:]:
-                    if isinstance(item, str):
-                        return item.rstrip("\x00").strip(), shape
-                continue
+                layout = self._layout(result, track_id)
+                for item in reversed(result):
+                    if isinstance(item, str) and not self._is_input_echo(item, track_id):
+                        return item.rstrip("\x00").strip(), f"{shape}:{layout}"
+                return None, f"{shape}:{layout}"
             if isinstance(result, str):
-                return result.rstrip("\x00").strip(), shape
+                if not self._is_input_echo(result, track_id):
+                    return result.rstrip("\x00").strip(), shape
         return None, "none"
 
     def _preset_index(self, track_index: int, fx_index: int) -> tuple[int | None, int | None, str]:
-        """`(current index, number of presets, shape)` from `TrackFX_GetPresetIndex`."""
+        """`(current index, number of presets, layout)` from `TrackFX_GetPresetIndex`.
+
+        MEASURED (P43): the host answers `[current index, track echo, fx echo, preset count]` -
+        the index is the retval (first) and the count is the out-parameter (LAST). Reading
+        "the second integer" picked the FX-ELEMENT ECHO and reported `0` presets while the host
+        was answering `4`, which also made `disagreement` fire against a file that agreed.
+        A shape that is not this one reports what came instead of a number from a guessed slot.
+        """
         track = self._track(track_index)
         function = reapy.reascript_api.TrackFX_GetPresetIndex
         try:
@@ -88,12 +158,15 @@ class PresetController(BaseController):
         except Exception:  # noqa: BLE001 - reported as an unreadable channel, never as zero presets
             return None, None, "error"
         if isinstance(result, (list, tuple)):
-            values = [item for item in result if isinstance(item, int)]
-            if len(values) >= 2:
-                return values[0], values[1], "tuple"
-            if values:
-                return values[0], None, "tuple"
-            return None, None, "tuple"
+            layout = self._layout(result, track.id)
+            values = [
+                item for item in result if isinstance(item, int) and not isinstance(item, bool)
+            ]
+            if len(values) >= 3:
+                return values[0], values[-1], f"list:{layout}"
+            if len(values) == 1:
+                return values[0], None, f"list:{layout}"
+            return None, None, f"list:{layout}"
         if isinstance(result, int):
             return result, None, "direct"
         return None, None, "none"
@@ -109,17 +182,26 @@ class PresetController(BaseController):
         )
 
     def _read_chunk(self, track_index: int) -> str:
-        """The whole track chunk, with the measured capacity (a fault is reported, not raised)."""
+        """The whole track chunk (MEASURED container: `[retval, track echo, chunk, cap, bool]`).
+
+        The chunk is the longest non-echo string; "the first string longer than 100 characters"
+        returned the track's POINTER for any track whose chunk was shorter than that, which is
+        the other half of the same misread the live call exposed.
+        """
         track = self._track(track_index)
         result = reapy.reascript_api.GetTrackStateChunk(track.id, "", _CHUNK_CAPACITY, False)
         if isinstance(result, (list, tuple)):
-            for item in result:
-                if isinstance(item, str) and len(item) > 100:
-                    return item
-            for item in result:
-                if isinstance(item, str):
-                    return item
-        if isinstance(result, str):
+            strings = [
+                item
+                for item in result
+                if isinstance(item, str) and not self._is_input_echo(item, track.id)
+            ]
+            if strings:
+                return max(strings, key=len)
+            raise RuntimeError(
+                f"GetTrackStateChunk returned no text ({self._layout(result, track.id)})"
+            )
+        if isinstance(result, str) and not self._is_input_echo(result, track.id):
             return result
         raise RuntimeError("GetTrackStateChunk returned no text")
 
@@ -139,7 +221,10 @@ class PresetController(BaseController):
         data: dict[str, Any] = {
             "track_index": int(track_index),
             "fx_index": int(fx_index),
-            "current": name,
+            # MEASURED (P43): the name buffer comes back EMPTY for this FX while the retval says
+            # the call succeeded - an empty buffer is reported as null, and the layout in
+            # `read_shapes.current` shows that a `str` slot was there and was empty.
+            "current": name or None,
             "preset_index": index,
             "host_preset_count": count,
             "user_preset_file": path,
@@ -223,22 +308,38 @@ class PresetController(BaseController):
         track = self._track(track_index)
         try:
             if has_index:
-                applied = reapy.reascript_api.TrackFX_SetPresetByIndex(
+                call_result = reapy.reascript_api.TrackFX_SetPresetByIndex(
                     track.id, int(fx_index), int(index)
                 )
                 selector: Any = int(index)
                 how = "index"
             else:
-                applied = reapy.reascript_api.TrackFX_SetPreset(
+                call_result = reapy.reascript_api.TrackFX_SetPreset(
                     track.id, int(fx_index), str(name)
                 )
                 selector = str(name)
                 how = "name"
         except Exception as exc:  # noqa: BLE001 - the host's own refusal is the message
             return {"status": "error", "message": f"the host refused the preset call: {exc}"}
+        applied = self._retval(call_result, track.id)
+        call_layout = self._layout(call_result, track.id)
         after_name, _ = self._current_preset(track_index, fx_index)
         after_index, count, _ = self._preset_index(track_index, fx_index)
         matched = (after_name == selector) if how == "name" else (after_index == selector)
+        if applied is None:
+            return {
+                "status": "error",
+                "applied": None,
+                "selector": {"how": how, "value": selector},
+                "before": {"name": before_name, "index": before_index},
+                "after": {"name": after_name, "index": after_index, "count": count},
+                "verified": bool(matched),
+                "call_layout": call_layout,
+                "message": (
+                    "the host's answer is not a shape this layer understands, so it is NOT "
+                    f"reported as applied (container: {call_layout})"
+                ),
+            }
         return {
             "status": "success" if applied else "error",
             "applied": bool(applied),
@@ -246,6 +347,7 @@ class PresetController(BaseController):
             "before": {"name": before_name, "index": before_index},
             "after": {"name": after_name, "index": after_index, "count": count},
             "verified": bool(matched),
+            "call_layout": call_layout,
             "message": (
                 f"preset applied and read back: {after_name!r} (index {after_index})"
                 if matched
@@ -262,14 +364,30 @@ class PresetController(BaseController):
         before_index, _, _ = self._preset_index(track_index, fx_index)
         track = self._track(track_index)
         try:
-            moved = reapy.reascript_api.TrackFX_NavigatePresets(
+            call_result = reapy.reascript_api.TrackFX_NavigatePresets(
                 track.id, int(fx_index), int(step)
             )
         except Exception as exc:  # noqa: BLE001
             return {"status": "error", "message": f"the host refused the navigation: {exc}"}
+        moved = self._retval(call_result, track.id)
+        call_layout = self._layout(call_result, track.id)
         after_name, _ = self._current_preset(track_index, fx_index)
         after_index, count, _ = self._preset_index(track_index, fx_index)
         changed = (after_index, after_name) != (before_index, before_name)
+        if moved is None:
+            return {
+                "status": "error",
+                "moved": None,
+                "step": int(step),
+                "before": {"name": before_name, "index": before_index},
+                "after": {"name": after_name, "index": after_index, "count": count},
+                "changed": changed,
+                "call_layout": call_layout,
+                "message": (
+                    "the host's answer is not a shape this layer understands, so the step is NOT "
+                    f"reported as accepted (container: {call_layout})"
+                ),
+            }
         return {
             "status": "success" if moved else "error",
             "moved": bool(moved),
@@ -277,6 +395,7 @@ class PresetController(BaseController):
             "before": {"name": before_name, "index": before_index},
             "after": {"name": after_name, "index": after_index, "count": count},
             "changed": changed,
+            "call_layout": call_layout,
         }
 
     # -- saving -------------------------------------------------------------
