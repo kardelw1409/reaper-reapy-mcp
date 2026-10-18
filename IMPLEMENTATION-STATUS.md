@@ -5948,5 +5948,62 @@ the dry run writes nothing. **1214 passed, 2 skipped**; commit `7c0cbc8`.
 | the owner listened | "Да, кик звучит как надо" - the sampler played his own kick through Vital's EFFECTS path |
 
 Left open by the owner's re-scope (he asked to finish after this chain): the wavetable probes from
-the same request, and a fresh state-only write (the state witness was exercised live as a READ -
-`filter_1_cutoff`; the write direction was last proven in §44.1).
+the same request. The state-only write WAS exercised in §46.6 (a no-op write of the plugin's own
+value, `ALL_VERIFIED`).
+
+### 46.6 Does `plugin_presets` reset the plugin first? NO - and the residue it can leave is now measured (2026-10-18)
+
+The owner's question, verbatim: "plugin_presets обнуляет ли плагин перед применением пресета? просто
+может быть такая ситуация что например крутим звук, включен семплер а потом грузим пресет где его нет
+и тем самым может остаться лишним". Answered from the code and from live measurement.
+
+**The apply is a DIFF onto the live document, not a reset** (`preset.change_set`: "Only DIFFERENCES
+are emitted (the live document is in hand)"), and no reset op exists: `op="init"` refuses explicitly
+("`op='init'` is not available yet: this build CONSTRUCTS its Init state in code ... Load an
+init-style preset with `op='apply'` instead"). A live apply of `BA - Bro Bass` wrote 90 rows - every
+one of them a value the preset actually changes - over a factory state.
+
+**The sampler part of the question, measured live on `BA - Frog Bass`** (applied while the live
+sampler held the owner's kick, `sample_on` 1.0): the write landed (`sample_on` -> 0.0, the `sample`
+block replaced by the preset's own `White Noise` 44,100). A library census says this is the general
+case: **2226 of 2226 `.vital` files carry `sample_on`** (840 ON / 1386 OFF, zero without the key) -
+so "a preset where the sampler is off" always carries the key, and no `sample_on` residue survives
+an apply.
+
+**Residue DOES exist, in two measured classes:**
+
+1. **Keys the preset FILE does not carry keep their LIVE values**, and it is a whole class, not an
+   edge: key counts by `synth_version` (first 400 files) are 775 (1.0.0-1.0.4), 776 (1.0.5-1.0.8),
+   781 (1.5.3/1.5.5, the live build). A pre-1.5 preset cannot set five or six keys, measured by
+   diffing a 1.5.5 file's key set against two real presets: a 776-key file (`BA - Frog Bass`, 1.0.8)
+   lacks `custom_warps`, `osc_1_spectral_morph_phase`, `osc_2_spectral_morph_phase`,
+   `osc_3_spectral_morph_phase`, `random_values`; a 775-key file (`BA - Bro Bass`, 1.0.3) lacks
+   those and `mpe_enabled`. After the live apply those keys still held the previous values, exactly
+   as the diff predicts; `beats_per_minute` is the same story by design (`host_owned_parameter`).
+2. **The named gaps** (`destination_dropped_by_plugin`, `slot_text_dropped_with_pair`,
+   `guarded_rule_subject`, `growth_over_budget`) - measured again in this apply: 4 gaps, of which
+   two dropped routes and one slot-field group.
+
+**A new, harder residue class, found here: a curve the plugin canonizes at load leaves the apply
+UNRESTORED.** Full numbers of the incident:
+
+* the preset's `lfos[0]` is `num_points 4, points [0,1, 0,0, 1,1, 1,1], powers [0, -1.1117651462554932, 0, 0]`;
+* the write was accepted and the read-back is the plugin's OWN form: `points [0,1, 0,0, 1,1, 0,0],
+  powers [0, 0, 0, 0]` - the plugin drops the duplicate-x point and its power when it re-serializes;
+* one unit of 14 mismatched -> `ok: false`, `WriteNotApplied`, `unit: 13`; the rollback ran and
+  **its own read-back could not be verified either** -> `outcome.verdict = FAILED_AND_NOT_RESTORED`,
+  `final_state: unknown` (host: 135 reads, 14 writes attempted, 14 verified);
+* it is DETERMINISTIC, not transient: a dry run of the SAME preset right after still plans
+  `settings.lfos.0.points` and `settings.lfos.0.powers`;
+* the state left behind is the preset MINUS 12 keys of 781: the six above, `beats_per_minute`, the
+  `modulations`/`modulation_N_amount` group, `lfos` (canonized), `sample` and `wavetables` (content).
+
+**The decisive control for the future fix:** writing the plugin its OWN current value back
+(`plugin_write({"state": {"settings.lfos.0.points": <the live 8 floats>}})`) answered
+`ALL_VERIFIED`, `agrees: true`, read-back identical - so the canonical form round-trips, and the
+failure is a property of the preset FILE's curve, not of the channel. What is NOT established from
+one incident is why the ROLLBACK could not restore (candidate causes: field-by-field writes leaving
+the `num_points/points/powers` triple inconsistent mid-flight, or the rollback ordering of that
+triple), so no fix is written yet: the element-as-one-unit write and a fixed-point verification are
+both candidates, and both need a measured law before they can be implemented (recorded in
+`docs/universal-plugin-mcp-v3/22-vital-preset-apply-limits.md` § 2.5/§ 7 as an open defect).
