@@ -24,9 +24,13 @@ from src.utils.reaper_presets import (  # noqa: E402
     PRESET_PAYLOAD_BYTES,
     append_preset,
     extract_fx_state,
+    name_trailer,
     parse_preset_library,
+    preset_blob,
     preset_names,
+    read_name_trailer,
     render_preset_section,
+    split_preset_blob,
     verify_preset_payload,
 )
 
@@ -275,6 +279,114 @@ def test_multiline_item_b_is_joined_like_the_host_writes_it():
     chunk = chunk_with(f'<VST "x" m.vst3 0 "" {{{CLASS_A}}} ""\nAAAA\n{wrapped}\n>')
     state = extract_fx_state(chunk, 0)
     assert state["data"] == base64.b64decode("AAAA") + item_b
+
+
+def test_the_state_payload_carries_the_same_wrapper_a_preset_file_does():
+    """The save path's premise, checked against the measured preset file.
+
+    MEASURED on `presets/vst3-Vital.ini`: the decoded payload begins with REAPER's own item-A header
+    (44 bytes) and the ASCII `VstW` marker sits at offset 48. What `save_fx_preset` stores is the
+    payload `extract_fx_state` returns, so that is the shape it must produce - if it did not, a saved
+    preset would be bytes REAPER's own file never holds.
+    """
+    plugins = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+    if plugins not in sys.path:
+        sys.path.append(plugins)
+    import mock_host as MH
+    from reaper_reapy_mcp.plugins import model as M
+
+    import test_p7_vital as T7
+    import test_p39_balloon as P39
+
+    document = P39.live_document(
+        P39.full_table(frames=1), P39.full_table(frames=1), P39.full_table(frames=1)
+    )
+    host = MH.MockHostBridge(
+        tracks=[MH.MockTrack(0, "Track 1", [T7.vitals_slot(block=T7.build_block(document))])]
+    )
+    ref = M.PluginInstanceRef(
+        host="reaper", location={"track_index": 0, "fx_index": 0}, provider="vital", identity=T7.IDENTITY
+    )
+    state = extract_fx_state(host.read_state_chunk(ref), 0)
+    payload = state["data"]
+    assert state["item_a_bytes"] == 44, "REAPER's item A is 44 bytes (measured in the real file)"
+    assert payload.find(b"VstW") == 52, (
+        "the `VstW` marker lands at 52 in the REAL preset file too (measured on all four presets); "
+        "an earlier reading of 48 came from a truncated dump and was wrong",
+        payload.find(b"VstW"),
+        payload[:64],
+    )
+    assert payload.find(b"{") == 228, "and the plugin document starts where the real file's does"
+
+
+# ---------------------------------------------------------------------------
+# The name trailer: REAPER writes the preset name INTO the blob
+# ---------------------------------------------------------------------------
+
+
+def blob_for(name: str, core: bytes) -> bytes:
+    """A blob in the shape the real file has: the state plus `NUL + name + five NULs`."""
+    return preset_blob(core, name)
+
+
+def test_the_real_file_relation_len_equals_state_plus_name_trailer():
+    """The measurement that made the save path change: `Len == 44 + A[0x20] + len(name) + 6`.
+
+    Verified on every preset of `vst3-Vital.ini` (BassHouse 15 = 9 + 6, pad 9 = 3 + 6,
+    DirtyBassKongo 20 = 14 + 6, "Bass 808" 14 = 8 + 6), so a blob written without the trailer is
+    shorter than anything REAPER itself produced.
+    """
+    for name in ("BassHouse", "pad", "DirtyBassKongo", "Bass 808", "MCP Check"):
+        core = sample_data(100, seed=1)
+        blob = preset_blob(core, name)
+        assert len(blob) == len(core) + len(name) + 6, name
+        assert blob[len(core) :] == b"\x00" + name.encode() + b"\x00" * 5, blob[len(core):]
+
+
+def test_the_split_finds_the_state_and_the_name_in_a_blob():
+    core = b"\x00" * 44 + b"payload bytes"
+    # item A declares item B's length at 0x20, so a real core declares it too
+    core = bytearray(core)
+    core[0x20:0x24] = (len(core) - 44).to_bytes(4, "little")
+    core = bytes(core)
+    blob = preset_blob(core, "MyPreset")
+    split = split_preset_blob(blob)
+    assert split["ok"] is True
+    assert split["core"] == core
+    assert split["artifact"] == b"\x00MyPreset" + b"\x00" * 5
+    assert split["name"] == "MyPreset"
+    assert split["declared_b"] == len(core) - 44
+    # re-saving under a new name replaces the name and keeps the state byte-for-byte
+    again = split_preset_blob(preset_blob(split["core"], "Other"))
+    assert again["name"] == "Other"
+    assert again["core"] == split["core"]
+
+
+def test_a_blob_without_the_measured_shape_is_not_decoded_as_a_name():
+    core = bytearray(b"\x00" * 44 + b"state")
+    core[0x20:0x24] = len(b"state").to_bytes(4, "little")
+    core = bytes(core)
+    not_a_name = core + b"\x01garbage\x00\x00\x00\x00\x00"
+    split = split_preset_blob(not_a_name)
+    assert split["ok"] is True and split["artifact"] == b"\x01garbage\x00\x00\x00\x00\x00"
+    assert split["name"] is None, "a region that is not the measured shape is 'not understood'"
+    assert read_name_trailer(b"") is None
+    assert read_name_trailer(b"\x00ab") is None, "too short to be the shape"
+
+
+def test_an_unusable_length_field_reports_the_whole_payload_as_the_core():
+    """Nothing is silently truncated: `ok: false` and the payload is the core."""
+    split = split_preset_blob(b"tiny")  # shorter than the header itself
+    assert split["ok"] is False and split["core"] == b"tiny" and split["name"] is None
+    long_enough = bytearray(b"\x00" * 44)
+    long_enough[0x20:0x24] = (10_000).to_bytes(4, "little")  # declares more than exists
+    split = split_preset_blob(bytes(long_enough) + b"tail")
+    assert split["ok"] is False and split["artifact"] == b"" and split["name"] is None
+
+
+def test_an_empty_name_cannot_be_written():
+    with pytest.raises(ValueError):
+        name_trailer("")
 
 
 # ---------------------------------------------------------------------------

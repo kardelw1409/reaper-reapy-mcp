@@ -5764,3 +5764,40 @@ host at all, which is what the server does at startup.
 The tool-count pin moved with the surface (59 -> 63 host tools; 71 -> 75 total advertised).
 
 **1189 passed, 2 skipped** (44.4 recorded 1172).
+
+### 45.6 The blob carries the NAME, and `VstW` is at 52 (measured after the first commit)
+
+Verification the owner's request made possible without the four new tools being callable yet (they
+are registered - the client's own tool cache lists all 75 - but this chat's tool set predates them,
+so every call is refused as "disabled by the user").
+
+**Corrected:** an earlier note in this section said the decoded payload reaches the ASCII `VstW`
+marker "at ~offset 48". It is **52**. The 48 came from a truncated hex dump (`raw[:48].hex()` printed
+96 characters and `VstW` appeared immediately after) and was wrong on both sides of the comparison:
+the real file and the live block shape agree on 52, and on the plugin document starting at 228.
+`tests/test_reaper_presets.py` now pins both numbers against the mock's own block.
+
+**New, and it changes the save path:** the payload REAPER stores is NOT "the plugin's state". It is
+`item A (44) + item B (A[0x20]) + NUL + <preset name> + five NULs`, i.e.
+`Len == 44 + A[0x20] + len(name) + 6` - measured on **every** preset of the real file:
+
+| preset | `Len` | `44 + A[0x20]` | trailer | name read back |
+|---|---|---|---|---|
+| `BassHouse` | 175,762 | 175,747 | 15 | `BassHouse` (9 + 6) |
+| `pad` | 176,148 | 176,139 | 9 | `pad` (3 + 6) |
+| `DirtyBassKongo` | 1,428,230 | 1,428,210 | 20 | `DirtyBassKongo` (14 + 6) |
+| `Bass 808` | 175,065 | 175,051 | 14 | `Bass 808` (8 + 6) |
+
+So the save path as first written (state = item A + item B only) produced a blob **15 bytes shorter
+than REAPER's own** for `BassHouse`, with no name in it. Fixed: `split_preset_blob` splits a blob at
+`44 + A[0x20]` into the state and the host's trailer, `read_name_trailer` decodes the name (and
+returns `None` for any region that is not the measured shape - "not understood", never a guess),
+`name_trailer`/`preset_blob` write the trailer fresh for the requested name, and `extract_fx_state`
+reports the split (`core_bytes`, `artifact_bytes`, `artifact_name`, `blob_ok`). A blob whose own
+length field is unusable is REFUSED by the controller rather than written blind.
+
+Checked against the real artifact: all four relations hold, every name reads back, and rebuilding
+each blob under a new name leaves the state byte-for-byte identical (`bytes 175762 -> 175764` for
+`BassHouse` -> `MCP Renamed`, i.e. exactly the name-length difference).
+
+**1197 passed, 2 skipped** (the round's earlier count was 1189).

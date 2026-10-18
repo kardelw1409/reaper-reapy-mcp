@@ -30,6 +30,7 @@ from utils.reaper_presets import (
     append_preset,
     extract_fx_state,
     parse_preset_library,
+    preset_blob,
     preset_names,
     verify_preset_payload,
 )
@@ -305,7 +306,23 @@ class PresetController(BaseController):
             state = extract_fx_state(self._read_chunk(track_index), int(fx_index))
         except Exception as exc:  # noqa: BLE001 - an unreadable state is not a savable state
             return {"status": "error", "message": f"the FX state could not be read: {exc}"}
-        payload = state["data"]
+        # MEASURED (2026-10-18): REAPER's own preset blob is the plugin state PLUS a trailer
+        # `NUL + name + five NULs` (every preset in `vst3-Vital.ini` satisfies
+        # `Len == 44 + A[0x20] + len(name) + 6`). So the blob is written with the requested name in
+        # that trailer: a payload without it is shorter than anything REAPER itself produced.
+        if not state.get("blob_ok"):
+            return {
+                "status": "error",
+                "message": (
+                    "the FX state's own length field is not usable, so the preset blob cannot be "
+                    "split into state + name trailer (writing it anyway would produce a blob REAPER "
+                    "never wrote)"
+                ),
+                "detail": {"item_a_bytes": state.get("item_a_bytes"), "item_b_bytes": state.get("item_b_bytes")},
+            }
+        block = state["data"]
+        core = block[: state["core_bytes"]]
+        payload = preset_blob(core, wanted)
         if not payload:
             return {"status": "error", "message": "the FX state is empty"}
         text = ""
@@ -323,6 +340,12 @@ class PresetController(BaseController):
             "section": appended["section"],
             "name": wanted,
             "payload_bytes": len(payload),
+            "state_bytes": len(core),
+            "artifact_before": {
+                "bytes": state.get("artifact_bytes"),
+                "name": state.get("artifact_name"),
+            },
+            "name_trailer_bytes": len(payload) - len(core),
             "nb_presets_before": appended["nb_presets_before"],
             "nb_presets_after": appended["nb_presets_after"],
             "characters_before": len(text),

@@ -39,6 +39,31 @@ byte equals `sum(part) & 0xFF` (checked for all of them; three were verified by 
 presets pass `checksums_ok` and `len_ok`; a simulated append leaves every existing byte identical
 and touches only the `NbPresets` line plus the new section.
 
+## The blob also carries the NAME, and that is what a save has to write
+
+The payload is not "the plugin's state": it is `item A (44 bytes) + item B + NUL + <name> + five
+NULs`, and `Len == 44 + A[0x20] + len(name) + 6`. Measured on every preset of the real file:
+
+| preset | `Len` | `A[0x20]` | `44 + A[0x20]` | trailer | name read back |
+|---|---|---|---|---|---|
+| `BassHouse` | 175,762 | 175,703 | 175,747 | 15 | `BassHouse` (9 + 6) |
+| `pad` | 176,148 | 176,095 | 176,139 | 9 | `pad` (3 + 6) |
+| `DirtyBassKongo` | 1,428,230 | 1,428,166 | 1,428,210 | 20 | `DirtyBassKongo` (14 + 6) |
+| `Bass 808` | 175,065 | 175,007 | 175,051 | 14 | `Bass 808` (8 + 6) |
+
+So a blob built as "item A + item B" is **shorter than anything REAPER itself produced**, and a
+`Len` that does not account for the trailer is wrong. `split_preset_blob` splits a blob into the
+state and the trailer, `read_name_trailer` decodes the name (returning `None` for a region that is
+not the measured shape - "not understood", never a guess), and `preset_blob(state, name)` writes the
+trailer fresh, so re-saving under a new name cannot keep the old one. Checked against the real file:
+all four relations hold, every name reads back, and rebuilding each blob under a new name leaves the
+state byte-for-byte identical.
+
+**One correction to an earlier reading:** the `VstW` marker sits at offset **52**, not 48. The 48
+came from a truncated hex dump (48 bytes of hex printed, `VstW` immediately after) and was wrong in
+both directions - the real file and the live block shape agree on 52, which is what the test now
+pins, together with the plugin document starting at 228 in both.
+
 **What the host API offers** (enumerated in `reapy.reascript_api`): `TrackFX_GetPreset`,
 `TrackFX_GetPresetIndex`, `TrackFX_SetPreset`, `TrackFX_SetPresetByIndex`, `TrackFX_NavigatePresets`,
 `TrackFX_GetUserPresetFilename` - and **no save call at all**. Saving is therefore done by writing
@@ -72,8 +97,10 @@ An unconfirmed preset is a trap (it looks saved and does not load), so `save_fx_
 and refuses at the first step that does not hold:
 
 1. the FX's state is read from the track chunk (item A + item B, the bytes a preset stores);
-2. the section is appended in REAPER's format, and the file is backed up **once** beside itself as
-   `<file>.reaper-mcp-backup` (never overwritten, so the way back does not depend on this call);
+2. the blob is completed with REAPER's own name trailer (`NUL + name + five NULs`) - measured on the
+   real file, see above - and the section is appended in REAPER's format, with the file backed up
+   **once** beside itself as `<file>.reaper-mcp-backup` (never overwritten, so the way back does not
+   depend on this call);
 3. `dry_run` stops here and returns the plan;
 4. otherwise the file is written and the HOST must confirm: the preset count grows, the new name
    becomes selectable (`TrackFX_SetPreset`), and the state that comes back after applying it equals

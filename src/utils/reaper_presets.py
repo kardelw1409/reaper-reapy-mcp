@@ -37,13 +37,27 @@ from __future__ import annotations
 import base64
 from typing import Any
 
-#: MEASURED (2026-10-18, decoded from the real file): each `Data*` line is `payload part + 1 checksum
-#: byte`, so a full line is 16,385 bytes = 32,770 hex characters and carries 16,384 payload bytes.
-#: The checksum is `sum(part) & 0xFF` - verified on three consecutive chunks of the real file
-#: (`0x87`, `0xcb`, `0x19`), and the model is what makes the payload a DECODABLE document: joining
-#: the chunks raw, or dropping their FIRST byte, corrupts the plugin JSON at every boundary
-#: (measured: only the "drop the last byte of each chunk" model yields a document with `settings`,
-#: 781 keys). `Len` is the payload's true byte length, i.e. `total_chunks*16385 - n_chunks`.
+#: MEASURED (2026-10-18, the REAL preset file, all four presets): the blob REAPER stores is
+#: `item A (44 bytes) + item B (A[0x20] bytes) + NUL + <preset name> + five NUL bytes`, i.e.
+#: `Len == 44 + A[0x20] + len(name) + 6`. Verified on every preset in `vst3-Vital.ini`:
+#: BassHouse (15 = 9 + 6), pad (9 = 3 + 6), DirtyBassKongo (20 = 14 + 6), "Bass 808" (14 = 8 + 6).
+#: So the name is part of the PAYLOAD, not only of the `Name=` line - a blob written without it is
+#: shorter than anything REAPER itself produced, which is why this is modelled instead of assumed.
+PRESET_NAME_PREFIX_BYTES = 1
+PRESET_NAME_SUFFIX_BYTES = 5
+
+#: The name trailer's total size for a given name (the two NUL runs plus the name).
+def name_trailer_bytes(name: str) -> int:
+    return PRESET_NAME_PREFIX_BYTES + len(str(name)) + PRESET_NAME_SUFFIX_BYTES
+
+
+#: MEASURED (2026-10-18): each `Data*` line is `payload part + 1 checksum byte`, so a full line is
+#: 16,385 bytes = 32,770 hex characters and carries 16,384 payload bytes. The checksum is
+#: `sum(part) & 0xFF` - verified on three consecutive chunks of the real file (`0x87`, `0xcb`,
+#: `0x19`), and the model is what makes the payload a DECODABLE document: joining the chunks raw,
+#: or dropping their FIRST byte, corrupts the plugin JSON at every boundary (measured: only the
+#: "drop the last byte of each chunk" model yields a document with `settings`, 781 keys). `Len` is
+#: the payload's true byte length, i.e. `total_chunks*16385 - n_chunks`.
 PRESET_PAYLOAD_BYTES = 16384
 
 #: The stored line length for a full chunk (payload + checksum).
@@ -274,6 +288,70 @@ def _raw_value(text: str, preset: dict[str, Any], key: str) -> str | None:
     return None
 
 
+def split_preset_blob(payload: bytes) -> dict[str, Any]:
+    """Split a preset blob into the plugin state and REAPER's own name trailer.
+
+    MEASURED: `item A` declares item B's length at offset ``0x20``, so the plugin's state ends at
+    ``44 + A[0x20]`` and everything after it is the host's trailer - which the real file shows is
+    `NUL + <name> + five NULs`. Returns ``{"core", "artifact", "name", "declared_b", "ok"}``;
+    ``ok`` is false when the length field is not usable, in which case the whole payload is
+    reported as the core (never silently truncated).
+    """
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) < 0x24:
+        return {"core": bytes(payload or b""), "artifact": b"", "name": None, "declared_b": None, "ok": False}
+    blob = bytes(payload)
+    declared = int.from_bytes(blob[0x20:0x24], "little")
+    end = 44 + declared
+    if not 0 < declared or end > len(blob):
+        return {"core": blob, "artifact": b"", "name": None, "declared_b": declared or None, "ok": False}
+    artifact = blob[end:]
+    return {
+        "core": blob[:end],
+        "artifact": artifact,
+        "name": read_name_trailer(artifact),
+        "declared_b": declared,
+        "ok": True,
+    }
+
+
+def read_name_trailer(artifact: bytes) -> str | None:
+    """The preset name REAPER wrote after the state, or ``None`` when the shape is not that.
+
+    MEASURED shape: one NUL, the name, five NULs. A region that does not match returns ``None`` -
+    "not understood", never a decoded guess.
+    """
+    if not isinstance(artifact, (bytes, bytearray)) or len(artifact) < PRESET_NAME_PREFIX_BYTES + PRESET_NAME_SUFFIX_BYTES:
+        return None
+    blob = bytes(artifact)
+    if blob[0] != 0 or blob[-PRESET_NAME_SUFFIX_BYTES:] != b"\x00" * PRESET_NAME_SUFFIX_BYTES:
+        return None
+    body = blob[PRESET_NAME_PREFIX_BYTES : len(blob) - PRESET_NAME_SUFFIX_BYTES]
+    try:
+        name = body.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return None
+    return name if "\x00" not in name else None
+
+
+def name_trailer(name: str) -> bytes:
+    """REAPER's own name trailer for a preset blob (`NUL + name + five NULs`)."""
+    text = str(name)
+    if not text:
+        raise ValueError("a preset name cannot be empty")
+    return b"\x00" + text.encode("utf-8") + b"\x00" * PRESET_NAME_SUFFIX_BYTES
+
+
+def preset_blob(state: bytes, name: str, *, base: bytes | None = None) -> bytes:
+    """The blob REAPER stores for a preset: the plugin state plus ITS OWN name trailer.
+
+    `base` is the state part when the caller already split one (see `split_preset_blob`); when it is
+    omitted the whole `state` is used. The trailer is always written fresh for `name`, so a blob
+    re-saved under a new name cannot keep the old one.
+    """
+    core = bytes(base if base is not None else state)
+    return core + name_trailer(name)
+
+
 # ---------------------------------------------------------------------------
 # Reading the FX's own state out of a track chunk (the payload a preset stores)
 # ---------------------------------------------------------------------------
@@ -379,6 +457,7 @@ def extract_fx_state(
     item_b_b64 = "".join(part.strip() for part in chosen["lines"][2:])
     item_a = _b64(item_a_b64)
     item_b = _b64(item_b_b64)
+    split = split_preset_blob(item_a + item_b)
     return {
         "header": chosen["header"],
         "class_hex": chosen["class_hex"],
@@ -388,6 +467,13 @@ def extract_fx_state(
         "item_a_bytes": len(item_a),
         "item_b_bytes": len(item_b),
         "data": item_a + item_b,
+        # The blob is the plugin's state PLUS whatever REAPER keeps after it - which the measured
+        # preset file shows is `NUL + name + five NULs`. The split is reported so a caller saving a
+        # preset can replace that name instead of writing a blob shorter than REAPER's own.
+        "core_bytes": len(split["core"]),
+        "artifact_bytes": len(split["artifact"]),
+        "artifact_name": split["name"],
+        "blob_ok": split["ok"],
     }
 
 
@@ -396,8 +482,13 @@ __all__ = [
     "PRESET_PAYLOAD_BYTES",
     "append_preset",
     "extract_fx_state",
+    "name_trailer",
+    "name_trailer_bytes",
     "parse_preset_library",
+    "preset_blob",
     "preset_names",
+    "read_name_trailer",
     "render_preset_section",
+    "split_preset_blob",
     "verify_preset_payload",
 ]
