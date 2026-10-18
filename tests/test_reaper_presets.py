@@ -21,11 +21,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.reaper_presets import (  # noqa: E402
     PRESET_CHUNK_BYTES,
+    PRESET_PAYLOAD_BYTES,
     append_preset,
     extract_fx_state,
     parse_preset_library,
     preset_names,
     render_preset_section,
+    verify_preset_payload,
 )
 
 
@@ -62,22 +64,28 @@ def test_the_measured_shape_parses_into_names_sizes_and_a_count():
 
 
 def test_a_payload_that_disagrees_with_len_is_a_problem_not_a_pass():
-    """`Len` is the payload size in BYTES: the cheapest consistency probe the format offers."""
+    """`Len` is the payload size in BYTES; the stored hex is `Len + one checksum byte per chunk`.
+
+    MEASURED on the real file: 11 chunks of a 175,762-byte payload stored 351,546 hex characters =
+    2 * (175,762 + 11). The relation is the cheapest consistency probe the format offers.
+    """
     text = library_text(("BassHouse", b"x" * 100))
+    assert parse_preset_library(text)["problems"] == [], "the renderer's own file must agree"
     broken = text.replace("Len=100", "Len=101")
     problems = parse_preset_library(broken)["problems"]
     assert [row["reason"] for row in problems] == ["payload_size_disagrees_with_len"]
-    assert problems[0]["len"] == 101 and problems[0]["data_chars"] == 200
+    assert problems[0]["len"] == 101 and problems[0]["chunks"] == 1
+    assert problems[0]["expected_chars"] == 2 * (101 + 1)
 
 
 def test_junk_lines_are_reported_rather_than_skipped():
-    text = "[General]\nNbPresets=1\n\nthis is not a key\n[Preset0]\nData=00\nLen=1\nName=x\n"
+    text = "[General]\nNbPresets=1\n\nthis is not a key\n[Preset0]\nData=0000\nLen=1\nName=x\n"
     problems = parse_preset_library(text)["problems"]
     assert [row["reason"] for row in problems] == ["not_a_key_value"]
 
 
 def test_a_preset_without_a_name_is_reported():
-    text = "[General]\nNbPresets=1\n\n[Preset0]\nData=00\nLen=1\n"
+    text = "[General]\nNbPresets=1\n\n[Preset0]\nData=0000\nLen=1\n"
     problems = parse_preset_library(text)["problems"]
     assert [row["reason"] for row in problems] == ["preset_without_name"]
 
@@ -88,15 +96,26 @@ def test_a_preset_without_a_name_is_reported():
 
 
 def test_the_renderer_writes_the_measured_chunking():
-    data = sample_data(PRESET_CHUNK_BYTES + 17)
+    """Each chunk is 16,384 payload bytes PLUS REAPER's own checksum byte (sum & 0xFF).
+
+    MEASURED on the real file: the last byte of three consecutive full chunks was `0x87`, `0xcb`,
+    `0x19` - the byte-sum of the 16,384 bytes before it in each case. A section written without it
+    is a file REAPER did not write, and joining the chunks raw or dropping their FIRST byte breaks
+    the plugin document at every boundary (measured: only "drop the last byte" decodes to a
+    document with `settings`).
+    """
+    data = sample_data(PRESET_PAYLOAD_BYTES + 17)
     lines = render_preset_section(2, "BassHouse", data)
     assert lines[0] == "[Preset2]"
     keys = [line.split("=", 1)[0] for line in lines[1:]]
     assert keys == ["Data", "Data_1", "Len", "Name"]
     first, second = (line.split("=", 1)[1] for line in lines[1:3])
     assert len(first) == PRESET_CHUNK_BYTES * 2 == 32_770, "a full chunk is 16,385 bytes of hex"
-    assert len(second) == 17 * 2
-    assert first == data[:PRESET_CHUNK_BYTES].hex().upper(), "uppercase hex, as REAPER writes it"
+    assert len(second) == 18 * 2, "16 payload bytes + the checksum"
+    part = data[:PRESET_PAYLOAD_BYTES]
+    assert first == (part + bytes([sum(part) & 0xFF])).hex().upper(), "uppercase hex, + checksum"
+    tail = data[PRESET_PAYLOAD_BYTES:]
+    assert second == (tail + bytes([sum(tail) & 0xFF])).hex().upper()
     assert lines[3] == f"Len={len(data)}"
     assert lines[4] == "Name=BassHouse"
 
@@ -129,7 +148,7 @@ def test_appending_adds_one_section_and_moves_only_the_count():
     parsed = parse_preset_library(result["text"])
     assert parsed["problems"] == [], parsed["problems"]
     section = [preset for preset in parsed["presets"] if preset["name"] == "New Sound"][0]
-    assert section["data_chars"] == len(payload) * 2
+    assert section["data_chars"] == 2 * (len(payload) + section["chunks"].__len__())
 
 
 def test_appending_to_an_empty_or_absent_file_starts_the_library():
@@ -147,7 +166,7 @@ def test_appending_refuses_a_file_whose_format_is_not_the_measured_one():
 
 def test_appending_refuses_a_file_without_a_count_key():
     with pytest.raises(ValueError) as bad:
-        append_preset("[Preset0]\nData=00\nLen=1\nName=x\n", "New", sample_data(4))
+        append_preset("[Preset0]\nData=0000\nLen=1\nName=x\n", "New", sample_data(4))
     assert "NbPresets" in str(bad.value)
 
 
@@ -218,6 +237,32 @@ def test_an_unterminated_block_is_refused():
     with pytest.raises(ValueError) as bad:
         extract_fx_state(chunk, 0)
     assert "not terminated" in str(bad.value)
+
+
+def test_the_checksum_byte_is_what_catches_a_corrupted_chunk():
+    """The format carries its own integrity check, and this is it being used."""
+    data = sample_data(PRESET_PAYLOAD_BYTES + 32, seed=5)
+    text = library_text(("Good", data))
+    check = verify_preset_payload(text, 0)
+    assert check["found"] is True and check["checksums_ok"] is True
+    assert check["len_ok"] is True and check["bad_chunks"] == []
+    assert check["payload"] == data, "the reassembled payload is the one that was written"
+
+    # flip one nibble inside the FIRST chunk: the checksum of that chunk must complain
+    first = text.splitlines()[4].split("=", 1)[1]
+    flipped = ("1" if first[10] != "1" else "2") + first[11:]
+    broken = text.replace(first, flipped, 1)
+    check = verify_preset_payload(broken, 0)
+    assert check["checksums_ok"] is False and check["bad_chunks"] == [0]
+    assert check["payload"] is None, "a payload that failed its check is not returned"
+
+    # a `Len` that does not describe the payload is visible too, without decoding
+    assert verify_preset_payload(text.replace("Len=%d" % len(data), "Len=7"), 0)["len_ok"] is False
+
+
+def test_integrity_of_a_section_that_does_not_exist_is_not_a_pass():
+    check = verify_preset_payload(library_text(("Only", b"x" * 10)), 7)
+    assert check == {"found": False}
 
 
 def test_multiline_item_b_is_joined_like_the_host_writes_it():

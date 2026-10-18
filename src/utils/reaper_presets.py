@@ -37,8 +37,17 @@ from __future__ import annotations
 import base64
 from typing import Any
 
-#: MEASURED: every `Data*` line of a full chunk is 32,770 hex characters = 16,385 bytes.
-PRESET_CHUNK_BYTES = 16385
+#: MEASURED (2026-10-18, decoded from the real file): each `Data*` line is `payload part + 1 checksum
+#: byte`, so a full line is 16,385 bytes = 32,770 hex characters and carries 16,384 payload bytes.
+#: The checksum is `sum(part) & 0xFF` - verified on three consecutive chunks of the real file
+#: (`0x87`, `0xcb`, `0x19`), and the model is what makes the payload a DECODABLE document: joining
+#: the chunks raw, or dropping their FIRST byte, corrupts the plugin JSON at every boundary
+#: (measured: only the "drop the last byte of each chunk" model yields a document with `settings`,
+#: 781 keys). `Len` is the payload's true byte length, i.e. `total_chunks*16385 - n_chunks`.
+PRESET_PAYLOAD_BYTES = 16384
+
+#: The stored line length for a full chunk (payload + checksum).
+PRESET_CHUNK_BYTES = PRESET_PAYLOAD_BYTES + 1
 
 #: The general section and the key that counts the presets (measured).
 GENERAL_SECTION = "General"
@@ -109,15 +118,20 @@ def parse_preset_library(text: str) -> dict[str, Any]:
             problems.append({"line": preset["line"], "reason": "section_index_unreadable", "section": preset["section"]})
         if "name" not in preset:
             problems.append({"line": preset["line"], "reason": "preset_without_name", "section": preset["section"]})
-        expected = (preset.get("len") or 0) * 2 if preset.get("len") else None
-        if expected is not None and expected != int(preset.get("data_chars") or 0):
+        chunks = int(len(preset.get("chunks") or []))
+        chars = int(preset.get("data_chars") or 0)
+        # MEASURED relation: the stored hex holds the payload PLUS one checksum byte per chunk.
+        expected = 2 * ((preset.get("len") or 0) + chunks) if preset.get("len") is not None else None
+        if expected is not None and expected != chars:
             problems.append(
                 {
                     "line": preset["line"],
                     "reason": "payload_size_disagrees_with_len",
                     "section": preset["section"],
                     "len": preset["len"],
-                    "data_chars": int(preset.get("data_chars") or 0),
+                    "chunks": chunks,
+                    "data_chars": chars,
+                    "expected_chars": expected,
                 }
             )
     return {"nb_presets": nb_presets, "presets": presets, "problems": problems}
@@ -138,7 +152,11 @@ def preset_names(text: str) -> list[dict[str, Any]]:
 
 
 def render_preset_section(index: int, name: str, data: bytes) -> list[str]:
-    """One `[PresetK]` section in REAPER's measured shape (hex chunks, `Len`, `Name`)."""
+    """One `[PresetK]` section in REAPER's measured shape (hex chunks + checksum, `Len`, `Name`).
+
+    The checksum byte is not decoration: it is what the real file carries at the end of every
+    chunk (`sum(part) & 0xFF`), and a section written without it is a file REAPER did not write.
+    """
     if not isinstance(index, int) or index < 0:
         raise ValueError(f"a preset index must be a non-negative integer, got {index!r}")
     if not isinstance(data, (bytes, bytearray)) or not data:
@@ -146,10 +164,10 @@ def render_preset_section(index: int, name: str, data: bytes) -> list[str]:
     if not str(name).strip():
         raise ValueError("a preset needs a non-empty name")
     lines = [f"[{PRESET_SECTION_PREFIX}{index}]"]
-    for offset in range(0, len(data), PRESET_CHUNK_BYTES):
-        key = DATA_KEY_PREFIX if offset == 0 else f"{DATA_KEY_PREFIX}_{offset // PRESET_CHUNK_BYTES}"
-        chunk = bytes(data[offset : offset + PRESET_CHUNK_BYTES])
-        lines.append(f"{key}={chunk.hex().upper()}")
+    for offset in range(0, len(data), PRESET_PAYLOAD_BYTES):
+        key = DATA_KEY_PREFIX if offset == 0 else f"{DATA_KEY_PREFIX}_{offset // PRESET_PAYLOAD_BYTES}"
+        part = bytes(data[offset : offset + PRESET_PAYLOAD_BYTES])
+        lines.append(f"{key}={(part + bytes([sum(part) & 0xFF])).hex().upper()}")
     lines.append(f"{LEN_KEY}={len(data)}")
     lines.append(f"{NAME_KEY}={name}")
     return lines
@@ -194,10 +212,71 @@ def append_preset(text: str, name: str, data: bytes) -> dict[str, Any]:
     }
 
 
+def verify_preset_payload(text: str, section_index: int) -> dict[str, Any]:
+    """Decode ONE preset's chunks and check REAPER's own per-chunk checksum byte.
+
+    This is the integrity check the format itself offers (`sum(part) & 0xFF` stored after each
+    16,384-byte part), so a payload that survives it is byte-for-byte what REAPER wrote - the
+    strongest statement available without asking the host. Returns ``{"found", "bytes",
+    "checksums_ok", "bad_chunks", "len_ok", "payload"}``; ``payload`` is the reassembled bytes and
+    is only present when every check held.
+    """
+    parsed = parse_preset_library(text)
+    wanted = None
+    for preset in parsed["presets"]:
+        if preset.get("index") == int(section_index):
+            wanted = preset
+            break
+    if wanted is None:
+        return {"found": False}
+    keys = sorted(
+        wanted.get("chunks") or [],
+        key=lambda key: int(key.split("_")[1]) if "_" in key else 0,
+    )
+    parts: list[bytes] = []
+    bad: list[int] = []
+    for position, key in enumerate(keys):
+        value = _raw_value(text, wanted, key)
+        if value is None:
+            continue
+        blob = bytes.fromhex("".join(value.split()))
+        if len(blob) < 2:
+            bad.append(position)
+            continue
+        if (sum(blob[:-1]) & 0xFF) != blob[-1]:
+            bad.append(position)
+        parts.append(blob[:-1])
+    payload = b"".join(parts)
+    return {
+        "found": True,
+        "bytes": len(payload),
+        "chunks": len(keys),
+        "checksums_ok": not bad,
+        "bad_chunks": bad,
+        "len_ok": wanted.get("len") == len(payload),
+        "payload": payload if not bad else None,
+    }
+
+
+def _raw_value(text: str, preset: dict[str, Any], key: str) -> str | None:
+    """The raw hex value of one key inside one section (bounded to that section)."""
+    current = None
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            continue
+        if current != preset.get("section") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() == key:
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reading the FX's own state out of a track chunk (the payload a preset stores)
 # ---------------------------------------------------------------------------
-
 
 def _b64(value: str) -> bytes:
     text = "".join(value.split())
@@ -314,9 +393,11 @@ def extract_fx_state(
 
 __all__ = [
     "PRESET_CHUNK_BYTES",
+    "PRESET_PAYLOAD_BYTES",
     "append_preset",
     "extract_fx_state",
     "parse_preset_library",
     "preset_names",
     "render_preset_section",
+    "verify_preset_payload",
 ]

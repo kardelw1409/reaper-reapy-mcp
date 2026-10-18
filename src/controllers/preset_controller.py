@@ -26,7 +26,13 @@ from typing import Any
 import reapy
 
 from controllers.base_controller import BaseController
-from utils.reaper_presets import append_preset, extract_fx_state, parse_preset_library, preset_names
+from utils.reaper_presets import (
+    append_preset,
+    extract_fx_state,
+    parse_preset_library,
+    preset_names,
+    verify_preset_payload,
+)
 
 #: Buffer size for the host's string out-parameters (a preset name is short; the filename is a path).
 _BUFFER = 1024
@@ -144,9 +150,10 @@ class PresetController(BaseController):
         }
         file_names: list[dict[str, Any]] = []
         problems: list[dict[str, Any]] = []
+        text = ""
         if path and os.path.isfile(path):
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
                     text = handle.read()
                 file_names = preset_names(text)
                 problems = parse_preset_library(text)["problems"]
@@ -162,6 +169,21 @@ class PresetController(BaseController):
                 data["file_preset_index"] = row.get("index")
                 break
         data["problems"] = problems
+        # The format's own integrity check (a checksum byte per chunk): reported for the preset
+        # that is CURRENT, because that is the one whose bytes a caller may rely on right now.
+        current_row = next(
+            (row for row in file_names if row.get("name") == name and row.get("index") is not None),
+            None,
+        )
+        if current_row is not None:
+            check = verify_preset_payload(text, current_row["index"])
+            data["current_payload"] = {
+                "section": current_row.get("section"),
+                "bytes": check.get("bytes"),
+                "checksums_ok": check.get("checksums_ok"),
+                "bad_chunks": check.get("bad_chunks"),
+                "len_ok": check.get("len_ok"),
+            }
         if count == 0 and not file_names:
             data["channel_empty"] = (
                 "the host reports no presets and no preset file is present for this FX: the channel "
@@ -288,7 +310,7 @@ class PresetController(BaseController):
             return {"status": "error", "message": "the FX state is empty"}
         text = ""
         if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
                 text = handle.read()
         try:
             appended = append_preset(text or "[General]\nNbPresets=0\n", wanted, payload)
@@ -314,7 +336,10 @@ class PresetController(BaseController):
         if os.path.isfile(path) and not os.path.isfile(backup):
             shutil.copy2(path, backup)
         original = text
-        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        # MEASURED: REAPER's own preset files are CRLF (140 CRLF, 0 lone LF in `vst3-Vital.ini`),
+        # so the whole file is written back that way - a section appended with LF endings is a file
+        # REAPER did not write.
+        with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
             handle.write(appended["text"])
         _, after_count, _ = self._preset_index(track_index, fx_index)
         grew = before_count is not None and after_count is not None and after_count > before_count
@@ -328,7 +353,7 @@ class PresetController(BaseController):
                 back_state = None
         identical = back_state == payload
         if not (grew and applied_ok and identical):
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
                 handle.write(original)
             if before_name:
                 self.set_fx_preset(track_index, fx_index, name=before_name)

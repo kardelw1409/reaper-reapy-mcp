@@ -5686,9 +5686,32 @@ state-chunk write with the whole measured ceiling arithmetic around it).
 measurement (`presets/` listing) shows the same family for other plugins - `vst-reaeq.ini`,
 `vst3-Dexed-builtin.ini`, ... - so this is REAPER's general FX-preset store, not a Vital special.
 The format is `[General] NbPresets=N`, then one `[PresetK]` per preset with uppercase-hex `Data`,
-`Data_1`, ... lines of **16,385 bytes** each (32,770 hex characters), a `Len` in **bytes** and a
-`Name`. The decoded payload reaches the ASCII `VstW` marker at ~offset 48 - the same wrapper the
-plugin state carries inside a track chunk (item B), i.e. the file stores the FX's own VST3 state.
+`Data_1`, ... lines, a `Len` in **bytes** and a `Name`. The decoded payload reaches the ASCII `VstW`
+master at ~offset 48 - the same wrapper the plugin state carries inside a track chunk (item B), i.e.
+the file stores the FX's own VST3 state.
+
+**The layout was PROVED, and the first model was wrong.** The chunking is not "16,385 bytes of
+payload per line": the payload is split every **16,384 bytes**, and each line is that part plus **one
+checksum byte** (`sum(part) & 0xFF`) - 16,385 bytes = 32,770 hex characters. Three measurements,
+in this order:
+
+1. the naive model (raw concatenation) left every preset `Len + number_of_chunks` bytes long, and a
+   `Len`-vs-hex consistency probe flagged all four real presets;
+2. a JSON test decided which end the extra byte is on: joining the chunks raw, or dropping their
+   FIRST byte, corrupts the plugin document at every boundary (no decodable object with `settings`),
+   while dropping the LAST byte of each chunk decodes to a document with **781 settings keys** - the
+   same count the plugin layer reads from a live instance. With that model the payload length equals
+   `Len` exactly for all four presets (175,762 / 176,148 / 1,428,230 / 175,065);
+3. the dropped byte is a checksum: for three consecutive chunks of `BassHouse` it equals
+   `sum(part) & 0xFF` (`0x87`, `0xcb`, `0x19`), and then for **every** chunk of all four presets.
+
+So the write path had a real bug before it was ever used: the renderer emitted chunks WITHOUT the
+checksum byte, which is a file REAPER did not write. The renderer now writes it, the parser checks it
+(`verify_preset_payload`, which also reassembles the payload), the `Len` probe uses the measured
+relation (`hex == 2 * (Len + chunks)`), and the file is written with **CRLF** line endings (measured:
+140 CRLF, 0 lone LF in the real file). Against the real artifact the parser now reports **zero
+problems**, all four presets pass `checksums_ok` and `len_ok`, and a simulated append leaves every
+existing byte identical while touching only the `NbPresets` line plus the new section.
 
 Note the contrast with the plugin layer's P38 finding ("every host-visible preset channel answers
 empty/`-1` on Vital"): that measurement is about the plugin's VST3 *program* channel, and it stands

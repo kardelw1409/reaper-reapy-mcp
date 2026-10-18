@@ -21,10 +21,23 @@ Len=175762
 Name=BassHouse
 ```
 
-* chunking: **16,385 bytes** per line (keys `Data`, `Data_1`, ...), the last one short;
-* `Len` = payload size in **bytes** (so a parse is checkable without decoding);
+* chunking: the payload is split every **16,384 bytes**, and each part is stored as hex of the part
+  **plus one checksum byte** (`sum(part) & 0xFF`) - 16,385 bytes = 32,770 hex characters per full
+  line, keys `Data`, `Data_1`, ...; the last one is short;
+* `Len` = payload size in **bytes** (so a parse is checkable without decoding: the stored hex is
+  `2 * (Len + number of chunks)`);
+* line endings are **CRLF** (measured: 140 CRLF, 0 lone LF), and the file is written back that way;
 * the decoded payload reaches the ASCII `VstW` marker at ~offset 48 - the same wrapper the plugin's
   state carries inside REAPER's track chunk, i.e. the file stores the FX's own VST3 state.
+
+**How the layout was proved** (not assumed): joining the chunks raw, or dropping their FIRST byte,
+corrupts the plugin document at every boundary - only "drop the last byte of each chunk" decodes to
+JSON with a `settings` object (781 keys, the same count the plugin layer reads live). With that
+model the reassembled payload's `Len` matches exactly for all four presets, and every chunk's last
+byte equals `sum(part) & 0xFF` (checked for all of them; three were verified by hand first:
+`0x87`, `0xcb`, `0x19`). On the real file the parser now reports **zero problems** and all four
+presets pass `checksums_ok` and `len_ok`; a simulated append leaves every existing byte identical
+and touches only the `NbPresets` line plus the new section.
 
 **What the host API offers** (enumerated in `reapy.reascript_api`): `TrackFX_GetPreset`,
 `TrackFX_GetPresetIndex`, `TrackFX_SetPreset`, `TrackFX_SetPresetByIndex`, `TrackFX_NavigatePresets`,
@@ -35,7 +48,7 @@ REAPER's own file in REAPER's own format, and then **the host has to confirm it*
 
 | tool | what it does | cost |
 |---|---|---|
-| `get_fx_presets(track_index, fx_index)` | current preset, host count + index, the user preset file, and the names parsed from that file | host reads only; the file is parsed once |
+| `get_fx_presets(track_index, fx_index)` | current preset, host count + index, the user preset file, the names parsed from that file, and the integrity of the CURRENT preset's payload | host reads only; the file is parsed once |
 | `set_fx_preset(..., name=`*or*`index)` | apply one preset from REAPER's set, verified by read-back | one host call |
 | `navigate_fx_presets(..., step)` | step through the set (`step` may be negative), reporting `before`/`after`/`changed` | one host call |
 | `save_fx_preset(..., name, dry_run=True)` | save the FX's CURRENT state as a REAPER preset, host-verified | one chunk read + one file write |
