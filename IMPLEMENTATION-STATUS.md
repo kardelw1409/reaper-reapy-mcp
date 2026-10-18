@@ -4781,3 +4781,430 @@ unit (~16 %), i.e. ~17 s on the 38-unit chain. It is left undone because it chan
 tracker's contract ("the expected revision advances only from this transaction's own verified
 read-back"), and that contract has its own tests; doing it needs a measurement of what an external
 parameter write in that window does today, which the post-write read presently absorbs anyway.
+
+## 40. P39 - the state write has a MEASURED landing bound, and the wavetable balloon (2026-10-17)
+
+Owner's requirement this round: *"мне нужно чтобы таблицы тоже все грузились, потому что тогда
+пресеты бесполезны и загружены получается частично"* - tables must load, otherwise a preset apply is
+half a preset. P38 had recorded "a growing table does not land" (P30) and shipped a guard that refused
+one; this round measured what that refusal was actually hitting and replaced it with a delivery
+mechanism. Evidence (outside the repo, P32): `run_artifacts\…__vital-preset-research__*` for
+`probe_p39_wrapper_sizes.py`, `probe_p39_balloon.py`, `probe_p39_table_balloon.py`,
+`probe_p39_acceptance.py` (+ `_p39_selftest.py`, `_p39_debug_plan.py`).
+
+### 40.1 The landing bound, measured exactly
+
+A state write LANDS **iff the new document is at most `headroom` characters longer than the one the
+host holds**, where `headroom = len(item B) - 8 - (the end of the JSON)`. Measured on plain string
+fields (labels), one host write per step, the block-text delta held constant:
+
+| step | document growth | block delta | outcome |
+|---|---|---|---|
+| 1-4 | +8 / +16 / +24 / +31 | +8 / +24 / +32 / +40 | land |
+| 5 | **+32** | +44 | **lands, exactly on the bound** |
+| 6-8 | +33 / +40 / +64 | +44 / +52 / +84 | ignored, state byte-identical |
+| 9-11 | +33 / +64 / +4096 with item B's size fields patched | +44 / +84 / +5 480 | **ignored** |
+
+The bound is therefore `len(item B) - 8`, and the "-8" is the host's own trailer: item B is REAPER's
+`VstW` wrapper (16-byte header + a chunk magic + JUCE's `CcnK` chunk, which ends 8 bytes before item B
+does + `FBCh` + the document + a 40-byte trailer). `headroom` is **32 in every state measured**
+(fixture and live), because the trailer after the document is 40 bytes and the host keeps its last 8.
+This also explains why P38 saw the same `+44` block delta for a growth of 32 and of 33: base64 expands
+4 characters per 3 bytes and both round to +44 - the band P38 measured was this bound seen through the
+encoding.
+
+### 40.2 Refuted: patching item B's own size fields
+
+The fixture (`tests/plugins/fixtures/vital_codec/state_layout.json`) records three header fields whose
+values equal `len(item B) - k` (LE at `+0x00`, BE at `+0x1C` = the `CcnK` size, BE at `+0xB4`). Carrying
+ALL of them by the delta was applied to the wire (verified in the evidence) and **does not move the
+bound**: the host hands the plugin `new_state[0 : len_prev - 8]` - its own remembered length, not a
+field in the text we send. The codec therefore still patches only `+0x00` (harmless, keeps the block
+consistent) and the planner does not rely on any field.
+
+### 40.3 The balloon: making the state bigger than the table
+
+Source-verified (`C:\repos\vital`, 1.0.6-era, GPL-3; the installed build is 1.5.5, so every rule was
+confirmed live):
+
+* `WaveSourceKeyframe::jsonToState` decodes `wave_data` into a block sized for ONE frame
+  (`sizeof(float) * kWaveformSize`) and `memcpy`s the whole frame - so a keyframe written with a short
+  payload reads back as a **full** frame. Measured live: a 44-character payload came back as 2 048
+  samples, `nan = 0`, `inf = 0`.
+* `Sample::jsonToState` reads `length` from the JSON and memcpys it - the sample layer is an amplifier
+  too, and it was the first balloon tested (it works, but it parks audio in the owner's sample block for
+  a moment, which is why the shipped balloon uses the slot being written instead).
+
+The mechanism: a table that cannot land is written in TWO writes - the SAME slot inflated with K stub
+keyframes (a small write, lands), then the real table, which is now a SHRINK, and **a shrink always
+lands**. Measured end to end: a 16-frame / 175,497-byte table into a slot holding the 1-frame Init
+table, read back frame-for-frame with `table_id` equality, and the document equal to the capture
+**except that slot**. `K` is chosen so the room (`K x 10 924` characters, one full frame per stub
+keyframe) covers the table, capped by the 256-frame axis (≈ 2.8 MB of state - the corpus median table is
+87 856 B, so the cap is far away).
+
+A balloon unit is verified **by its effect**, not by equality (its read-back is the plugin's own
+re-serialization, by design): the read-back's room has to cover the table it is clearing the way for.
+It is a separate unit in the outcome (`kind: balloon`, with `frames_written` / `frames_read_back` /
+`target_chars` / `room_chars`) and a named line in the run log.
+
+### 40.4 What the guard refuses now
+
+`wavetables.check_writable` no longer caps a table's size (that cap was a workaround for 40.1). It still
+refuses a value that is not a table object, a table with no `Wave Source` frames (the plugin accepts such
+a slot and it sounds like silence), and a write with no live `synth_version` to stamp (`version` is
+restamped by the plugin on re-serialisation - measured). `VERIFIED_PAYLOAD_BYTES = 11 159` and
+`HOST_ABORT_EVIDENCE` stay exported as the RECORDED measurement, with a `superseded_by` entry that says
+what replaced their reading: the P30 abort was the same truncation cutting the JSON, not a size limit of
+the wavetable engine. The preset layer's gap reason `wavetable_growth_refused` became
+`wavetable_unwritable`, and a table beyond what a balloon can clear is `no_room_for_growth`.
+
+### 40.5 Offline surface
+
+**1048 passed, 2 skipped** (`py -3.11 -m pytest -q -p no:cacheprovider tests/plugins
+--ignore=tests/plugins/live`; P38 ended at 1032 + 2). New `tests/plugins/test_p39_balloon.py` (15 tests):
+the headroom the framing reports (computed independently from the block), the constants' derivation
+(`BATCH_GROWTH_BUDGET = STATE_HEADROOM_BYTES - HEADROOM_MARGIN_BYTES`), the sizing rules, the stub's
+template and payload, the plan shape, the guard's new verdict, the verify-by-room branch (passing AND
+failing), and the two-write chain end to end. Three tests were **rewritten to the measurement** rather
+than kept green: `test_p30_wavetable.py::test_the_raw_state_path_is_guarded_too` (the structural refusals
+and the plan, no longer a size refusal), `test_a_growing_table_is_refused_on_the_dry_run_too` →
+`…_is_planned_with_a_balloon_on_the_dry_run_too`, and
+`test_p38_presets.py::test_change_set_declines_a_growing_wavetable_slot` →
+`test_change_set_carries_a_growing_wavetable_slot` (+ a new test that the value-level refusal still
+fires). The revision pin moved r14 → **r15**.
+
+The host double gained one GENERIC hook (`state_write_transform`, default `None`): the balloon's
+verification needs a read-back that mirrors the plugin's re-serialization, so the Vital tests install
+`expand_keyframes` - the measured behaviour, implemented in the test, not in the mock. No existing test
+writes short frames, so the hook is inert elsewhere.
+
+### 40.6 Live acceptance, through the product path
+
+`probe_p39_acceptance.py` calls `api.plugin_presets` (the function the `plugin_presets` tool calls) on
+the sandbox instance: it searches the library, resets the slot with a preset that carries a small table,
+applies a preset with a REAL multi-frame table, and compares the live slot against a fresh read of the
+file.
+
+* preset `Florixel - Vital Essentials/CH - Future Bass Super Saw 4` - table `Basic Shapes`, **8 frames /
+  87 856 bytes** (exactly the class P30 measured as "does not land");
+* apply: `ok: true`, `committed: true`, `verdict: ALL_VERIFIED`; the wavetable row reports
+  `table_id_written == table_id_read_back`, `agrees: true`, `differing_fields: []`;
+* the **balloon row**: `frames_written 9`, `frames_read_back 9`, `room_chars 98 804` ≥
+  `target_chars 87 856`, `growth_chars 76 697` against `budget_chars 24`;
+* `matches_the_preset_file: true` - the live document's slot 1 holds the file's table (`1d80ab8c8b625f0807a4`).
+
+The gaps that remain in that outcome are honest and unrelated to size: 1 × `host_owned_parameter`
+(`beats_per_minute`) and 2 × `wavetable_unwritable` (the file's slots 2 and 3 carry no `Wave Source`
+frames - writing them would silence those oscillators).
+
+**A finding that answers the owner's earlier ear test.** `LD - Future Saw` **carries no custom table at
+all**: its three slots are the Init table, and applying it writes `table_id 1e4f3dfee12a65b88d98`
+(1 frame / 2 048 samples / 11 159 B) into all three - measured in the same acceptance run (the reset
+step). So "track 15 sounds like an init saw" was the FILE, not a failed write; now that growing tables
+are deliverable, the two cases are distinguishable by the outcome (`wavetables_requested` /
+`wavetables_declined` and the wavetable rows).
+
+### 40.7 Cost, and what is still open
+
+* A growing table costs ONE extra host write (the balloon) plus one read-back; the apply above stayed in
+  the same order of magnitude as P38's applies.
+* The non-table half of the P38 chain verdict (unit 34/38 of the Cyberline chain) was NOT re-run this
+  round: the slot-field fix from P38 §39.10 is in place and the chain re-run is the cheap next step.
+* The bytes past a balloon's stub payload are the plugin's preallocated frame buffer: finite on the live
+  build (measured), confined to the slot the same transaction replaces, and not zeroed by us.
+* The balloon is a delivery path through the LIVE chunk. Whether a host-native route exists that is not
+  bounded at all (the plugin's own preset menu, an RPL preset) was not chased - it is not needed now.
+* The `dry_run` output does not yet name the two writes (state units are planned after the request is
+  expanded); it is recorded in doc 22 §7 as the cheap next improvement.
+
+## 41. P39, second half - the growl/dubstep tables (`Audio File Source`), and the family measured (2026-10-18)
+
+The owner restarted the MCP server (so the tool carried r15), then asked the question this round
+answers: *"там ведь много пресетов, особенно интересно как будет гроу бас и все такое что в дабстепе"*.
+The answer turned out to be a GAP, not a confirmation: the whole growl family stores its table in a
+component type the guard refused.
+
+### 41.1 What the family actually carries (offline, `_p39c_family_survey.py` + `_p39c_component_dive.py`)
+
+Query over names/styles (`growl|wobble|dubstep|riddim|tearout|monst|bass|drop|sub`) over the 2,226-file
+library: **536 presets, 449 with a custom table**, median max payload **164,353 B** (double the P38
+sample's median), max **1,469,727 B**. Dumping the components of two of them showed why the numbers
+were so much bigger than P38's: most of those tables are **`Audio File Source`** slots, whose entire
+wave data is ONE `audio_file` string of base64 int16 PCM (1,409,036 characters = 528,388 samples in
+`Dubstep Growl Seq`). The plugin's factory names ten component types and **four of them are sources**
+(`Wave Source`, `Line Source`, `Audio File Source`, `Shepard Tone Source`); `wavetables.describe` called
+every non-`Wave Source` slot "processing stages only" and the guard refused it with
+`wavetable_unwritable`. That is exactly the part that makes a growl a growl - the reason the P38 corpus
+sample reported "85 % of presets carry a custom table" while the layer carried almost none of them.
+
+### 41.2 The three capabilities that were missing
+
+1. **Recognition.** `SOURCE_COMPONENTS` (the plugin's own four), `carriers()`/`carrier()`,
+   `audio_payload()`, `audio_samples()`, `carries_waves()`; `describe()` reports `source_types`, and an
+   audio slot reports `audio_chars`/`audio_samples` with a `why_no_frames` that explains the slot
+   instead of implying it is empty. `table_id` now digests **every** source payload, so an audio slot
+   has an identity at all - with the `Wave Source` digest left byte-for-byte as P30 shipped it, so ids
+   recorded in the journal since then stay valid (pinned by a test that recomputes the old digest).
+   Identity is still the WAVE CONTENT: a label, a version or a modifier is not part of it.
+2. **Delivery.** The balloon is now general: it replaces the **first wave-carrying component of any
+   type** with a stub `Wave Source` of K keyframes (keeping the graph's modifiers). For an audio slot
+   the write drops the whole ~1.4 MB payload, so it is a large shrink and it lands; the read-back is
+   `K x 10,924` characters. `balloon_sizing` counts what the balloon KEEPS (the modifiers) as part of
+   the room, and the stub carries the target's own opening samples - from its first frame, or from the
+   audio payload's head (decoded from a sliced base64 prefix, never the whole 1.4 MB).
+3. **Verification.** An audio payload cannot come back byte-identical: measured twice on the same
+   1,409,808-byte table, **8,856 of 528,388 samples (1.676 %) return moved by EXACTLY one step**
+   (`histogram {1: 8856}`, identical in both trials) because the plugin converts int16 -> float on load
+   and back on save. The row now takes the payload OUT of the field comparison (which stays exact for
+   the graph, the windows, the keyframe positions and `version`), compares it as its own band (equal
+   length always, step <= 1), reports `differing_fraction`, and states plainly that `table_id` cannot be
+   expected to match for an audio slot (`table_id_agrees` + `table_id_agrees_note`). The band can fail:
+   a move of 3 steps refuses the write (test).
+
+### 41.3 Live measurements
+
+| probe | measurement |
+|---|---|
+| `probe_p39d_audio_slots.py` | a general balloon lands on a live audio slot: 136 stub keyframes -> read-back 1,490,155 chars, then the 1,409,808-byte table lands as a shrink; the small one (86,997 B) comes back byte-identical; restore `matches_capture: true` |
+| `probe_p39e_audio_residual.py` | the requant band, twice (see above) |
+| `probe_p39_acceptance.py` (upgraded to compare every slot) | `Dubstep Growl Seq` applied through `plugin_presets(op="apply")`: `ALL_VERIFIED`, **`wavetables_requested: 3`, `wavetables_declined: 0`**, all three slots carry the file (528,388 / 528,388 / 32,429 samples), balloons 130 / 130 / 8 frames, slot 3's `table_id` matched exactly, 92 controls + 6 LFOs + 6 labels + 11 routes created |
+| `_p39g_cold_slot.py` (offline) | from a FRESH Init slot one balloon covers up to ~2.4 MB of table (the family's max is 1.47 MB); beyond that the plan names `no_room_for_growth` instead of guessing |
+| `probe_p39h_family_batch.py` | **6 presets applied one by one: 6/6 `ALL_VERIFIED` and committed, 18/18 slots carry the file.** Slot payloads 1,469,727 / 1,409,808 / 1,409,788 / 150,832 / 164,353 / 841,563 / 175,497 / 87,856 / 22,114 B; **16 of the 18 slots' `table_id` matched byte-for-byte** (including the family maximum) and the two that did not are the ones whose live content came from a previous balloon - the row says so and gives the band. 401 s for all six (~67 s per apply). Remaining gaps are the P38 family (`host_owned_parameter`, `guarded_rule_subject`, `destination_dropped_by_plugin`, `slot_text_dropped_with_pair`, `growth_over_budget`, `sample_growth_over_budget`) - none about tables |
+
+**One probe step failed and is recorded as such:** the acceptance's helper "reset" apply returned
+`ok: false` without a captured reason (the probe only recorded the flag; it now records the envelope).
+The same call dry-runs clean afterwards (`90 controls, wavetables_requested 3, declined 0`), and the
+acceptance that followed it succeeded completely - so the failure is unexplained rather than benign,
+and the next run of that probe carries its error.
+
+### 41.4 Offline surface
+
+**1067 passed, 2 skipped** (P39's first half ended at 1048 + 2). New `tests/plugins/test_p39c_audio_slots.py`
+(19 tests): recognition and identity (including the pinned P30 digest), the guard's acceptance and its
+remaining refusals, the balloon's component swap and its sizing arithmetic, the requant band passing and
+failing, the masked field comparison, and the two-write chain end to end against a host double that
+mirrors BOTH measured behaviours (`P39.expand_keyframes` + a requant transform, composed). Revision
+r15 -> **r16**.
+
+### 41.5 What this means for the owner's question
+
+Before this round, a growl/dubstep preset applied as: every control batch, the labels, the sample block
+- and its TABLE refused, so the oscillator kept whatever table happened to be in the slot (on a fresh
+instance: the Init saw). That is exactly the "presets are useless without the tables" report. After it,
+the same presets apply with `wavetables_declined: 0` and the instance's three slots hold the FILE's own
+tables - measured on six presets spanning the family's whole payload range, verified slot by slot
+against a fresh read of the file.
+
+Still not carried in those applies, and worth saying plainly: the `fm_needs_modulator`-guarded values,
+the destinations this build drops, one value per preset whose own growth exceeds a single write
+(`growth_over_budget`), the project tempo, and - in two presets - the SAMPLE block, because the file's
+sample is bigger than what the live document can grow by in one write (`sample_growth_over_budget`).
+The table channel no longer belongs on that list.
+
+### 41.6 The sample block gets its own balloon (mono and stereo)
+
+The two presets whose sample was left behind were measured: `BASS Broken Circuit` needs **+99,508**
+chars and `BASS - Deep 2` needs **+132,300** - and the second one is STEREO, so it writes TWO payloads
+(`samples` and `samples_stereo`). The first fix attempted - borrow room from a wavetable slot by
+ballooning it first - was measured and does NOT work: a sample's growth is the whole document's growth,
+and the slot's inflation has already spent the room by the time the sample arrives. What works is the
+sample inflating ITSELF: the block is re-declared with a larger `length` and a tiny per-channel payload
+(the write shrinks, so it lands), the plugin re-serializes that many samples, and the file's payload
+then arrives as a SHRINK of that. The two writes must be adjacent, because any other unit shrinks the
+document and takes the room back.
+
+Two live bugs were found and fixed on the way, both by a live refusal rather than by reasoning:
+
+1. **The room and the verification must count every channel.** `plugin_write`'s balloon path and the
+   codec's read-back both looked at `samples` only, so a stereo write was refused (`sample_inflated...`
+   / room-not-restored) although the room was there. `_verify_sample_balloon` now requires the read-back
+   `length` to equal what was written AND the SUM of all `SAMPLE_PAYLOAD_KEYS` payloads to cover the
+   target; `_sample_row` compares every payload through `_sample_alignment`.
+2. **A wavetable slot's balloon cannot serve a sample** (above).
+
+Live result through the product path: `BASS - Deep 2` -> `ALL_VERIFIED`, `sample: 1`, and the instance's
+sample block carries the file's own name, length (93,712 samples) and payload size (249,900 chars); the
+only remaining gap is `host_owned_parameter`.
+
+### 41.7 🔴 The read ceiling: a state can be too large for the host to READ back
+
+Applying the family's biggest presets repeatedly left the sandbox instance in a state the layer can no
+longer read. Measured on that instance (track 15):
+
+| | |
+|---|---|
+| JSON state | 2,522,972 chars |
+| `item B` | 3,363,963 bytes |
+| the chunk's plugin BLOCK as text | 4,485,284 chars |
+| `GetTrackStateChunk` at capacity 4,000,000 / 4,100,000 | returns a **TRUNCATED** chunk (4,099,999 chars) |
+| at 4,400,000 / 5M / 6M / 9M / 20M | `OSError: exception: access violation writing 0x...` - three runs in a row, so not transient |
+| the SAME capacities on light tracks (0 and 1) | read fine (1,176 / 1,185 chars) |
+
+So the fault is about THAT state, not about the capacity, and the line lies between **4.0 and 4.45 MB of
+block text** (about 3.0-3.3 MB of state). The `Dubstep Growl Seq` acceptance of §41.3 (three tables,
+2.91 MB) sat at ~4.0 MB of block text - just under the line - which is why it read back cleanly and this
+one does not. The layer used to classify that `OSError` as a transport loss (`NotConnected`) and RETRY
+it; it is now `Unreadable` with `reason: "state_too_large_to_read"` and the message names the recovery.
+
+Guard: the planner refuses to CREATE such a state (`state_ceiling_reached`, naming the projected size and
+the ceiling). `STATE_CHUNK_CEILING_CHARS = 4,000,000` of chunk text minus a 250 KB margin, converted at
+the measured 4/3 expansion -> **2.81 MB of state**. **This is a deliberate capability cost**: the family's
+largest three-slot presets sit at or above it and would now be refused instead of landing with no margin.
+Readability is the precondition for BOTH verification and rollback, so trading an unverifiable apply for a
+named refusal is the conservative direction.
+
+The stuck instance is NOT recoverable through the layer (a write needs a read first, and
+`SetTrackStateChunk` goes in with `isUndo=False`, so REAPER's Ctrl+Z does not hold the layer's pre-writes).
+The host-side preset route is closed as well: `TrackFX_GetPreset` returns an EMPTY name and the plugin
+exposes no programs to the host (`TrackFX_GetNumPresets` does not exist; `TrackFX_SetPreset`/
+`TrackFX_NavigatePresets` have nothing to navigate). Recovery is owner-side: load a normal wavetable or
+preset in the PLUGIN's own browser, or delete and re-add the instance, or revert the project to its file.
+Writing the truncated chunk back would destroy the preset, not heal it.
+
+### 41.8 Offline surface, second half
+
+**1072 passed, 2 skipped** (41.4 ended at 1067). `tests/plugins/test_p39c_audio_slots.py` grew to 21
+tests, and the sample balloon brought its own regression pair inside `test_p38_preset_batching.py`
+(`..._is_carried_by_inflating_the_sample`, `..._beyond_what_the_engine_holds_is_named`, the end-to-end
+chain, and `..._measures_every_channel_it_opens_room_for` - the stereo bug). `mock_host` gained a generic
+`state_write_transform` hook so a host double can mirror the measured landing bound without a special
+case per probe.
+
+## 42. P40 - the write channel survives the owner's own hands, the ceiling is pinned, and the layer can build its OWN wavetables (2026-10-18)
+
+This round started from the owner's question ("so all presets load fully, tables included - and, since
+you found out how to load custom tables, could the TOOL load OUR OWN, and could an agent design sound
+with it") and from what the previous round's live runs did when the owner hit Play.
+
+### 42.1 🔴 A changed TRACK is not a changed PLUGIN (the transport-churn fix)
+
+Live, measured: starting the transport rewrites the track's chunk WHILE a transaction walks its units.
+The bridge's write path checked the whole-chunk digest of the slice it had located, refused the write -
+and the ROLLBACK hit the same guard, so `rollback.end` reported `channels.state: false` and a ballooned
+wavetable slot was left holding its STUB. Two of six presets of the family batch died that way, and the
+instance looked broken from an edit nobody asked for.
+
+The rule now (pure function, shared by the real bridge and the mock host):
+
+* if the chunk moved, re-locate this instance's own block **by identity** (class id + module + ordinal)
+  and splice there;
+* refuse ONLY when the located BLOCK's bytes differ from the plan's - that is a real conflict (someone
+  changed the plugin), and splicing over it would destroy their change.
+
+`relocate_unchanged_block` + `locate_block_by_identity` live in `host/reaper.py`; the mock calls the same
+function, so the offline transaction tests exercise the shipping rule. `test_p5_transport.py`'s
+"a stale slice is refused" case was split into the two rules that replaced it (re-located when the block
+is unchanged, refused when it changed - the fixture edits a payload line INSIDE the block, because a line
+appended after the closing `>` is not part of the block).
+
+**Live confirmation:** the same six-preset batch that failed 2 of 6 with the transport PLAYING came out
+**6/6 `ALL_VERIFIED`, 16/18 slots carrying the file's table** (before: 13/18).
+
+### 42.2 The read ceiling, pinned to the two states it was measured on
+
+The ceiling shipped in §41.7 was conservative by construction: 4,000,000 characters of chunk text minus a
+250,000 margin at the measured 4/3 expansion -> 2,812,500 document characters. It refused 23 of the 536
+family presets, and the numbers behind it were two states, only one of which was measured precisely.
+
+Measured this round (same track, the same layer):
+
+| state | document chars | chunk text | read outcome |
+|---|---|---|---|
+| the three-table `Dubstep Growl Seq` state | 3,048,249 | 4,083,632 | **COMPLETE** read, stable at every capacity >= its length, verified |
+| the earlier stuck instance | 3,363,963 | 4,485,284 | `OSError: exception: access violation` - three runs in a row |
+| a capacity BELOW the real length | - | exactly `capacity - 1` | silently TRUNCATED (never a safe fallback) |
+
+So the line lies between 4.08 and 4.45 MB of chunk text, and the ceiling is now **the largest text
+measured readable**: `STATE_CHUNK_CEILING_CHARS = 4_100_000`, margin 25,000, expansion 4/3 -> **3,056,250
+document characters**. `test_p39c_audio_slots.py` pins BOTH ends (the readable state must be allowed, the
+faulting one must be refused), so a future change cannot quietly move the line back to a guess.
+
+### 42.3 The order of the writes decides whether a balloon fits (and the fresh case decides the order)
+
+A balloon's peak is `document + room - replaced`, so a plan that balloons FIRST meets the document while
+it still holds the other slots' OLD tables. Measured, in both directions:
+
+* a slot whose write SHRINKS the document (always lands: measured) must go **first** - it is free room.
+  Before this, `Vain Bass` left its `Audio File Source` slot behind; now it lands 3/3 AND its sample;
+* among the writes that each NEED a balloon, the BIGGEST room must meet the emptiest document. Ordering
+  the smallest first cost the fresh-state case its third table (measured live: 2/3 slots), so the sort is
+  two-tier: non-balloon writes by ascending delta (biggest shrink first), then ballooned writes by
+  DESCENDING room;
+* the balloon's projection is now computed against the RUNNING document size (the plan's own claim about
+  readability), not against the live document.
+
+**Live, after the fix:** on a FRESH instance the family's biggest preset applies **3/3 slots + sample**,
+final document 3,048,249 under the ceiling 3,056,250 (chunk 4,083,632 - right at the measured readable
+maximum). Six-preset batch over a warm instance: **6/6 `ALL_VERIFIED`, 18/18 slots carrying the file's
+tables, 4/6 samples** (the slot count was 13/18 and the sample count 0/6 before this round; the same
+batch with the transport PLAYING came out 6/6 and 16/18). What is left over is the P38 family's own list
+(`host_owned_parameter`, `guarded_rule_subject`, `destination_dropped_by_plugin`, `growth_over_budget`,
+`slot_text_dropped_with_pair`), plus two samples: `BASS Broken Circuit`'s 217 KB sample finds no room on a
+document that holds a 1.47 MB table (`no_room_for_sample_growth`, named), and `BASS - Deep 2`'s sample
+needed the two-write delivery (`sample_inflated_before_write`, reported as such).
+
+### 42.4 🔴 An outcome must not say ALL_VERIFIED while a requested change never arrived
+
+Found by reproducing a live symptom offline: the read ceiling refused a table, the planner DID record
+`state_ceiling_reached` in `outcome.named_gaps` - and the response carried `ok: true`, `partial: false`,
+`gaps: []`. The verdict is true about the units the transaction RAN; it is not a statement that every
+requested change arrived, and a caller could not tell the difference. Two live presets lost a table that
+way with nothing in the answer naming it.
+
+`_gaps_from_outcome` (in `api.py`) now folds the outcome's named gaps into every write response
+(`plugin_write`, `plugin_presets`, `plugin_wavetable`), sets `partial: true` and adds `write_gaps` with
+the reasons. Gaps a preset's own plan already named are kept and de-duplicated.
+
+**Live:** the remaining refusal is now NAMED (`state_ceiling_reached` with its path), and the two family
+presets whose tables alone exceed the ceiling (4.12 MB) both come back `partial: true` with the reason
+while the **instance stays readable** - the behaviour the owner needs when the answer is "no".
+
+### 42.5 `plugin_wavetable` - building our OWN tables (the sound-design channel)
+
+New tool (10th; the surface pin in `test_p0_contracts.py` moves with it, deliberately). Three ops over
+ONE small object - the whole protocol is documented in
+[docs/universal-plugin-mcp-v3/23-own-wavetables.md](docs/universal-plugin-mcp-v3/23-own-wavetables.md):
+
+* exactly one source: `shape` (a named waveform, or a LIST of them for a morph), `harmonics` (an additive
+  spectrum as `[[partial, amplitude], ...]`, or one spectrum per frame), `samples` (raw, resampled to the
+  plugin's 2,048-sample frame - a short payload would otherwise be zero-padded by the plugin, i.e. a
+  different waveform);
+* `frames` 1..256: the listed items are the morph's KEY positions and the frames between them are
+  interpolated (two shapes + `frames: 16` is a 16-step morph);
+* `duty`/`phase`/`name`/`full_normalize`/`remove_all_dc` optional;
+* `op='preview'` renders the spec with NO host (useful for an agent designing before writing), `op='read'`
+  reports what the slot holds in the same numbers, `op='write'` rides the SAME state channel as every
+  other write: the guard, the growth bound, the balloon, the read-back verification and the rollback all
+  apply unchanged, and a table that cannot be delivered is REFUSED by name.
+
+Everything plugin-specific (the frame width, the 0..256 axis, the component shape, the version stamp)
+lives in the provider's `WavetableCapability` (`providers/vital/tables.py`); the tool layer refuses a
+provider without the hook by name. The core stays free of provider identifiers (the boundary checker has
+a test for exactly that).
+
+**Live proof (2026-10-18):** an additive growl spectrum morphed over 16 frames was written into
+oscillator 1 of the sandbox instance - **16/16 frames delivered in 9.6 s, no gaps**, and the read-back's
+spectra matched the host-free PREVIEW exactly (frame 0: 0.5473 / 0.3284 / 0.2189 / 0.1642; frame 15:
+0.6167 / 0.3083 / 0.2054 / 0.1542), because `Wave Source` frames are float32 and are NOT requantized (unlike
+the `Audio File Source` payloads, whose band is documented in §41).
+
+### 42.6 Offline surface
+
+**1090 passed, 2 skipped** (41.8 ended at 1072). New: `tests/plugins/test_p40_write_gaps.py` (5 - the
+ordering rules, the fresh-instance fit, and the envelope honesty) and
+`tests/plugins/test_p40_wavetables.py` (12 - the spec language, every refusal, the built table's shape,
+preview host-free, read, write, a one-frame shrink, a provider without the vocabulary). `test_p5_transport.py`
+carries the two transport-churn rules, `test_p0_contracts.py`'s surface pins moved 9 -> 10.
+
+### 42.7 What is NOT solved, stated plainly
+
+* A preset whose tables need more room than the ceiling leaves cannot be delivered **over an instance
+  that already holds a large table** - the peak needs the sum of the transient and the content. On a
+  fresh instance the same preset applies fully (measured 3/3). The refusal names it; the workaround is
+  the owner's (a fresh/Init instance, or a smaller preset).
+* The morph's own interpolation curves (the plugin's `interpolation_style`) are not expressible in the
+  spec: frames are written with linear interpolation between the listed items.
+* The sample block is not writable through `plugin_wavetable` (it has its own channel, §41.6).
+* The audible result is not measured anywhere in this round: what is established is what the plugin
+  STORES, read back through its own document.

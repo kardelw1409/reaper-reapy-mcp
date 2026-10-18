@@ -343,8 +343,29 @@ verified one ([05 §2.8](05-universal-core-contract.md)). `plugin_write`/`plugin
   (`tests/plugins/test_p12_safety_gates.py::test_the_registered_modulation_tool_still_lists_and_removes`
   pins a committed removal at `ALL_VERIFIED` and one `write_state_slice`).
 
-## 10. Registration & compatibility
+### 9.1 `plugin_presets` (P38 — implemented, not in the original V1 surface)
 
+The plugin's **own** preset library (its native browser's files — not the host's session presets, which
+the plugin does not expose): `op='search' | 'info' | 'apply' | 'save' | 'init'`. An apply rides the
+**same** transaction machinery as any other write, and a part the plan cannot carry is named in
+`gaps[]` with `partial: true` — never silently. Research report and measured limits:
+[21-vital-preset-browser-research.md](21-vital-preset-browser-research.md),
+[22-vital-preset-apply-limits.md](22-vital-preset-apply-limits.md).
+
+### 9.2 `plugin_wavetable` (P40 — implemented, not in the original V1 surface)
+
+The **sound-design** channel: build a wavetable from a small spec and write it into an oscillator slot
+(`op='write' | 'preview' | 'read'`). The spec is one object with exactly one source — `shape` (a named
+waveform, or a list of them for a morph), `harmonics` (an additive spectrum, or one per frame) or
+`samples` (raw) — plus `frames` (1…256, interpolated when larger than the list). `preview` is
+**host-free**, so a waveform can be designed without a REAPER instance; `read` reports what the slot
+holds now, in the same numbers (peak/RMS/partials). Protocol, examples and the measured limits:
+[23-own-wavetables.md](23-own-wavetables.md).
+
+The provider supplies the vocabulary (`WavetableCapability`); a provider without the hook is refused by
+name, and no plugin-specific fact lives in the tool layer.
+
+## 10. Registration & compatibility
 - **Registration:** `setup_plugin_tools(mcp: FastMCP, *, config)` called from `create_server()`
   immediately after `setup_mcp_tools(...)` [A: `server.py`]. Uses the proven SPEC-driven closure
   pattern: each tool validates required args, dispatches through a `DISPATCH` table, returns the
