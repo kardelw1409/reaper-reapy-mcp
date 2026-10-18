@@ -150,6 +150,11 @@ def test_the_spec_refuses_what_it_cannot_build_and_says_what_it_accepts():
     with pytest.raises(InvalidValue) as bad_duty:
         VT.spec_frames({"shape": "pulse", "duty": 1.5})
     assert "duty" in str(bad_duty.value)
+    # MEASURED (live, 2026-10-18): a caller reads `duty` as a PERCENTAGE and passes 25. The unit is
+    # a fraction, and the refusal has to say so - otherwise the correction is a guess.
+    with pytest.raises(InvalidValue) as percent:
+        VT.spec_frames({"shape": "pulse", "duty": 25})
+    assert "0.25" in json.dumps(percent.value.detail), percent.value.detail
 
 
 def test_an_additive_spectrum_builds_the_waveform_it_names():

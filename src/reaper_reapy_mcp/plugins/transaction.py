@@ -18,6 +18,7 @@ The engine is provider-agnostic and host-agnostic: it talks to a
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -154,6 +155,17 @@ class Transaction:
         self._rows: dict[str, list[dict[str, Any]]] = {"state": [], "parameters": []}
         self._mismatched: dict[str, list[dict[str, Any]]] = {"state": [], "parameters": []}
         self._named_gaps: list[dict[str, Any]] = []
+        #: Paths this transaction has already WRITTEN, with the exact value it wrote.
+        #:
+        #: MEASURED (2026-10-18, live): the plugin re-encodes some payloads on every state load -
+        #: a sample's PCM comes back delayed by `SAMPLE_RELOAD_DELAY` (4) samples. Every later unit
+        #: re-sends the WHOLE state, and the document it sends comes from the read-back, so the
+        #: delay compounded once per following write: a 12-unit apply left the file's sample
+        #: 48 samples late, and the layer's own per-unit verification could not see the drift
+        #: (each step was within the measured reload delay). Re-injecting the value we INTENDED -
+        #: exactly what a writer that knows its target does - keeps the instance on the target and
+        #: leaves the plugin's own one-round-trip delay as the only residue.
+        self._intended: dict[str, Any] = {}
         #: Route operations the plugin accepted and then silently dropped on
         #: re-serialisation (an unknown pair name - measured behaviour, P38).
         #: Named in the outcome like any other gap, and reported as `partial`.
@@ -710,6 +722,33 @@ class Transaction:
         self._prevalidate_units(document, state_units)
         return state_units, pairs
 
+    def _carry_intended(self, document: Any, unit: StateWriteUnit) -> Any:
+        """The document a unit's write should be built from: the live one, with OUR values.
+
+        Every path this transaction has already written is put back exactly as it was written, and
+        the unit's own paths are left alone (the encoder is about to set them). Paths the document
+        no longer has are skipped: a rollback or an external removal must not make the carry a
+        failure, and the unit's own verification still guards what it writes.
+        """
+        if not self._intended:
+            return document
+        own = {str(path) for path in ((unit.payload or {}).get("paths") or {})}
+        carry = {
+            path: value for path, value in self._intended.items() if path not in own
+        }
+        if not carry:
+            return document
+        hook = getattr(self.codec, "apply_intended_values", None)
+        if not callable(hook):
+            return document
+        hook(document, carry)
+        return document
+
+    def _record_intended(self, unit: StateWriteUnit) -> None:
+        """Remember what this unit wrote, so later units keep the instance on that value."""
+        for path, value in ((unit.payload or {}).get("paths") or {}).items():
+            self._intended[str(path)] = copy.deepcopy(value)
+
     def _prevalidate_units(self, document: Any, units: Sequence[StateWriteUnit]) -> None:
         """F3: a plan that cannot be built against the live state refuses
         BEFORE the first write (nothing is written while simulating)."""
@@ -730,7 +769,7 @@ class Transaction:
         # write below is guarded against a chunk that moved since: a second read of
         # the same chunk would buy nothing and cost one host round trip per unit.
         current_slice = self._last_slice
-        current_document = self._last_document
+        current_document = self._carry_intended(self._last_document, unit)
         new_block = self.codec.encode_slice(current_document, unit, current_slice)
         self._attempted["state"].add(text_digest(new_block.block_text))
 
@@ -777,6 +816,7 @@ class Transaction:
                 )
         self._last_slice = readback_slice
         self._last_verified["state"] = text_digest(readback_slice.block_text)
+        self._record_intended(unit)
         # a document write can reset ordinary parameters (measured behaviour),
         # so the parameter channel is re-read and its expected digest advanced
         fresh = self._read_full_parameter_vector()

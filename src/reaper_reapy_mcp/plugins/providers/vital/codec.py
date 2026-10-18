@@ -32,9 +32,9 @@ import json
 import math
 import struct
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
-from ...errors import InvalidValue, Unreadable
+from ...errors import InvalidValue, PluginError, Unreadable
 from ...model import (
     StateWritePlan,
     StateWriteUnit,
@@ -151,6 +151,9 @@ LABEL_PATHS: tuple[str, ...] = (
 #:
 #:   * document 3,048,473 chars -> a COMPLETE 4,083,633-character chunk, returned identically at
 #:     every capacity at or above its length (so it was not truncated), decoded and verified;
+#:   * document 3,127,179 chars -> a COMPLETE 4,189,248-character chunk (the largest measured
+#:     READABLE state; `_p40m_ceiling_probe.py`), while 3,166,642 (~4.24 M) and 3,206,106
+#:     (~4.29 M) both faulted - so the line sits between 4,189,248 and 4,240,000 characters;
 #:   * document 3,363,963 chars -> chunk 4,485,284, and `GetTrackStateChunk` answered
 #:     `OSError: exception: access violation writing 0x...` three runs in a row, while the same
 #:     capacities read light tracks (1,176 chars) fine.
@@ -845,28 +848,31 @@ class VitalCodec:
                     )
                     continue
                 pending[key] = paths[key]
-            # ORDER THE TABLE WRITES SO EVERY BALLOON MEETS THE SMALLEST DOCUMENT IT CAN (P40).
+            # SCHEDULE EVERY PAYLOAD WRITE SO THE DOCUMENT'S PEAK STAYS LOWEST (P40).
             #
-            # MEASURED (2026-10-18, live):
-            #   * a preset whose slot must SHRINK was refused a balloon for a second slot when the
-            #     balloon was planned against the live document - which still held the first slot's
-            #     OLD, bigger table. A strict shrink always lands (measured), so a non-balloon write
-            #     that shrinks is free room for everything after it: those go FIRST, biggest shrink
-            #     first.
-            #   * a balloon's peak is `document + room - replaced`, so among the writes that NEED a
-            #     balloon the biggest room must meet the emptiest document: those go next, ordered by
-            #     DESCENDING room. (Ordering them by the smallest first instead cost the fresh-state
-            #     case its third table - measured: 2/3 slots instead of 3/3.)
+            # MEASURED (2026-10-18, live, three separate runs):
             #
-            # The deltas are exact for table writes (both sizes are known from the live document and
-            # the target), and the projection below is computed against the RUNNING size, so a plan is
-            # judged against the document it will actually meet.
-            needs: dict[str, bool] = {}
-            rooms: dict[str, int] = {}
+            #   * a balloon's own write lands on the spot, and the plugin then holds the room it
+            #     opened - so a pair's PEAK IS the document it leaves behind;
+            #   * a write that SHRINKS the document is free room for everything after it (measured:
+            #     the two shrinking tables of `BASS Broken Circuit` are what made room for its
+            #     1.47 MB one, and withOUT them that balloon was refused by the read ceiling);
+            #   * the SAMPLE pair must be scheduled like the others rather than pinned first. Pinned
+            #     first it met the document while it still held the previous preset's 1.4 MB tables
+            #     and was refused (`no_room_for_sample_growth`); the same preset frees ~1.5 MB a few
+            #     units later, which is where the sample belongs.
+            #
+            # Both sizes of every item are known exactly (the live document and the target), so the
+            # peaks below are arithmetic over measured numbers. Three candidate orders are simulated
+            # and the one with the lowest peak wins; ties keep the first candidate, so the choice is
+            # deterministic.
+            items: list[dict[str, Any]] = []
             for key, note in table_units:
                 growth = _table_growth(note)
-                needs[key] = bool(growth is not None and growth > budget)
-                if needs[key]:
+                needs = bool(growth is not None and growth > budget)
+                overhead = 0
+                sizing: dict[str, Any] = {}
+                if needs:
                     try:
                         sizing = wavetables_module.balloon_sizing(
                             paths[key],
@@ -876,48 +882,14 @@ class VitalCodec:
                         )
                     except InvalidValue:
                         sizing = {}
-                    rooms[key] = int(sizing.get("room_chars") or 0)
-            schedule = sorted(
-                table_units,
-                key=lambda item: (
-                    0 if not needs.get(item[0]) else 1,
-                    (_table_growth(item[1]) or 0) if not needs.get(item[0]) else -rooms.get(item[0], 0),
-                ),
-            )
-            running_chars = _running_document_chars(document, sample_pending, sample_growth)
-            planned: list[StateWriteUnit] = []
-            for key, note in schedule:
-                growth = _table_growth(note)
-                if needs.get(key):
-                    balloon = self._plan_balloon(
-                        document, note, paths[key], budget, document_chars=running_chars
-                    )
-                    if isinstance(balloon, dict) and balloon.get("blocked") == "state_ceiling":
-                        notices.append(
-                            {
-                                "reason": "state_ceiling_reached",
-                                "path": note["path"],
-                                "growth_chars": growth,
-                                "projected_chars": balloon.get("projected_chars"),
-                                "ceiling_chars": balloon.get("ceiling_chars"),
-                                "document_chars_now": _document_chars(document),
-                                "message": (
-                                    "this table was NOT written: delivering it would leave a "
-                                    "state whose track chunk passes ~4 MB, which REAPER can no "
-                                    "longer read back (measured) - and the read is what every "
-                                    "later step, including the rollback, needs. Free room by "
-                                    "loading a smaller table (or a normal preset) first"
-                                ),
-                            }
-                        )
-                        continue
-                    if balloon is None:
+                    if not sizing.get("ok"):
                         notices.append(
                             {
                                 "reason": "no_room_for_growth",
                                 "path": note["path"],
                                 "growth_chars": growth,
                                 "budget_chars": budget,
+                                "why": sizing.get("why"),
                                 "message": (
                                     "this table was NOT written: it grows the document past "
                                     "the measured landing bound and no balloon can open "
@@ -926,33 +898,23 @@ class VitalCodec:
                             }
                         )
                         continue
-                    note["balloon"] = balloon["sizing"]
-                    note["balloon"]["unit"] = len(planned)
-                    planned.append(balloon["unit"])
-                planned.append(
-                    StateWriteUnit(
-                        order_index=len(planned),
-                        kind="state",
-                        payload={"paths": {key: paths[key]}, "wavetable": [note]},
+                    overhead = max(
+                        0,
+                        int(sizing.get("room_chars") or 0) - int(sizing.get("replaced_chars") or 0),
                     )
+                items.append(
+                    {
+                        "kind": "table",
+                        "key": key,
+                        "note": note,
+                        "net": int(growth or 0),
+                        "overhead": overhead,
+                        "sizing": sizing,
+                    }
                 )
-                if growth is not None:
-                    running_chars += growth
-            for batch in _batch_paths(document, pending):
-                units.append(
-                    StateWriteUnit(order_index=len(units), kind="state", payload={"paths": batch})
-                )
-            # P39: a value that is not a table may also outgrow one write - the SAMPLE block
-            # does on real presets (measured: 99,508 and 132,300 characters on two family files).
-            # The room comes from the SAMPLE layer's own amplifier and nowhere else: the plugin
-            # sizes its sample buffer from the JSON's `length` and re-serializes that many
-            # samples (`Sample::jsonToState`), so a block written with a small payload and a
-            # larger `length` reads back BIGGER. Borrowing a wavetable slot's room does NOT work
-            # (measured live: the sample's growth is a growth of the whole document, which the
-            # slot's inflation has already spent) - the sample block has to inflate ITSELF.
             if sample_pending is not None:
-                room = self._plan_sample_balloon(document, sample_pending, budget)
-                if room is None:
+                sizing = self._sample_balloon_sizing(document, sample_pending)
+                if sizing is None:
                     notices.append(
                         {
                             "reason": "no_room_for_sample_growth",
@@ -968,21 +930,77 @@ class VitalCodec:
                             ),
                         }
                     )
-                else:
-                    unit, sizing = room
-                    sample_unit = StateWriteUnit(
-                        order_index=0,
-                        kind="state",
-                        payload={"paths": {SAMPLE_PATH: sample_pending}},
+                elif sizing["growth_chars"] > budget:
+                    # the balloon's own write is a shrink of the live payload (measured), so this
+                    # only happens on a live block with almost no payload to give up
+                    notices.append(
+                        {
+                            "reason": "no_room_for_sample_growth",
+                            "path": SAMPLE_PATH,
+                            "growth_chars": sample_growth,
+                            "budget_chars": budget,
+                            "balloon_growth_chars": sizing["growth_chars"],
+                            "message": (
+                                "the sample payload was NOT written: the live sample block is too "
+                                "small for its own balloon write to land in one step"
+                            ),
+                        }
                     )
-                    # the balloon and the sample must be ADJACENT: every other unit shrinks the
-                    # document again, and a shrinking document takes the room away
-                    sample_pair = [unit, sample_unit]
+                else:
+                    items.append(
+                        {
+                            "kind": "sample",
+                            "key": SAMPLE_PATH,
+                            "value": sample_pending,
+                            "net": int(sample_growth),
+                            "overhead": max(
+                                0, int(sizing["room_chars"]) - int(sizing["live_chars"])
+                            ),
+                            "sizing": sizing,
+                        }
+                    )
+
+            order = _lowest_peak_order(items, _document_chars(document))
+            running_chars = _document_chars(document)
+            planned: list[StateWriteUnit] = []
+            for item in order:
+                projected = running_chars + int(item["overhead"])
+                if projected > _state_ceiling_chars():
+                    notices.append(
+                        {
+                            "reason": "state_ceiling_reached",
+                            "path": (
+                                SAMPLE_PATH if item["kind"] == "sample" else item["note"]["path"]
+                            ),
+                            "growth_chars": item["net"],
+                            "projected_chars": projected,
+                            "ceiling_chars": _state_ceiling_chars(),
+                            "document_chars_now": _document_chars(document),
+                            "message": (
+                                "this value was NOT written: delivering it would leave a state "
+                                "whose track chunk passes what REAPER can read back (measured: "
+                                "4,189,248 characters read fine, 4,240,000 faulted), and the read "
+                                "is what every later step, including the rollback, needs. Free "
+                                "room by loading a smaller table or preset first"
+                            ),
+                        }
+                    )
+                    continue
+                if item["kind"] == "sample":
+                    sizing = item["sizing"]
+                    planned.append(self._sample_balloon_pair(sizing))
+                    planned.append(
+                        StateWriteUnit(
+                            order_index=len(planned),
+                            kind="state",
+                            payload={"paths": {SAMPLE_PATH: item["value"]}},
+                        )
+                    )
                     notices.append(
                         {
                             "reason": "sample_inflated_before_write",
                             "path": SAMPLE_PATH,
-                            "growth_chars": sample_growth,
+                            "growth_chars": item["net"],
                             "balloon_length": sizing["length"],
                             "balloon_room_chars": sizing["room_chars"],
                             "message": (
@@ -994,13 +1012,37 @@ class VitalCodec:
                             ),
                         }
                     )
-            # P40 ORDERING (measured 2026-10-18): the SAMPLE pair (its own balloon and its write,
-            # adjacent - a shrinking document takes its room away), then the TABLE schedule, then
-            # the plain batches. Inside the schedule each balloon sits immediately before the
-            # table it opens room for, and the SHRINKING table writes come first, so every balloon
-            # meets the smallest document the plan can give it - which is what turned a live
-            # `state_ceiling_reached` refusal into a delivered table.
-            units = list(sample_pair) + planned + units
+                else:
+                    note = item["note"]
+                    if item["sizing"]:
+                        balloon = self._plan_balloon(
+                            document,
+                            note,
+                            paths[item["key"]],
+                            budget,
+                            document_chars=running_chars,
+                            sizing=item["sizing"],
+                        )
+                        if balloon is not None and "unit" in balloon:
+                            note["balloon"] = balloon["sizing"]
+                            note["balloon"]["unit"] = len(planned)
+                            planned.append(balloon["unit"])
+                    planned.append(
+                        StateWriteUnit(
+                            order_index=len(planned),
+                            kind="state",
+                            payload={"paths": {item["key"]: paths[item["key"]]}, "wavetable": [note]},
+                        )
+                    )
+                running_chars += int(item["net"])
+            for batch in _batch_paths(document, pending):
+                units.append(
+                    StateWriteUnit(order_index=len(units), kind="state", payload={"paths": batch})
+                )
+            # P40 ORDERING (measured): route ops stay first (P38's rule), then the scheduled items -
+            # pairs keep their two writes adjacent - and the plain control batches last, where the
+            # room the schedule made is already in the document.
+            units = planned + units
         route_ops = (
             [{"op": "create", **spec} for spec in (changes.get("routes_create") or [])]
             + [{"op": "update", **spec} for spec in (changes.get("routes_update") or [])]
@@ -1236,6 +1278,33 @@ class VitalCodec:
             space="native",
         )
 
+    def apply_intended_values(self, document: Any, values: Mapping[str, Any]) -> None:
+        """Put values this transaction already wrote back into a document read from the plugin.
+
+        The plugin re-encodes some payloads on every state load (measured: a sample's PCM comes back
+        delayed by four samples), and every later unit re-sends the whole state - so without this,
+        the file's own waveform drifts by one delay per following write (measured: 48 samples after a
+        12-unit apply). Applying the INTENDED value keeps the instance on the target; the plugin's
+        single round-trip delay stays, and it is the delay the verification band already reports.
+
+        The caller hands over what `decode` returned, which WRAPS the document: a set on the wrapper
+        would add a stray top-level key and leave the real payload drifting (measured - the carry
+        silently did nothing until it unwrapped here, exactly as `encode_slice` and
+        `snapshot_document` already do).
+        """
+        target = document["document"] if isinstance(document, dict) and "document" in document else document
+        if not isinstance(target, dict):
+            return
+        for path, value in (values or {}).items():
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                set_path(target, path, copy.deepcopy(value))
+            except (InvalidValue, Unreadable, PluginError):
+                # a path the document no longer carries (a rollback removed it, or a slot shrank
+                # away): the unit's own verification still guards what it writes now
+                continue
+
     def snapshot_document(self, doc: dict[str, Any]) -> dict[str, Any]:
         """The restorable part: the whole document (V1 writes only touch it)."""
         document = doc["document"] if isinstance(doc, dict) and "document" in doc else doc
@@ -1308,6 +1377,7 @@ class VitalCodec:
         budget: int,
         *,
         document_chars: int | None = None,
+        sizing: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Plan the write that opens room for a table too big to land on its own (P39).
 
@@ -1462,26 +1532,23 @@ class VitalCodec:
         note.update(stamp_note)
         return note
 
-    def _plan_sample_balloon(
-        self, document: Any, target: Any, budget: int
-    ) -> tuple[StateWriteUnit, dict[str, Any]] | None:
-        """The write that opens room for a growing SAMPLE block (P39b mechanism, measured live).
+    def _sample_balloon_sizing(self, document: Any, target: Any) -> dict[str, Any] | None:
+        """The room the SAMPLE block's own balloon would open - and what it costs, or ``None``.
 
-        The plugin sizes its sample buffer from the JSON's ``length`` and re-serializes exactly
-        that many samples (``Sample::jsonToState``). So a block written with a SHORT payload and
-        a LONGER ``length`` reads back bigger than what was written - and the file's own payload
-        then lands as a shrink of that.
+        The plugin sizes its sample buffer from the JSON's ``length`` and re-serializes exactly that
+        many samples (``Sample::jsonToState`` sizes a buffer from ``length`` and memcpys it), so a
+        block written with a SHORT payload and a LONGER ``length`` reads back bigger than what was
+        written - and the file's own payload then lands as a shrink of that. (Measured live, P39b.)
 
-        Requirements, both checked here:
+        What this returns is arithmetic over the live document and the target:
+        ``length``/``room_chars`` (what the read-back will hold), ``live_chars`` (what the live block
+        holds now), ``target_chars``, ``channels``, and the balloon's OWN ``growth_chars`` - which is
+        a shrink on every preset measured, because the live payload it replaces is bigger than the
+        few samples it writes. ``None`` means this build cannot inflate the block at all: no integer
+        ``length``, no payload in the target, no live block, or a ``length`` the engine clamps.
 
-        * the balloon's own write must land: it may grow the document by at most `budget`, and it
-          replaces the live payload with a few samples, so the live block must have at least that
-          much payload to give up;
-        * the ``length`` must stay inside what the engine holds (`Sample::loadSample` clamps to
-          1,764,000 samples) and must exceed the target's own sample count, so the read-back is
-          bigger than what the file needs.
-
-        Returns ``(unit, sizing)`` or ``None`` (the caller names the gap).
+        The ceiling is NOT judged here: the schedule decides when this pair runs, and therefore which
+        document it meets (`_lowest_peak_order`).
         """
         if not isinstance(target, dict):
             return None
@@ -1517,41 +1584,67 @@ class VitalCodec:
             else:
                 balloon_block.pop(key, None)
         growth = _growth_of(document, SAMPLE_PATH, balloon_block)
-        if growth > budget:
-            return None
         room = (length * 8 * channels) // 3
-        #: The measured read ceiling applies here too: the balloon's own room is what pushes the
-        #: document up, so a sample balloon can cross the ~4 MB line exactly as a table one can.
-        projected = _document_chars(document) - len(live.get("samples") or "") - len(
-            live.get("samples_stereo") or ""
-        ) + room
-        if projected > _state_ceiling_chars():
-            return None
-        unit = StateWriteUnit(
+        live_chars = sum(
+            len(live[key]) for key in SAMPLE_PAYLOAD_KEYS if isinstance(live.get(key), str)
+        )
+        return {
+            "length": length,
+            "room_chars": room,
+            "target_chars": target_chars,
+            "channels": channels,
+            "growth_chars": growth,
+            "live_chars": live_chars,
+            "target_length": target_length,
+            "payload": {key: balloon_block[key] for key in payloads},
+            "why": (
+                "the file's sample payload grows the document past the landing bound, so the live "
+                "block is first re-declared with a longer `length` and a tiny payload; the plugin "
+                "then re-serializes that many samples and the file's payload lands as a shrink of it"
+            ),
+        }
+
+    def _sample_balloon_pair(
+        self, sizing: dict[str, Any]
+    ) -> StateWriteUnit:
+        """The unit that writes a sample balloon whose sizing is already decided."""
+        return StateWriteUnit(
             order_index=0,
             kind="state",
             payload={
                 "sample_balloon": {
                     "path": SAMPLE_PATH,
-                    "length": length,
-                    "payload": {key: balloon_block[key] for key in payloads},
-                    "target_length": target_length,
-                    "target_chars": target_chars,
-                    "channels": channels,
-                    "room_chars": room,
-                    "growth_chars": growth,
-                    "budget_chars": budget,
-                    "why": (
-                        "the file's sample payload grows the document past the landing bound, so "
-                        "the live block is first re-declared with a longer `length` and a tiny "
-                        "payload; the plugin then re-serializes that many samples and the file's "
-                        "payload lands as a shrink of it"
-                    ),
+                    "length": sizing["length"],
+                    "payload": sizing["payload"],
+                    "target_length": sizing["target_length"],
+                    "target_chars": sizing["target_chars"],
+                    "channels": sizing["channels"],
+                    "room_chars": sizing["room_chars"],
+                    "growth_chars": sizing["growth_chars"],
+                    "why": sizing["why"],
                 }
             },
         )
-        return unit, {"length": length, "room_chars": room, "target_chars": target_chars,
-                      "growth_chars": growth}
+
+    def _plan_sample_balloon(
+        self, document: Any, target: Any, budget: int
+    ) -> tuple[StateWriteUnit, dict[str, Any]] | None:
+        """Size the sample balloon AND judge it against the live document.
+
+        Kept as the self-contained form of the pair (the schedule calls the two halves separately, so
+        it can order the pair against the other writes): returns ``None`` when the block cannot be
+        inflated, when the balloon's own write would not land, or when its projection passes the read
+        ceiling on the LIVE document.
+        """
+        sizing = self._sample_balloon_sizing(document, target)
+        if sizing is None or sizing["growth_chars"] > budget:
+            return None
+        projected = (
+            _document_chars(document) - int(sizing["live_chars"]) + int(sizing["room_chars"])
+        )
+        if projected > _state_ceiling_chars():
+            return None
+        return self._sample_balloon_pair(sizing), sizing
 
     def _verify_sample_balloon(self, document: Any, balloon: dict[str, Any]) -> VerificationReport:
         """Verify a sample balloon by its EFFECT: the read-back block is the room it promised.
@@ -1873,14 +1966,59 @@ def _table_growth(note: dict[str, Any]) -> int | None:
 def _running_document_chars(document: Any, sample_pending: Any, sample_growth: int) -> int:
     """The document size the TABLE schedule will start from.
 
-    The sample pair runs first, so its own growth is already in the document by the time the first
-    balloon runs; the balloon's transient is released by the sample write that follows it, so only
-    the sample's net growth counts here. A sample that is not being written contributes nothing.
+    Kept for callers that need the historical "sample first" number; the schedule itself simulates
+    each candidate order from the live size (`_lowest_peak_order`), so it no longer needs this.
     """
     size = _document_chars(document)
     if sample_pending is not None and sample_growth > 0:
         size += int(sample_growth)
     return size
+
+
+def _lowest_peak_order(items: Sequence[dict[str, Any]], start_chars: int) -> list[dict[str, Any]]:
+    """The order in which these writes reach the LOWEST document peak (P40).
+
+    Every item carries two numbers, both exact (the live document and the target are known):
+
+    * ``net`` - what the document gains once the item is done (negative = it shrinks it);
+    * ``overhead`` - what the document holds WHILE the item runs, above its own starting size. A
+      balloon's transient is exactly this: the room it opens minus the content it replaces. A plain
+      write's overhead is zero.
+
+    So an item's peak is ``running + overhead``, and the order decides every peak after the first.
+    Three candidate orders are simulated and the one with the lowest peak wins (ties keep the first,
+    so the choice is deterministic): biggest shrink first (by net), cheapest overhead first, and
+    dearest overhead first.
+
+    MEASURED (2026-10-18, live) why this is not academic: the SAMPLE pair pinned first met the
+    document while it still held the previous preset's 1.4 MB tables and was refused, while the same
+    preset frees 1.5 MB two units later; and with the tables of `BASS Broken Circuit` ordered by
+    net, the document never rises above what it started at.
+    """
+    usable = [item for item in items if isinstance(item, dict)]
+    if not usable:
+        return []
+
+    def peak_for(order: Sequence[dict[str, Any]]) -> int:
+        running = int(start_chars)
+        peak = running
+        for item in order:
+            peak = max(peak, running + int(item.get("overhead") or 0))
+            running += int(item.get("net") or 0)
+        return peak
+
+    candidates = [
+        sorted(usable, key=lambda item: int(item.get("net") or 0)),
+        sorted(usable, key=lambda item: int(item.get("overhead") or 0)),
+        sorted(usable, key=lambda item: -int(item.get("overhead") or 0)),
+    ]
+    best = candidates[0]
+    best_peak = peak_for(best)
+    for candidate in candidates[1:]:
+        peak = peak_for(candidate)
+        if peak < best_peak:
+            best, best_peak = candidate, peak
+    return list(best)
 
 
 def _batch_paths(document: Any, pending: dict[str, Any]) -> list[dict[str, Any]]:

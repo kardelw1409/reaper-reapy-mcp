@@ -277,7 +277,7 @@ def test_the_tool_is_partial_and_names_a_table_the_ceiling_refused(vital_api, mo
     assert data["write_gaps"]["from_outcome"] >= 1
     ceiling_gap = next(gap for gap in data["gaps"] if gap["reason"] == "state_ceiling_reached")
     assert ceiling_gap["path"] == "settings.wavetables.0"
-    assert "4 MB" in str(ceiling_gap["message"])
+    assert "4,189,248" in str(ceiling_gap["message"])
 
 
 def test_a_write_with_no_refused_change_stays_complete(vital_api, monkeypatch):

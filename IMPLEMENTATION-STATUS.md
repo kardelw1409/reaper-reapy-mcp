@@ -5208,3 +5208,92 @@ carries the two transport-churn rules, `test_p0_contracts.py`'s surface pins mov
 * The sample block is not writable through `plugin_wavetable` (it has its own channel, §41.6).
 * The audible result is not measured anywhere in this round: what is established is what the plugin
   STORES, read back through its own document.
+
+### 42.8 Closing the two samples: the order, the drift, and a bug inside the fix (2026-10-18)
+
+The owner asked why 4 of 6 samples is not "all of them", and whether our own tables had been tried.
+Both gaps turned out to be ONE mechanism seen twice - the sample block's payload is re-encoded by the
+plugin on every state load - plus an ordering mistake in the plan.
+
+**The order.** `BASS Broken Circuit`'s sample was refused (`no_room_for_sample_growth`) while the
+sample's balloon pair was pinned FIRST, because it met the document while that still held the previous
+preset's three big tables - and the SAME preset frees ~1.5 MB two units later (it SHRINKS 1,409,791
+and 86,997 byte tables down to 11,149 each). The plan now builds its items (each with its measured
+`net` growth and its balloon `overhead`), simulates three candidate orders (net ascending, overhead
+ascending, overhead descending) and keeps the one whose PEAK document is lowest; ties keep the first,
+so the choice is deterministic. `_lowest_peak_order` is a pure function over numbers that are known
+before any write.
+
+**The drift.** `BASS - Deep 2` landed with the file's name and length but 99.6 % of its samples
+different: the payload was the file's own, delayed by **48 samples = 12 x 4** - the plugin returns PCM
+4 samples late (`SAMPLE_RELOAD_DELAY`) and every following unit re-sends the whole document it just
+read, so each write added one more delay. Per-unit verification could not see it: every single step
+was inside the band. The transaction now carries the values it INTENDED (`_intended` +
+`VitalCodec.apply_intended_values`), leaving each unit's own paths alone so a later unit still wins.
+
+**🔴 And the carry itself was broken in a way only a control could find.** `apply_intended_values`
+applied to the WRAPPER `decode()` returns (`{"document": ..., ...}`), so `set_path` added a stray
+top-level key and left the real payload drifting - silently, with the fix's own unit test passing
+because the test passed a BARE document. The control test (`test_without_the_carry_the_very_same_fixture_drifts_further`)
+pins the sample FIRST (isolating the carry from the scheduler), runs the fixture with and without the
+carry, and requires a strictly larger residue without it - which is how the still-compounding 8 was
+found. The hook now unwraps exactly as `encode_slice` and `snapshot_document` do, and the test uses
+the shape the transaction really passes.
+
+**The read ceiling, narrowed by direct probes** (`_p40m_ceiling_probe.py`, a document of exactly N
+characters written and read back): 3,127,179 document chars (chunk 4,189,248) reads COMPLETE; 3,166,642
+(~4.24 M) and 3,206,106 (~4.29 M) fault. The line is now bracketed to "4,189,248 reads, 4,240,000 does
+not" instead of the previous "4.08 M ... 4.45 M"; the shipped ceiling stays the largest MEASURED
+readable with a margin: `STATE_CHUNK_CEILING_CHARS = 4,100,000` - 25,000 -> 3,056,250 document chars,
+both ends pinned by `test_p39c_audio_slots.py`.
+
+**Live, the family slice again** (`probe_p39h_family_batch.py`, warm instance, 320 s):
+**6/6 `ALL_VERIFIED`, 6/6 samples carried** (was 4/6), **17/18 slots**. Both former offenders now land
+with `shift = -4`, i.e. exactly the plugin's own round trip and no compounding. The one lost slot is
+`Dubstep Growl Seq`'s first table: that preset's own three tables are ~2.9 MB, and over an instance
+already holding a 1.47 MB table the peak passes the ceiling - refused BY NAME
+(`state_ceiling_reached`), instance left readable, and the same preset lands 3/3 on a fresh instance
+(§42.3).
+
+**Why a batch could leave the instance unreadable, attributed slot by slot**
+(`_p39y_cumulative_state.py`): a fresh instance applies the whole family slice and is asked for its
+size after every step - 1,950,322 / 1,649,717 / 1,650,425 / 325,651 / 710,518 / 1,170,179 document
+chars, all far under the 3,056,250 ceiling, and the final state READABLE. So the earlier unreadable
+leftover was the OLD code's failed sample write leaving a ballooned stub, not an inherent
+accumulation: with the scheduler the same sequence ends at 1.57 M of chunk. (The instance was
+recovered with the owner-authorized `_p39s_recover_track15.py`, which deletes the FX and re-adds it -
+the only in-process path, since a chunk write needs a chunk read first.)
+
+### 42.9 Our own tables, every input the spec accepts (2026-10-18)
+
+`_p40h_own_table_variants.py` walks the whole small vocabulary and checks each case the only way it can
+be checked: `preview` host-free first, then the write through the state channel, then `read` - a case
+passes when the read-back's own frame summaries agree with the preview's on the frames they share and
+the frame count matches.
+
+| case | oscillator | result |
+|---|---|---|
+| named shape, 1 frame (`saw`) | 1 | CARRIED 1/1, `Wave Source`, 11,170 B |
+| morph between two SHAPES, 16 frames (`sine` -> `square`) | 1 | CARRIED 16/16, 175,513 B |
+| additive spectrum, 1 frame | 2 | CARRIED 1/1, 11,175 B |
+| one spectrum PER FRAME, 8 frames | 2 | CARRIED 8/8, 87,871 B |
+| raw samples (1,024 points -> resampled to 2,048) | 3 | CARRIED 1/1, 11,174 B |
+| pulse with `duty` and `phase` | 3 | CARRIED 1/1, 11,178 B |
+
+**6/6 delivered**, every read-back's `n_frames` equal to the preview's, the described frames agreeing
+on `peak` and partials, state between 0.25 and 1.25 MB against the 3.06 MB ceiling, and the three
+oscillators all writing through the same slot path.
+
+**A real finding from the first attempt:** `duty: 25` (a percentage) was refused typed and by name
+(`0 < duty < 1`) - but neither the refusal nor the tool's description said WHICH unit was wanted, so
+the correction was a guess. The description now states it and the refusal's `detail` carries
+`"duty is a fraction of the cycle: 25 percent is 0.25"`;
+`test_p40_wavetables.py` pins that a percentage is not accepted silently.
+
+### 42.10 Offline surface, second half
+
+**1097 passed, 2 skipped** (42.6 recorded 1090). New: `tests/plugins/test_p40_scheduling.py` (6 - the
+sample pair scheduled after the write that makes room, the scheduler's arithmetic, the drift across the
+units that follow, the control that proves the drift test can fail, the carry never overriding a unit's
+own path, and the hook's call shape). `tests/plugins/test_p39c_audio_slots.py` gained the two ceiling
+ends, `tests/plugins/test_p40_write_gaps.py` the envelope rule.

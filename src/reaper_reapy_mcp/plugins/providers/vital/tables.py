@@ -127,7 +127,13 @@ def shape_wave(
     if key == "pulse" and not 0.0 < width < 1.0:
         raise InvalidValue(
             "a pulse's duty must be between 0 and 1",
-            detail={"duty": duty, "accepted": "0 < duty < 1"},
+            detail={
+                "duty": duty,
+                "accepted": "0 < duty < 1",
+                # measured (2026-10-18): a caller reads `duty` as a percentage and passes 25 - the
+                # unit is a fraction, so the refusal has to say which one it wants
+                "note": "duty is a fraction of the cycle: 25 percent is 0.25",
+            },
         )
     start = (float(phase) % 360.0) / 360.0
     out: list[float] = []

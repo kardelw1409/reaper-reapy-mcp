@@ -425,7 +425,7 @@ def test_a_balloon_that_would_pass_the_read_ceiling_is_named():
     assert plan.units == [], "nothing is planned: the write would leave an unreadable instance"
     notice = plan.notices[0]
     assert notice["projected_chars"] > notice["ceiling_chars"]
-    assert "4 MB" in notice["message"]
+    assert "4,189,248" in notice["message"], "the refusal names the text MEASURED readable"
 
 
 def test_a_balloon_under_the_ceiling_is_still_planned():
