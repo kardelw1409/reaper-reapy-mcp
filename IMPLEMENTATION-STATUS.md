@@ -5535,3 +5535,86 @@ The one measurement that produced both numbers at once: a dry-run load of a larg
 `growth_chars: 4,307,075` - a refusal that reports live facts instead of guessing.
 
 **1157 passed, 2 skipped** (43.8 recorded 1153).
+
+## 44. P42 - the state write reaches the plugin, and a re-created instance dead-ended the write path (2026-10-18)
+
+The owner, looking at the plugin on track 15: "ничего в плагине в 15 дорожке не сменилось, все висит 3
+таблицы и нету соло семплера с каким нибудь семплом звуком, думаю делай ты лучше инит просто удаляя
+и ставя снова витал, так быстрее. инит ведь это вообще все обнуление". Two claims to check: that the
+state channel does not actually reach the plugin, and that deleting + re-adding is the better reset.
+
+### 44.1 The decisive test: a state-only write, read back from the PLUGIN
+
+The state channel's own verification cannot answer this. `_sample_alignment` returns
+`{shift: 0, exact: True, within_delay: True}` when the read-back **equals** what was written (codec.py),
+and a chunk that REAPER stores verbatim always equals it - so "agrees: true" is consistent with both
+"the plugin loaded it" and "nobody but REAPER's copy ever saw it". The witness has to be something only
+the plugin produces: a PARAMETER.
+
+`filter_1_cutoff` is such a witness - a document field (`settings.filter_1_cutoff`) with a parameter
+behind it. Measured live:
+
+| step | value |
+|---|---|
+| `plugin_read(controls=["filter_1_cutoff"])` | `normalized 0.36525145173072815`, native **54.7521858215332** semitones |
+| `plugin_write(request={"state": {"settings.filter_1_cutoff": 30}})` | `committed: true`, `written 30`, `read_back 30.0`, one state path, no parameters |
+| `plugin_read(...)` again | `normalized 0.171875`, native **30.0** semitones |
+
+The parameter followed the document. REAPER cannot map a document field to a parameter (the plugin
+state is opaque to the host), so the plugin itself re-read the document - **the state channel is live**,
+and the "we only wrote REAPER's copy" hypothesis is closed by measurement, not by argument. What the
+channel cannot show by itself is *when* a read-back is the plugin's; this pair is how a caller checks it.
+
+### 44.2 A fresh instance is a measurable reset, and it does not need a preset
+
+`remove_fx(track_index=14, fx_index=0)` + `add_fx(track_index=14, "VST3i: Vital (Vital Audio)")` ->
+`success`, `fx_index 0`. `plugin_sample(op="read")` then answers the factory default, which is what
+"init" means for this plugin: `White Noise`, 44,100 frames (1.0 s), 1 channel, `sample_on: "Off"`,
+`loop: "On"`, `destination: "EFFECTS"`, `level: 0.7071067690849304`. So the owner's reading is right -
+re-creating the instance IS a full reset, and it is cheaper than a 253K-character preset write (two
+host calls instead of one state write). What it is NOT is verified: the state a fresh instance gets is
+the plugin's own default, and nothing in this layer can refuse it, because there is nothing to compare
+against. Both routes are legitimate and they answer different questions: a preset makes the state
+*known*, a replacement makes it *default*.
+
+### 44.3 The refusal that followed: correct, and a dead end
+
+The very next mutation - the sample load - was refused:
+
+```
+TargetChanged: the write target no longer matches the token's validated facts
+  reason: target_facts_changed, fields: ["session_handle"]
+  verdict: REFUSED_BEFORE_ANY_WRITE, write_calls_attempted: 0
+```
+
+Every part of that is right except that it was permanent. Three facts put together:
+
+* `session_handle` (the host's FX handle) **moved** on this remove-and-re-add. That contradicts the P8
+  measurement (`handle_changed: false` on the same experiment, 2026-10-10) - and both stand, which is
+  itself the useful half: the datum is real evidence when it moves and no evidence when it does not;
+* `TargetTokenRegistry.issue()` reuses the one token per validated target by (location, build
+  fingerprint) and **never refreshed its snapshot**, so the stale handle stayed in the token;
+* the registry is **process-scoped** (`api._REGISTRY`), so the refusal repeated for every mutation until
+  the server restarted - and the remedy the refusal prints ("address the instance by location ... a
+  present-tense claim the layer verifies inside the call") is exactly what the caller had done.
+
+A refusal that names a remedy which does not work is a defect, not a safety property. The fix keeps the
+two claims apart instead of weakening the check:
+
+* a token a **caller** holds is a claim about the past: `revalidate` and `_check_instance_claims` still
+  refuse it, and `_require_continuity_basis` still refuses it outright for any mutation;
+* the token **this layer mints for the call in hand** is a present-tense claim on that location, so
+  `issue()` re-anchors it to the facts it just read, keeping the token id (and therefore the per-target
+  lock, which the contract binds to the target);
+* the re-anchoring is **counted, not hidden**: `facts_snapshot["session_handle_changes"]` says how often
+  the handle reading at that slot changed under one token, so a replacement leaves a trace in the layer
+  rather than being silently absorbed.
+
+`tests/plugins/test_p42_token_refresh.py` (7 tests) pins all of it: reuse with the same reading counts
+zero, a moved handle is counted once and `differences_against` comes back empty for the re-anchored
+token, evidence *appearing* (`None` -> a handle) is recorded too, a different build still mints a
+separate token, a caller-held token from before the replacement is still refused at the write verb with
+`write_calls_attempted == 0`, and the live failure end to end - a replacement followed by a mutation -
+now lands `ALL_VERIFIED` with the write verbs exercised.
+
+**1164 passed, 2 skipped** (43.9 recorded 1157).

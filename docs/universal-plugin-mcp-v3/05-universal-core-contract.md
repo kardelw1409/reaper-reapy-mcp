@@ -319,6 +319,16 @@ same slot matches every field.
   to show the addressed instance never moved, which is a different question. So the token's question
   ("is this still the exact instance I resolved?") **cannot be answered** for an identical-build
   replacement.
+- **Measured, 2026-10-18 (P42, live):** the handle **does** move on the same experiment. `remove_fx`
+  plus `add_fx` of the same build into the same slot left the next mutation
+  `TargetChanged / fields: ["session_handle"]` - so the datum is real evidence when it moves and no
+  evidence when it does not (both readings stand; nothing above is retracted). What changed with the
+  measurement is the **reuse** rule: a token a **caller** holds is a claim about the past and is
+  refused as before, while the token this layer mints **for the call in hand** is a present-tense
+  claim on that location and is re-anchored to the facts just read (`issue()`), with the re-anchoring
+  counted in the token's own snapshot (`session_handle_changes`). Without that, the remedy printed
+  above ("address the instance by location") did not work at all: the stale snapshot lived for the
+  whole server session, so every mutation after a re-created instance was refused until a restart.
 - **Consequence, binding since the owner's safety-gate correction (2026-10-11):** a
   **caller-supplied token is refused for any mutation** (`IdentityContinuityUnprovable`, before any
   host work), because accepting it would let the caller's belief stand in for verification - the
