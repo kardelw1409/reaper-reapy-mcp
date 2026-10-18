@@ -484,9 +484,20 @@ def test_a_load_lands_the_block_and_verifies_it(vital_api, monkeypatch):
     assert abs(int(alignment["shift"])) == VC.SAMPLE_RELOAD_DELAY, alignment
 
 
-def test_a_growing_load_rides_the_sample_balloon_pair(vital_api, monkeypatch):
-    """A payload bigger than the landing bound is delivered in two writes - measured behaviour."""
-    host = host_with(document_with_sample(length=4096))
+def test_a_growing_load_reports_its_shape_as_a_NOTE_not_a_gap(vital_api, monkeypatch):
+    """MEASURED live (2026-10-18): a fully successful load came back `loaded: false, partial: true`.
+
+    The codec had marked the two-write delivery with `sample_inflated_before_write` - a notice that
+    says the value IS being written - and the response read every path-carrying notice as a
+    refusal. The live evidence is unambiguous: `outcome.channels.state.rows` said `agrees: true`
+    for both units (balloon and sample) while `loaded` was false. A notice that reports HOW a value
+    arrived must not read as "it did not arrive", and the flag that tells them apart is the codec's
+    own `informational` marker - not a list of reason names in the core.
+
+    The fixture's live sample is deliberately SHORTER than what is loaded here: with equal sizes no
+    growth happens, no balloon is planned, and the notice this test is about never appears.
+    """
+    host = host_with(document_with_sample(length=512))
     monkeypatch.setattr(A, "_BRIDGE", host)
     envelope = A.plugin_sample(
         config=vital_api,
@@ -497,10 +508,195 @@ def test_a_growing_load_rides_the_sample_balloon_pair(vital_api, monkeypatch):
         dry_run=False,
     )
     assert envelope["ok"] is True, envelope.get("error")
-    reasons = [gap.get("reason") for gap in envelope["data"].get("gaps") or []]
-    assert "sample_inflated_before_write" in reasons or envelope["data"].get("partial") is not True
+    data = envelope["data"]
+    assert data["loaded"] is True, "the sample landed; only the flag was wrong"
+    assert data.get("partial") is not True, data.get("write_gaps")
+    assert data.get("gaps") in (None, []), data.get("gaps")
+    notes = data.get("notes") or []
+    assert [note.get("reason") for note in notes] == ["sample_inflated_before_write"], notes
+    assert notes[0]["balloon_length"] > 4096, notes[0]
+    assert "informational" not in notes[0], "the marker is plumbing, not payload"
     live = decode_live(host)["document"]["settings"]["sample"]
-    assert live["length"] == 4096
+    assert live["length"] == 4096, "and the value really is in the plugin"
+
+
+def test_a_load_without_a_growth_reports_no_notes_at_all(vital_api, monkeypatch):
+    """The other side of it: a load that fits one write has nothing to explain."""
+    host = host_with(document_with_sample(length=4096))
+    monkeypatch.setattr(A, "_BRIDGE", host)
+    envelope = A.plugin_sample(
+        config=vital_api,
+        instance=dict(INSTANCE),
+        op="load",
+        samples=[((index * 37) % 2000) - 1000 for index in range(4096)],
+        sample_rate=44_100,
+        dry_run=False,
+    )
+    data = envelope["data"]
+    assert envelope["ok"] is True, envelope.get("error")
+    assert data["loaded"] is True
+    assert not data.get("notes"), data.get("notes")
+
+
+def capture_request(monkeypatch) -> list[dict]:
+    """Capture the request a tool builds, without running a transaction.
+
+    The transaction's own machinery (guard, growth bound, read-back, rollback) is covered by its own
+    suites; what these tests are about is the REQUEST the sampler tool builds - which controls
+    `solo` addresses, and whether a control-only write carries any state at all.
+    """
+    from reaper_reapy_mcp.plugins import transaction as TR
+
+    seen: list[dict] = []
+
+    class Spy:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+
+        def run(self):
+            return TR.TransactionResult(ok=True, committed=False, outcome=None, data={})
+
+    monkeypatch.setattr(A, "Transaction", Spy)
+    return seen
+
+
+def declare_sampler_controls(monkeypatch) -> None:
+    """Let the sampler's control ids resolve against the (13-control) fixture profile.
+
+    The pinned fixture registry is a deliberate subset and does not carry `sample_on` or
+    `osc_<n>_on` - which is right for the registry's own tests, and useless for a tool whose job is
+    to ADDRESS exactly those. The declarations below are the shape a real profile has (an enum with
+    its own member ids); what the profile's own completeness is worth is pinned elsewhere (P16/P21).
+    """
+    real = A._control_by_name
+
+    def by_name(profile, name):
+        control_id = str(name)
+        if control_id in VS.SAMPLER_CONTROLS.values() or control_id in VS.SOURCE_CONTROLS:
+            return {
+                "id": control_id,
+                "label": control_id,
+                "type": "enum" if control_id.endswith("_on") else "number",
+                "binding": {"index": 900},
+                "enum_values": [{"id": "Off"}, {"id": "On"}],
+                "range": {"min": 0, "max": 1},
+            }
+        return real(profile, name)
+
+    monkeypatch.setattr(A, "_control_by_name", by_name)
+
+
+def test_solo_addresses_the_other_sources_in_one_control_write(vital_api, monkeypatch):
+    """The sampler is a fourth source beside three oscillators; soloing is three switches + on."""
+    monkeypatch.setattr(A, "_BRIDGE", host_with(document_with_sample()))
+    declare_sampler_controls(monkeypatch)
+    seen = capture_request(monkeypatch)
+    envelope = A.plugin_sample(config=vital_api, instance=dict(INSTANCE), op="solo", dry_run=False)
+    assert envelope["ok"] is True, envelope.get("error")
+    assert len(seen) == 1, "one call, one transaction"
+    request = seen[0]["request"]
+    assert "state" not in request, (
+        "solo is CONTROL-ONLY: soloing after a 2 MB load must never re-send the sample"
+    )
+    controls = request["controls"]
+    assert controls["sample_on"] == "On"
+    assert all(controls[control] == "Off" for control in VS.SOURCE_CONTROLS), controls
+    assert set(controls) == {"sample_on", *VS.SOURCE_CONTROLS}
+    assert envelope["data"]["solo"] is True
+
+
+def test_solo_rides_the_load_batch_when_asked(vital_api, monkeypatch):
+    """`solo=true` on a load is the SAME switch, inside the load's own batch - not a second call."""
+    monkeypatch.setattr(A, "_BRIDGE", host_with(document_with_sample()))
+    declare_sampler_controls(monkeypatch)
+    seen = capture_request(monkeypatch)
+    envelope = A.plugin_sample(
+        config=vital_api,
+        instance=dict(INSTANCE),
+        op="load",
+        samples=[3, 4, 5, 6],
+        sample_rate=44_100,
+        solo=True,
+        dry_run=False,
+    )
+    assert envelope["ok"] is True, envelope.get("error")
+    assert len(seen) == 1
+    request = seen[0]["request"]
+    assert "settings.sample" in request["state"], "the load still carries its block"
+    controls = request["controls"]
+    assert controls["sample_on"] == "On"
+    assert all(controls[control] == "Off" for control in VS.SOURCE_CONTROLS), controls
+
+
+def test_a_load_without_solo_leaves_the_other_sources_alone(vital_api, monkeypatch):
+    """The default must not touch a source the caller did not name."""
+    monkeypatch.setattr(A, "_BRIDGE", host_with(document_with_sample()))
+    declare_sampler_controls(monkeypatch)
+    seen = capture_request(monkeypatch)
+    A.plugin_sample(
+        config=vital_api,
+        instance=dict(INSTANCE),
+        op="load",
+        samples=[1, 2, 3, 4],
+        sample_rate=44_100,
+        dry_run=False,
+    )
+    controls = seen[0]["request"]["controls"]
+    assert controls.get("sample_on") == "On", "a load switches the sampler ON by default"
+    assert not any(control in controls for control in VS.SOURCE_CONTROLS), controls
+
+
+def test_a_dry_run_solo_asks_for_no_write(vital_api, monkeypatch):
+    monkeypatch.setattr(A, "_BRIDGE", host_with(document_with_sample()))
+    declare_sampler_controls(monkeypatch)
+    seen = capture_request(monkeypatch)
+    envelope = A.plugin_sample(config=vital_api, instance=dict(INSTANCE), op="solo", dry_run=True)
+    assert envelope["ok"] is True, envelope.get("error")
+    assert seen[0]["dry_run"] is True, "the transaction is told to plan only"
+
+
+def test_solo_on_a_profile_that_declares_nothing_is_refused_not_silently_a_no_op(vital_api, monkeypatch):
+    """A provider that cannot name its sources must say so, not "soloed" with nothing written."""
+    monkeypatch.setattr(A, "_BRIDGE", host_with(document_with_sample()))
+    with pytest.raises(InvalidValue) as bad:
+        A.plugin_sample(config=vital_api, instance=dict(INSTANCE), op="solo", dry_run=False)
+    assert "nothing could be switched" in str(bad.value)
+    assert set(bad.value.detail["controls_skipped"]) == {"sample_on", *VS.SOURCE_CONTROLS}
+
+
+def test_a_solo_label_that_is_not_a_member_is_refused_with_the_legal_list():
+    """The switch must be the control's OWN label - a label it does not have is a guess."""
+    profile = profile_with(*[enum_control(control, ["Off", "On"]) for control in VS.SOURCE_CONTROLS])
+    profile["controls"].append(enum_control("sample_on", ["Bypass", "Enable"]))
+    with pytest.raises(InvalidValue) as bad:
+        A._sampler_solo(profile, VS.SampleCapability())
+    assert bad.value.detail["legal"] == ["Bypass", "Enable"]
+
+
+def test_a_provider_without_the_solo_hook_is_refused_by_name():
+    class Bare:
+        id = "bare"
+
+    with pytest.raises(UnsupportedProvider) as bad:
+        A._sampler_solo_values(Bare())
+    assert bad.value.detail["missing"] == "SampleCapability.solo_values"
+
+
+def test_the_capability_names_its_own_sources():
+    values = VS.SampleCapability().solo_values()
+    assert values["sample_on"] == "On"
+    assert set(VS.SOURCE_CONTROLS) <= set(values)
+    assert all(values[control] == "Off" for control in VS.SOURCE_CONTROLS)
+
+
+def test_the_informational_marker_is_what_separates_a_note_from_a_gap():
+    """The decision is data-driven: no reason name is hard-coded in the core."""
+    assert A._informational_notice({"reason": "x", "evidence": {"informational": True}}) is True
+    assert A._informational_notice({"reason": "x", "evidence": {"growth_chars": 10}}) is False
+    assert A._informational_notice({"reason": "state_ceiling_reached"}) is False
+    assert A._informational_notice(None) is False
+    assert A._value_refused([{"path": "settings.sample", "evidence": {"informational": True}}], "settings.sample") is False
+    assert A._value_refused([{"path": "settings.sample"}], "settings.sample") is True
 
 
 def test_a_load_that_only_switches_the_sampler_on_still_names_the_chain(vital_api, monkeypatch):
@@ -566,7 +762,7 @@ def test_raw_samples_need_a_rate():
 def test_an_unknown_op_is_refused_with_the_accepted_list(vital_api):
     with pytest.raises(InvalidValue) as bad:
         A.plugin_sample(config=vital_api, instance=dict(INSTANCE), op="record", dry_run=True)
-    assert bad.value.detail["accepted"] == ["read", "load"]
+    assert bad.value.detail["accepted"] == ["read", "load", "solo"]
 
 
 def test_a_provider_without_the_capability_is_refused_by_name():

@@ -377,13 +377,16 @@ SPEC: dict[str, dict[str, Any]] = {
     },
     "plugin_sample": {
         "purpose": (
-            "THE SAMPLER (the plugin's sample engine, an extra oscillator): put a waveform in and "
-            "switch it on. op='load' takes `file_path` (a PCM WAV) or `samples` (raw int16 values "
-            "+ `sample_rate`) and writes the plugin's sample BLOCK through the same verified "
-            "state channel as every other write (landing bound, sample balloon, read-back, "
-            "rollback); the sampler's controls ride the SAME batch, so `on` (default true), "
-            "`loop`, `destination`, `level`, `transpose`, `tune`, `pan`, `keytrack` address them "
-            "by name. op='read' reports what the sampler holds now (name, length, sample_rate, "
+            "THE SAMPLER (the plugin's sample engine, an extra oscillator): put a waveform in, "
+            "switch it on, and make it the thing you hear. op='load' takes `file_path` (a PCM "
+            "WAV) or `samples` (raw int16 values + `sample_rate`) and writes the plugin's sample "
+            "BLOCK through the same verified state channel as every other write (landing bound, "
+            "sample balloon, read-back, rollback); the sampler's controls ride the SAME batch, so "
+            "`on` (default true), `loop`, `destination`, `level`, `transpose`, `tune`, `pan`, "
+            "`keytrack` address them by name, and `solo=true` also switches the plugin's other "
+            "sound sources off in that same batch. op='solo' does ONLY that switching (a "
+            "control-only write: soloing after a 2 MB load must not send the sample again). "
+            "op='read' reports what the sampler holds now (name, length, sample_rate, "
             "channels, seconds, payload bytes) and its controls' current DISPLAY values "
             "(`{control_id: value}` - the same strings plugin_write accepts; call plugin_read for "
             "the profile's full record, with normalized value, unit and law). The "
@@ -399,7 +402,7 @@ SPEC: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "required": True,
                 "default": None,
-                "enum": ["read", "load"],
+                "enum": ["read", "load", "solo"],
             },
             "file_path": {
                 "type": "string",
@@ -433,6 +436,15 @@ SPEC: dict[str, dict[str, Any]] = {
                 "default": True,
                 "note": "load: switch the sampler on (default true - a load that stays silent is a bug)",
             },
+            "solo": {
+                "type": "boolean",
+                "required": False,
+                "default": None,
+                "note": (
+                    "load: also switch the plugin's other sound sources off in the same batch; "
+                    "op='solo' does only that (a control-only write, nothing re-sent)"
+                ),
+            },
             "loop": {"type": "boolean", "required": False, "default": None},
             "destination": {
                 "type": "string",
@@ -449,10 +461,11 @@ SPEC: dict[str, dict[str, Any]] = {
         },
         "required": ("op",),
         "destructive": True,
-        "mutating_ops": ("load",),
+        "mutating_ops": ("load", "solo"),
         "returns": (
             "op, path, described (name/length/channels/payload), controls sent, controls_skipped, "
-            "outcome; op='read' adds the sampler's current control values"
+            "notes[] (how a value was delivered when it took two writes), outcome; op='read' adds "
+            "the sampler's current control values"
         ),
     },
 }

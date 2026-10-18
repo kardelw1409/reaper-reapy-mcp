@@ -1799,6 +1799,36 @@ def _plan_projection(plan: Any) -> dict[str, Any]:
     }
 
 
+def _value_refused(gaps: Any, path: str) -> bool:
+    """True when a REFUSAL names this path (an informational notice never counts).
+
+    The success flags (`loaded`, `delivered`) answer "did the value arrive". A notice that
+    reports a delivery (`sample_inflated_before_write`) must not flip them - see
+    `_informational_notice`.
+    """
+    for gap in gaps or []:
+        if not isinstance(gap, dict) or _informational_notice(gap):
+            continue
+        if str(gap.get("path")) == path:
+            return True
+    return False
+
+
+def _informational_notice(gap: Any) -> bool:
+    """A notice that says HOW a change was delivered, not that it failed.
+
+    MEASURED (2026-10-18, live): a sample load that used the two-write balloon came back
+    `loaded: false, partial: true` while `outcome.channels.state.rows` showed `agrees: true` for
+    both units - the write had landed and only the flag was wrong. The codec marks such a notice
+    (`informational: True`) and it travels in the gap's `evidence`, so this is a data-driven test
+    and not a list of reason names living in the core.
+    """
+    if not isinstance(gap, dict):
+        return False
+    evidence = gap.get("evidence")
+    return bool(isinstance(evidence, dict) and evidence.get("informational"))
+
+
 def _gaps_from_outcome(result_data: dict[str, Any], data: dict[str, Any]) -> None:
     """Fold the transaction's own named gaps into the response, and mark it PARTIAL.
 
@@ -1810,8 +1840,10 @@ def _gaps_from_outcome(result_data: dict[str, Any], data: dict[str, Any]) -> Non
     family batch lost exactly that way: `ALL_VERIFIED`, no reason, and the oscillator kept its old
     table.
 
-    Gaps already present (a preset's own plan gaps) are kept and de-duplicated, so the two lists
-    read as one.
+    A notice marked INFORMATIONAL is not one of those: it reports a delivery that happened (the
+    sample's two-write balloon), so it lands in `notes` - where a caller can read it - and it
+    neither raises `partial` nor counts as a gap. Gaps already present (a preset's own plan gaps)
+    are kept and de-duplicated, so the two lists read as one.
     """
     outcome = (result_data or {}).get("outcome")
     if not isinstance(outcome, dict):
@@ -1819,10 +1851,31 @@ def _gaps_from_outcome(result_data: dict[str, Any], data: dict[str, Any]) -> Non
     named = [gap for gap in (outcome.get("named_gaps") or []) if isinstance(gap, dict)]
     if not named:
         return
+    notices = [gap for gap in named if _informational_notice(gap)]
+    refusals = [gap for gap in named if not _informational_notice(gap)]
+    if notices:
+        existing_notes = [note for note in (data.get("notes") or []) if isinstance(note, dict)]
+        existing_notes.extend(
+            {
+                "reason": gap.get("reason"),
+                "path": gap.get("path"),
+                "message": gap.get("detail"),
+                **{
+                    key: value
+                    for key, value in (gap.get("evidence") or {}).items()
+                    if key != "informational"
+                },
+            }
+            for gap in notices
+        )
+        data["notes"] = existing_notes
+    if not refusals:
+        # every requested change arrived - the notes above say how, and `partial` stays false
+        return
     existing = [gap for gap in (data.get("gaps") or []) if isinstance(gap, dict)]
     seen = {(str(gap.get("reason")), str(gap.get("path"))) for gap in existing}
     added = 0
-    for gap in named:
+    for gap in refusals:
         key = (str(gap.get("reason")), str(gap.get("path")))
         if key in seen:
             continue
@@ -2167,9 +2220,7 @@ def plugin_wavetable(
     result = transaction.run()
     data.update(result.data)
     _gaps_from_outcome(result.data, data)
-    data["delivered"] = bool(result.ok) and not [
-        gap for gap in data.get("gaps") or [] if str(gap.get("path")) == path
-    ]
+    data["delivered"] = bool(result.ok) and not _value_refused(data.get("gaps"), path)
     if result.ok:
         return ok_envelope(
             "plugin_wavetable", data, meta=meta, outcome=result.data.get("outcome")
@@ -2202,6 +2253,7 @@ def plugin_sample(
     sample_rate: int | None = None,
     name: str | None = None,
     on: bool | None = True,
+    solo: bool | None = None,
     loop: Any = None,
     destination: Any = None,
     level: Any = None,
@@ -2214,7 +2266,7 @@ def plugin_sample(
 ) -> dict[str, Any]:
     """Load and read the plugin's SAMPLER - the sample engine as a channel (P41).
 
-    Two ops:
+    Three ops:
 
     * ``load`` - put a waveform into the sampler: ``file_path`` (a PCM WAV) or ``samples``
       (raw int16 values, with ``sample_rate``). The block is written through the SAME verified
@@ -2222,8 +2274,12 @@ def plugin_sample(
       verification and the rollback all apply - and the sampler's own controls travel in the
       same batch, so one call both loads the material and switches the engine on
       (``on`` defaults to true; that is the step a caller forgets);
+    * ``solo`` - switch the sampler ON and the plugin's OTHER sound sources OFF, so the sampler is
+      what you hear. It is a control-only write (no state, nothing re-sent), which is why it is
+      its own op: soloing after a 2 MB load must not send the sample again. `load` takes the same
+      switch as ``solo=true``, which rides the load's own batch instead of a second call;
     * ``read`` - what the sampler HOLDS now: name, length, sample_rate, channels, seconds,
-      payload size, plus the current value of its controls.
+      payload size, plus the current DISPLAY value of its controls.
 
     The provider supplies the vocabulary and the conversions (``SampleCapability``); a provider
     without the hook is refused by name, and nothing plugin-specific lives in this layer.
@@ -2231,17 +2287,18 @@ def plugin_sample(
     from .tools import error_envelope, ok_envelope
 
     operation = str(op or "").strip().lower()
-    if operation not in ("read", "load"):
+    if operation not in ("read", "load", "solo"):
         raise InvalidValue(
             f"unknown sample op {op!r}",
-            detail={"op": op, "accepted": ["read", "load"]},
+            detail={"op": op, "accepted": ["read", "load", "solo"]},
         )
     enabled = V.strict_bool(dry_run, "dry_run")
+    solo_wanted = V.strict_bool(solo, "solo") if solo is not None else False
     resolved_config = _config(config)
     provider, resolution, bridge, registry, source = _resolution_any(
         resolved_config,
         instance,
-        require_writable=operation == "load",
+        require_writable=operation in ("load", "solo"),
         tool="plugin_sample",
     )
     _requires_provider(source, "plugin_sample", "the provider's sampler vocabulary")
@@ -2277,17 +2334,36 @@ def plugin_sample(
         },
         _sampler_mapping(capability),
     )
-    built = capability.load(file_path=file_path, samples=samples, sample_rate=sample_rate, name=name)
+    block: dict[str, Any] | None = None
+    described: dict[str, Any] | None = None
+    if operation == "load":
+        built = capability.load(
+            file_path=file_path, samples=samples, sample_rate=sample_rate, name=name
+        )
+        block = built["block"]
+        described = built["described"]
+    if solo_wanted or operation == "solo":
+        solo_values, solo_skipped = _sampler_solo(profile, capability)
+        wanted.update(solo_values)
+        skipped.update(solo_skipped)
     path = _sampler_slot_path(capability)
-    request: dict[str, Any] = {"state": {path: built["block"]}}
-    if wanted:
-        request["controls"] = wanted
+    if not wanted and block is None:
+        raise InvalidValue(
+            "nothing could be switched: the profile declares none of the plugin's other sound "
+            "sources, so there is no way to make the sampler the one that sounds",
+            detail={"path": path, "controls_skipped": skipped},
+        )
+    request: dict[str, Any] = {}
+    if block is not None:
+        request["state"] = {path: block}
+    request["controls"] = wanted
     data = {
         "op": operation,
         "path": path,
-        "described": built["described"],
+        "described": described,
         "dry_run": enabled,
         "controls": wanted,
+        "solo": bool(solo_wanted or operation == "solo"),
     }
     if skipped:
         data["controls_skipped"] = skipped
@@ -2306,13 +2382,60 @@ def plugin_sample(
     result = transaction.run()
     data.update(result.data)
     _gaps_from_outcome(result.data, data)
-    data["loaded"] = bool(result.ok) and not [
-        gap for gap in data.get("gaps") or [] if str(gap.get("path")) == path
-    ]
+    data["loaded"] = bool(result.ok) and not _value_refused(data.get("gaps"), path)
     if result.ok:
         return ok_envelope("plugin_sample", data, meta=meta, outcome=result.data.get("outcome"))
     error = result.error or PluginError("the sample load did not complete")
     return error_envelope("plugin_sample", error, meta=meta, outcome=result.data.get("outcome"))
+
+
+def _sampler_solo(
+    profile: dict[str, Any], capability: Any
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The provider's solo switch set, VALIDATED against the profile like every other knob.
+
+    The capability says which controls (and which labels) leave only the sampler sounding; this
+    checks each of them against the live declaration - an undeclared control is skipped and NAMED,
+    and a label that is not one of the control's own members is refused with the legal list. Without
+    this the solo write would be the one path in the tool that addresses controls the profile does
+    not declare, which is exactly how a ".-" switch lands in the wrong band.
+    """
+    values = _sampler_solo_values(capability)
+    wanted: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    for control_id, value in values.items():
+        control = _control_by_name(profile, control_id)
+        if control is None:
+            skipped[control_id] = (
+                f"the profile declares no control {control_id!r}, so it cannot be switched off"
+            )
+            continue
+        members = [str(member.get("id")) for member in control.get("enum_values") or []]
+        if members and str(value) not in members:
+            raise InvalidValue(
+                f"the provider's solo value {value!r} is not a member of {control_id!r}",
+                detail={"control": control_id, "legal": members, "got": value},
+            )
+        wanted[control_id] = value
+    return wanted, skipped
+
+
+def _sampler_solo_values(capability: Any) -> dict[str, str]:
+    """The capability's own `solo` control write, or a typed refusal naming what is missing."""
+    hook = getattr(capability, "solo_values", None)
+    if not callable(hook):
+        raise UnsupportedProvider(
+            "this provider's sampler capability does not say which controls are its other sound "
+            "sources, so the sampler cannot be soloed on it",
+            detail={"missing": "SampleCapability.solo_values"},
+        )
+    values = hook()
+    if not isinstance(values, dict) or not values:
+        raise InvalidValue(
+            "the provider's `solo_values` returned nothing to write",
+            detail={"got": type(values).__name__},
+        )
+    return {str(control): value for control, value in values.items()}
 
 
 def _sampler_mapping(capability: Any) -> dict[str, str]:

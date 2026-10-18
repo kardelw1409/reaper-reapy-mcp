@@ -1003,6 +1003,12 @@ class VitalCodec:
                             "growth_chars": item["net"],
                             "balloon_length": sizing["length"],
                             "balloon_room_chars": sizing["room_chars"],
+                            # MEASURED (2026-10-18, live): this notice says the value IS being
+                            # written, in two steps - so it must not be read as "the sample did
+                            # not arrive". Without the marker a fully successful load came back
+                            # `loaded: false, partial: true` while both state rows read
+                            # `agrees: true` (the write landed; only the flag was wrong).
+                            "informational": True,
                             "message": (
                                 "the sample block was written in two writes: the live block was "
                                 "first re-declared with a longer `length` and a tiny payload (a "

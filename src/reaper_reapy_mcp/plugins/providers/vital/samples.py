@@ -45,6 +45,7 @@ __all__ = [
     "PCM_MAX",
     "PCM_SCALE",
     "SAMPLER_CONTROLS",
+    "SOURCE_CONTROLS",
     "SampleCapability",
     "build_block",
     "describe",
@@ -67,6 +68,14 @@ SAMPLER_CONTROLS: dict[str, str] = {
     "bounce": "sample_bounce",
     "random_phase": "sample_random_phase",
 }
+
+#: The plugin's OTHER sound sources, as the switches that turn them off.
+#:
+#: The sampler is a fourth source beside the three wavetable oscillators (measured: the profile
+#: declares `osc_<n>_on` for each of them plus `sample_on`), so "make the sampler the thing you
+#: hear" means switching three controls off. A caller should not have to know that, and the core
+#: must not hard-code it - this table is the provider's, and `solo` reads it.
+SOURCE_CONTROLS: tuple[str, ...] = ("osc_1_on", "osc_2_on", "osc_3_on")
 
 #: The sampler's buffer bound, from the plugin's own source (`Sample::loadSample`).
 MAX_SAMPLES = codec_module.SAMPLE_MAX_SAMPLES
@@ -428,7 +437,19 @@ class SampleCapability:
     """
 
     controls = SAMPLER_CONTROLS
+    sources = SOURCE_CONTROLS
     max_samples = MAX_SAMPLES
+
+    def solo_values(self) -> dict[str, str]:
+        """The control write that leaves ONLY the sampler sounding.
+
+        Returned as the control ids and their own enum labels ("On"/"Off"), which is what the
+        declaration takes. The label is spelled from the plugin's own vocabulary rather than a
+        member index, so the write cannot land in the wrong band.
+        """
+        values = {control: "Off" for control in self.sources}
+        values[str(self.controls["on"])] = "On"
+        return values
 
     def slot_path(self) -> str:
         """The state path of the sampler block (`settings.sample`)."""
