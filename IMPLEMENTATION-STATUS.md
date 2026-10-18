@@ -5993,8 +5993,9 @@ UNRESTORED.** Full numbers of the incident:
 * one unit of 14 mismatched -> `ok: false`, `WriteNotApplied`, `unit: 13`; the rollback ran and
   **its own read-back could not be verified either** -> `outcome.verdict = FAILED_AND_NOT_RESTORED`,
   `final_state: unknown` (host: 135 reads, 14 writes attempted, 14 verified);
-* it is DETERMINISTIC, not transient: a dry run of the SAME preset right after still plans
-  `settings.lfos.0.points` and `settings.lfos.0.powers`;
+* it is DETERMINISTIC **for a given live state**: a dry run of the SAME preset right after still
+  plans `settings.lfos.0.points` and `settings.lfos.0.powers`. It is NOT a property of the curve -
+  see §46.7;
 * the state left behind is the preset MINUS 12 keys of 781: the six above, `beats_per_minute`, the
   `modulations`/`modulation_N_amount` group, `lfos` (canonized), `sample` and `wavetables` (content).
 
@@ -6007,3 +6008,77 @@ the `num_points/points/powers` triple inconsistent mid-flight, or the rollback o
 triple), so no fix is written yet: the element-as-one-unit write and a fixed-point verification are
 both candidates, and both need a measured law before they can be implemented (recorded in
 `docs/universal-plugin-mcp-v3/22-vital-preset-apply-limits.md` § 2.5/§ 7 as an open defect).
+
+### 46.7 The same preset landed cleanly on the second attempt, and the ANSWER was the plan's shape
+
+The restart that followed §46.6's fix (below) was also the live re-test: the SAME `BA - Frog Bass`,
+applied over the state the incident had left behind, answered **`ALL_VERIFIED`, `final_state:
+committed`, 6 writes of 6 verified, no rollback, 4 usual gaps** (tempo, two dropped destinations,
+slot fields with pair). The two rows that failed before went through VERBATIM:
+
+| path | attempted before | now |
+|---|---|---|
+| `settings.lfos.0.points` | written `0 1 0 0 1 1 1 1`, read back `0 1 0 0 1 1 0 0` -> refused | written `0 1 0 0 1 1 1 1`, read back **`0 1 0 0 1 1 1 1`** |
+| `settings.lfos.0.powers` | (not reached) | written `0 -1.11176514625549 0 0`, read back **the same** |
+
+The live document now holds the file's own curve (`points [0,1,0,0,1,1,1,1]`,
+`powers [0,-1.1117651462554932,0,0]`), the preset's own sample (`White Noise`, `sample_on 0.0`),
+state 175,156 -> 175,198 bytes. **So the canonicalization is STATE-DEPENDENT, not a property of the
+curve**, and the earlier "safe recipe" this journal sketched is retracted.
+
+The two plans differ in a way the rows make readable, and that difference is the candidate -
+recorded, NOT claimed:
+
+* the FAILED plan was the full preset diff - 40+ control paths plus
+  `settings.lfos.0.num_points` (3 -> 4, which LANDED) followed LATER by `settings.lfos.0.points`
+  (unit 13 of 14);
+* the SUCCESSFUL plan contained NO `num_points` write (both sides already 4) and wrote `points`
+  and `powers` directly.
+
+Candidate: changing `num_points` in the same transaction as the curve's `points` makes the plugin
+re-derive the curve on a later load, overriding the just-written points. It fits both measurements
+and it is falsifiable, but two live observations cannot separate it from the plan's length, the
+unit order or the live state's other fields - so nothing is guarded on it yet (named in the
+documentation's open list instead).
+
+### 46.8 The dead-end fix: the plugin's own re-serialization is recognised, and a restore restores
+an element whole
+
+The incident's real defect was not the refusal (correct - the curve did not land) but that the
+ROLLBACK WAS SKIPPED: `_channel_restorable` compares the observed state against the digests the
+layer SENT, and the plugin's rendering of our own write matched neither, so both channels were
+named `not_restored (external_change)` and the verdict was `FAILED_AND_NOT_RESTORED`. The rule is
+right in spirit - never restore over state that is not ours - but that state WAS ours.
+
+Two changes, both from measurement rather than theory (commit `eab2c9a`):
+
+* **recognition on evidence** (`transaction._plugin_reserialized` + `codec.differing_paths`): on a
+  unit that fails to verify, the observed document is compared against the INTENDED one (live +
+  this unit's values, through the codec's own `apply_intended_values`), over the codec's own
+  writable space (settings leaves, whole wavetable slots, labels; `DERIVED_LEAVES` excluded because
+  the plugin re-derives them regardless). If every differing path is one this unit wrote - itself
+  or an ANCESTOR, because a unit writes a VALUE and the differ names the leaf that moved - the
+  state is recognised as ours-as-the-plugin-rendered-it: the digest is recorded (the rollback may
+  restore over it), a `plugin_reserialized_write` gap is written, and the parameter vector is
+  recognised on the same evidence (a state write resets ordinary parameters - measured). A
+  divergence OUTSIDE our paths keeps the rule's old answer, and that control is a test;
+* **a restore restores an element WHOLE** (`restore_changes`): the restoration was expressed leaf by
+  leaf (`flat_paths` names list entries by index), so a captured array SHORTER than the live one
+  left its extra tail behind - `lfos[0].points` kept four values the capture never had while every
+  leaf row verified. The measured consequence: a "restored" verdict that was not a restoration.
+  `ELEMENT_BLOCKS` (`lfos`, `custom_warps`, `random_values`, now one constant shared with the
+  preset diff) are restored as one value per element; an equal element is not rewritten.
+
+`tests/plugins/test_p43_plugin_reserialization.py` (4 tests): the incident offline - the refusal
+stands (`WriteNotApplied`, mismatched path), the verdict becomes `FAILED_AND_RESTORED`, the gap
+names the paths, and the captured document AND parameter vector are back exactly; the CONTROL - the
+same canonicalization plus one path the unit never touched keeps `FAILED_AND_NOT_RESTORED` and
+restores nothing; a codec without the hooks is never credited with the recognition; and the differ
+covers the writable space (symmetric, leaf-granular, derived PCM ignored, whole-slot and label
+differences seen). **1218 passed, 2 skipped** (46.5's round recorded 1214).
+
+**Live acceptance of the fix is OUTSTANDING, and that is measured too:** the live re-test did not
+reproduce the incident - the same preset landed cleanly (§46.7) - so the fix's live proof could not
+be obtained this pass. The incident's evidence stands in the earlier call's answer, the mechanism is
+proven offline, and the reproduction recipe is now known to depend on the live state (plan shape),
+which is what § 7 of the apply-limits doc now says.
