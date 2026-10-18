@@ -417,10 +417,6 @@ def describe(document: Any) -> dict[str, Any]:
     if isinstance(length, int) and isinstance(rate, int) and rate > 0:
         described["seconds"] = round(length / rate, 6)
     described["max_samples"] = MAX_SAMPLES
-    described["note"] = (
-        "the sampler is an ORDINARY state block: it carries the PCM inline, and its controls "
-        "(`on`, `loop`, `destination`, `level`, ...) are ordinary parameters"
-    )
     return described
 
 

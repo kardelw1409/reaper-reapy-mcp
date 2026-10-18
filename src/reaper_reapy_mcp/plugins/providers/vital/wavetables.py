@@ -574,12 +574,6 @@ def describe(table: Any, *, oscillator: int | None = None) -> dict[str, Any]:
             "no source component carrying wave data in the first group: the table's components "
             "are processing stages only, so it renders silence"
         )
-    elif len(rows) == 1:
-        out["why_this_matters"] = (
-            "a SINGLE-frame table is what makes `Oscillator N Wave Frame` inert: there "
-            "is no second frame to move to, so a write or a modulation route to the "
-            "frame returns the table's own frame"
-        )
     return out
 
 

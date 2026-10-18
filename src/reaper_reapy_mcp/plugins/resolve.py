@@ -86,12 +86,42 @@ IDENTITY_CONTINUITY_LIMIT: dict[str, Any] = {
     ),
 }
 
+#: The SAME claim, short enough to repeat on every response (P41).
+#:
+#: MEASURED (2026-10-18): the full disclosure above is 716 characters of JSON, and it rides `meta` of
+#: EVERY call of every tool - a `plugin_sample(op="read")` answer spent a quarter of its size on a
+#: paragraph that never changes. The claim itself must stay on every response (it is an audit
+#: requirement: a caller has to see what a target token does NOT establish, without asking), so the
+#: compact form keeps every FIELD that carries the claim - what was validated, what is not claimed,
+#: the reason id, and the evidence - and states the consequence in one sentence. The prose is not
+#: lost: `identity_basis(full=True)` still returns it, and `plugin_describe` is where a caller reads
+#: it once.
+IDENTITY_CONTINUITY_SHORT: dict[str, Any] = {
+    "validated": ["location", "build_facts", "state_revision"],
+    "not_claimed": ["instance_continuity"],
+    "reason": "identical_build_replacement_indistinguishable",
+    #: The evidence id, not its path: the corpus' own naming rule is that a record name stays valid
+    #: as an id, and `plugin_describe` carries the full path for a caller who wants to go and read it.
+    "measured_by": "p8_l3_identity__20261010T203101Z__dcd339e9c219.json",
+    "consequence": (
+        "a mutation is authorised for the target at that location now; the guarantees are "
+        "state-based (capture, write, restore) and the layer does not claim instance continuity. "
+        "`plugin_describe` spells the measurement out"
+    ),
+}
 
-def identity_basis() -> dict[str, Any]:
-    """A copy of the continuity disclosure for a live response's ``meta``."""
+
+def identity_basis(full: bool = False) -> dict[str, Any]:
+    """The continuity disclosure for a live response's ``meta``.
+
+    ``full=False`` (the default, and what every tool response carries) is the compact form: the
+    claim, its reason id and its evidence, in ~360 characters. ``full=True`` returns the prose as
+    well - what ``plugin_describe`` prints for a caller who wants the measurement spelled out.
+    """
+    source = IDENTITY_CONTINUITY_LIMIT if full else IDENTITY_CONTINUITY_SHORT
     return {
         key: (list(value) if isinstance(value, list) else value)
-        for key, value in IDENTITY_CONTINUITY_LIMIT.items()
+        for key, value in source.items()
     }
 
 

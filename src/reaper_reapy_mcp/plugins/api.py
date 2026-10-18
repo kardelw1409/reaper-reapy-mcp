@@ -497,6 +497,15 @@ def _meta(resolution: RS.ProfileResolution, *, source: str = "provider") -> dict
     from . import preload as _preload  # noqa: PLC0415 - lazy: keeps registration import-light
 
     meta = resolution.meta()
+    # P41: `meta` rides EVERY response, so its boilerplate stays small. Two rules, both measured on
+    # a real answer (a `plugin_sample` read spent a quarter of its size on a paragraph that never
+    # changes): an EMPTY list/dict/None says nothing a caller can act on, and the full identity
+    # prose is available from `plugin_describe` instead of being repeated here.
+    cache = meta.get("cache")
+    if isinstance(cache, dict):
+        meta["cache"] = {
+            key: value for key, value in cache.items() if value not in ([], {}, None)
+        }
     meta["instance"] = _ref_dict(resolution.instance.ref)
     meta["target_token"] = resolution.instance.token.id
     meta["identity_basis"] = RS.identity_basis()
@@ -514,7 +523,20 @@ def _meta(resolution: RS.ProfileResolution, *, source: str = "provider") -> dict
     else:
         report = _preload.prepared_profiles().report
         if report is not None:
-            meta["startup"] = report.summary()
+            # the DIRECTORY is dropped: it is the parent of `cache.path`, already in this envelope,
+            # and `reason`/`capped` are carried only when they say something (a 0 or a null here is
+            # noise on every single call).
+            summary = report.summary()
+            trimmed = {
+                key: value
+                for key, value in summary.items()
+                if key not in ("directory", "configured_providers", "reason", "capped")
+            }
+            if report.reason:
+                trimmed["reason"] = report.reason
+            if report.capped:
+                trimmed["capped"] = report.capped
+            meta["startup"] = trimmed
     return meta
 
 
@@ -881,6 +903,11 @@ def plugin_describe(
     modulation = profile.get("modulation") or {}
     data = {
         "identity": dict(resolution.identity),
+        # P41: this is the ONE place the identity/continuity disclosure is spelled out in prose.
+        # Every other response carries the compact claim in `meta.identity_basis` (it must be on
+        # every answer - that is the audit rule - but a paragraph that never changes has no business
+        # riding a sampler read), so a caller who wants the measurement reads it here.
+        "identity_basis": RS.identity_basis(full=True),
         "profile": {
             "key": resolution.build.key_for(str(provider.id), resolution.identity),
             "schema": profile.get("profile_schema_version"),
@@ -2350,12 +2377,27 @@ def _sampler_controls(
 def _sampler_control_state(
     config: Any, instance: Any, profile: dict[str, Any], mapping: dict[str, str]
 ) -> dict[str, Any]:
-    """The sampler's controls as they are NOW (one batched read; never a guess)."""
+    """The sampler's controls as they are NOW: `{control_id: display}` (one batched read).
+
+    MEASURED (2026-10-18): the profile's full value record is `{normalized, native, unit, display}`
+    - four fields per control, ~130 characters each, and a ten-control sampler spent ~1.3 KB of a
+    `read` answer on them. The DISPLAY string is the one a caller acts on (a number for a numeric
+    control, the enum's own label for a switch), and it is exactly what `plugin_write` accepts, so
+    the compact answer carries that. A caller who needs the profile's full record (normalized value,
+    unit, law) calls `plugin_read`, which is the tool that serves it.
+    """
     ids = [control for control in mapping.values() if _control_by_name(profile, control)]
     if not ids:
         return {}
     envelope = plugin_read(config=config, instance=instance, controls=ids, include_display=True)
-    return (envelope.get("data") or {}).get("values") or {}
+    values = (envelope.get("data") or {}).get("values") or {}
+    out: dict[str, Any] = {}
+    for control_id, record in values.items():
+        if not isinstance(record, dict):
+            continue
+        display = record.get("display")
+        out[control_id] = display if display is not None else record.get("native")
+    return out
 
 
 def _sampler_capability(provider: Any) -> Any:
