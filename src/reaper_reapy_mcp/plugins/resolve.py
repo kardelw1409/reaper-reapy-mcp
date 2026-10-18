@@ -185,6 +185,15 @@ class TargetToken:
         sameness. The comparison is kept because a handle that *does* change is a
         real difference and must refuse (fail closed), and because it costs
         nothing when it stays the same.
+
+        **A handle that DOES move is a real difference too (measured, P42
+        2026-10-18, live).** The same remove-and-re-add on the same build in the
+        same slot moved the handle this time - the next mutation was refused with
+        `fields: ["session_handle"]`. Both readings stand (P8 saw no move, this
+        one did), so the comparison must fire here, and it must not dead-end the
+        caller: a token a CALLER holds is refused (it claims the past), while the
+        token `issue()` mints for the call in hand is re-anchored to the facts it
+        just read.
         """
         diffs: list[str] = []
         if facts_location(fresh) != self.location:
@@ -245,21 +254,43 @@ class TargetTokenRegistry:
 
         A session has ONE token per validated instance, so two requests against
         the same target share the target-scoped lock instead of interleaving.
+
+        Reuse **re-anchors the session snapshot** (P42, measured live 2026-10-18).
+        Removing an FX and re-adding the same build into the same slot moved that
+        slot's `session_handle`, and because reuse kept the snapshot the next
+        mutation was refused with `fields: ["session_handle"]` - permanently, for
+        the rest of the server session, while the refusal's own remedy ("address
+        the instance by location") named exactly what the caller had done. A
+        handle that moved at that slot is a real difference and `revalidate`
+        still refuses it when the token is the CALLER's; the token this layer
+        mints for the call in hand is a present-tense claim on that location, so
+        it is re-anchored to the facts just read instead of dead-ending on the
+        workflow the layer recommends.
+
+        The re-anchoring is RECORDED, not hidden: `session_handle_changes` counts
+        how often the handle reading at this slot changed under one token, which
+        is the layer's own note that the slot was re-populated.
         """
         resolved_identity = dict(identity if identity is not None else facts_identity(facts))
         location = facts_location(facts)
+        snapshot = {
+            "track_name": facts.track_name,
+            "fx_count": facts.fx_count,
+            "session_handle": facts.session_handle,
+        }
         for existing in self._tokens.values():
             if existing.location == location and existing.identity == resolved_identity:
+                if str(existing.facts_snapshot.get("session_handle")) != str(snapshot["session_handle"]):
+                    existing.facts_snapshot["session_handle_changes"] = (
+                        int(existing.facts_snapshot.get("session_handle_changes") or 0) + 1
+                    )
+                existing.facts_snapshot.update(snapshot)
                 return existing
         token = TargetToken(
             id="tok_" + secrets.token_hex(16),
             location=location,
             identity=resolved_identity,
-            facts_snapshot={
-                "track_name": facts.track_name,
-                "fx_count": facts.fx_count,
-                "session_handle": facts.session_handle,
-            },
+            facts_snapshot=dict(snapshot, session_handle_changes=0),
             session_context=dict(self.session_context),
         )
         self._tokens[token.id] = token
