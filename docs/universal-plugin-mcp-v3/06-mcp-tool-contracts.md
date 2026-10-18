@@ -379,8 +379,10 @@ off would put material in the plugin and never sound it), `loop`, `destination`,
 no state at all, so making the sampler the source that sounds does not require `plugin_write` (which can
 be disabled in a workspace config, and was); every control it addresses is validated against the live
 profile like any other knob, and a profile that declares none of them is refused rather than reported as
-a solo that wrote nothing. Protocol, the block's exact shape and the measured limits:
-[24-sampler.md](24-sampler.md).
+a solo that wrote nothing. A **plan** (the dry-run answer) never carries the payload: the synthesised
+block in `preview.state_paths` reports `payload_chars`, because a measured dry run answered 6.46 MB of
+base64 for a 12-second stereo file while the same write committed in ~18 KB. Protocol, the block's exact
+shape and the measured limits: [24-sampler.md](24-sampler.md).
 
 ### 9.4 The preset search ranks (P41)
 

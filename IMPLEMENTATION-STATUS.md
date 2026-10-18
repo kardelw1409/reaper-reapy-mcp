@@ -5442,10 +5442,12 @@ visible in the source so re-adding `refusals: []` to every answer fails a test i
 * No resampling: the block declares the FILE's rate and the plugin plays the buffer at that rate.
 * No loop points (the state block carries none), no `clear`, and the audible result is not measured -
   what is established is what the plugin STORES, read back through its own document.
-* Length against the ceiling: a sample lives in the state as base64, so 9.14 s of stereo (403,200
-  frames) is ~1.08 MB of document characters. Over an instance that already holds large tables such a
-  load is refused BY NAME (`state_ceiling_reached`, doc 22 2.3) rather than silently trimmed - free
-  room with a smaller table/preset, or load a shorter file.
+* Length against the ceiling: a sample lives in the state as base64 of int16, so 9.14 s of stereo
+  (403,200 frames) is **1,612,800 bytes of PCM = 2,150,400 characters of the document** (corrected in
+  43.9, which also measures the live figure: that load took the document from ~253,000 to 2,284,530
+  characters, 75 % of the 3,056,250-character planning ceiling). A load that would pass the ceiling is
+  refused BY NAME (`state_ceiling_reached`, doc 22 2.3) rather than silently trimmed - free room with a
+  smaller table/preset, or load a shorter file.
 * The live confirmation of the new tool needs the MCP server restarted (the surface is registered at
   startup); the offline suite plus the measured live behaviour of the same channel are what this round
   rests on until then.
@@ -5494,3 +5496,42 @@ nothing. Measured: the whole solo is one control write, with no state sent (veri
 a captured request, once live).
 
 **1153 passed, 2 skipped** (43.6 recorded 1143; the new tests are the note/gap split and the solo op).
+
+### 43.9 The dry run was the expensive half: a plan that carried the payload
+
+Owner, after the restart: "все тулы включены, пробуй ещё раз". The solo landed on the first try
+(`committed`, `ALL_VERIFIED`, one parameter write, all four rows `agrees: true`), and the four values
+are the plugin's own measured bands, not a guess: `osc_1_on|osc_2_on|osc_3_on` are `enum` controls whose
+host-measured `band_ends` are `[0.0, 0.4999999850988388, 1.0]` with `positions: [0.25, 0.75]`, so "Off"
+was written as **0.25** - the midpoint of its own band (`sample_on` "On" went in at 1.0 and read back
+inside band 2).
+
+Then the same session measured two things the previous round had wrong:
+
+* **A dry run answered 6,466,384 characters, of which 6,457,749 were one preview field** -
+  `preview.state_paths["settings.sample"]`, i.e. the two base64 payloads of a 12-second stereo file
+  (99.87 % of the answer), inside a structure whose job is to say what WOULD change, and after the
+  request had already named that material by file path. The committed write of the same material
+  answers ~18 KB, because a preview only exists on the dry-run path (`transaction.py:250-270`) - so the
+  half that LOOKS without writing was the expensive one, and by default (`dry_run: true`) it is the
+  one a caller gets. Fixed at the provider boundary: `VitalProvider.summarize_state_value(path, value)`
+  hands the sampler's block to `samples.summarize_block`, which drops the payload and reports
+  `payload_chars` instead - the vocabulary `op="read"` already uses - and returns everything else
+  verbatim. The hook is optional (`getattr` + `callable`), the plan is untouched (the units still carry
+  the block in full, which `test_a_load_lands_the_block_and_verifies_it` keeps proving by reading the
+  payload back out of the plugin's document), and no plugin vocabulary entered the core.
+* **The round's own figure for a sample's size was wrong by 2x.** 43.7 said 9.14 s of stereo
+  (403,200 frames) is "~1.08 MB of document characters". It is **1,612,800 bytes of PCM and 2,150,400
+  characters of the document** (403,200 frames x 2 channels x 2 bytes x 4/3) - the earlier number was
+  computed for one channel. The live sequence fixes the scale exactly: after `init.vital` the document
+  was ~253,000 characters, the load put it at **2,284,530** (measured by the ceiling refusal below),
+  i.e. **75 % of the 3,056,250-character planning ceiling** - so one more load of the same size is
+  refused by name, not silently trimmed. Also worth stating, because `plugin_state` reports the other
+  number: `block_chars` is the **chunk** REAPER stores (base64 of the document, x4/3), not the document.
+
+The one measurement that produced both numbers at once: a dry-run load of a larger file
+(`New York Subway.wav`, 4.8 MB, 1,210,777 frames at 96 kHz) is refused with
+`state_ceiling_reached`, `document_chars_now: 2,284,530`, `ceiling_chars: 3,056,250`,
+`growth_chars: 4,307,075` - a refusal that reports live facts instead of guessing.
+
+**1157 passed, 2 skipped** (43.8 recorded 1153).
