@@ -219,6 +219,62 @@ def cut_actions_by_segments(
     return sliced
 
 
+def _trim_item_to_slice(project, track_index: int, *, window_start_s: float, window_end_s: float) -> dict:
+    """Delete the notes of the newest item that fall OUTSIDE its slice window.
+
+    An inserted MIDI file brings its WHOLE content into the item, and the take's source offset only
+    decides what SOUNDS. MEASURED (afro take, 2026-10-19, vision review of the filled project): a kick
+    item spanning bars 17-27 held 64 notes beyond its own edges - drawn on the lane, silent, and read
+    by the reviewer as part of the part. A user's split CUTS the data; so does this, and it is also
+    what makes "the notes in the item" and "the notes that sound" the same statement in verification.
+
+    The window is in PROJECT seconds (the same clock `_take_note_times` reads), and the deletion runs
+    BACKWARDS because deleting a note shifts the indices of the ones after it.
+    """
+    track = project.tracks[track_index]
+    count = int(RPR.CountTrackMediaItems(track.id))
+    if count < 1:
+        return {"notes": None, "removed": None, "reason": "no items"}
+    item = RPR.GetTrackMediaItem(track.id, count - 1)
+    take = RPR.GetActiveTake(item)
+    if not take:
+        return {"notes": None, "removed": None, "reason": "no take"}
+    counted = RPR.MIDI_CountEvts(take, 0, 0, 0)
+    if not isinstance(counted, (list, tuple)) or len(counted) < 3:
+        return {"notes": None, "removed": None, "reason": "no MIDI event reader"}
+    notes = int(counted[2])
+    ppqs: list[int] = []
+    for note_index in range(notes):
+        got = RPR.MIDI_GetNote(take, note_index, 0, 0, 0, 0, 0, 0, 0)
+        if isinstance(got, (list, tuple)) and len(got) >= 6:
+            ppqs.append(int(float(got[5])))
+    if not ppqs:
+        return {"notes": notes, "removed": 0, "kept": notes}
+    resolve, report = _note_time_map(take, min(ppqs), max(ppqs))
+    if resolve is None or not report.get("exact"):
+        times = [float(RPR.MIDI_GetProjTimeFromPPQPos(take, float(ppq))) for ppq in ppqs]
+    else:
+        times = [resolve(ppq) for ppq in ppqs]
+    # A note exactly ON the slice's right edge belongs to the NEXT slice (whose window starts there),
+    # so the removal is [start - eps, end - eps): every note sounds in exactly ONE item.
+    eps = 1e-4
+    removed = 0
+    refusal: str | None = None
+    for note_index in range(len(ppqs) - 1, -1, -1):
+        when = times[note_index]
+        if when < float(window_start_s) - eps or when >= float(window_end_s) - eps:
+            try:
+                RPR.MIDI_DeleteNote(take, note_index)
+            except Exception as exc:  # noqa: BLE001 - a bridge that cannot delete must be NAMED
+                refusal = "%s: %s" % (type(exc).__name__, exc)
+                break
+            removed += 1
+    answer = {"notes": notes, "removed": removed, "kept": notes - removed}
+    if refusal:
+        answer["reason"] = "the bridge refused MIDI_DeleteNote (%s)" % refusal
+    return answer
+
+
 def _same_span(mark: dict, region: dict) -> bool:
     """True when a project mark covers the manifest region's range (both ends)."""
     return (
@@ -708,6 +764,11 @@ def apply_bundle(
             )
     if info.get("midi_parts"):
         item_actions = [a for a in item_actions if a["track"] != "MIDI_DRUMS"]
+        # ...and no TRACK either: the combined part is not inserted, so a MIDI_DRUMS track would be
+        # born empty and read as a part that failed to arrive (MEASURED - the vision review of the
+        # afro project listed it as "MISSING joiner"; the per-class tracks hold the real parts).
+        if "MIDI_DRUMS" in tracks_to_create:
+            tracks_to_create.remove("MIDI_DRUMS")
 
     # ---- CUT BY REGION: one item per segment, not one item per file (see
     # cut_actions_by_segments for the rule and where the rows come from).
@@ -842,6 +903,7 @@ def apply_bundle(
             if action["start_s"] != 0.0:
                 controller.set_item_position(track, outcome, action["start_s"])
             source_offset = None
+            trim_report: dict | None = None
             if action["kind"] == "audio" and audio_source_offset_s > 0:
                 source_offset = _set_audio_source_offset(project, track, audio_source_offset_s)
                 if source_offset is None or abs(source_offset - audio_source_offset_s) > 1e-4:
@@ -867,6 +929,22 @@ def apply_bundle(
                         f"{action['track']} ({Path(action['file']).name}): the slice's source offset "
                         f"{('is unknown' if source_offset is None else f'is {source_offset:.3f} s')} "
                         f"but the manifest says {action['source_offset_s']:.3f} s"
+                    )
+                # ...AND THE ITEM KEEPS ONLY THE NOTES IT PLAYS (see _trim_item_to_slice: an
+                # inserted file brings its whole content, and the extra notes are drawn but silent).
+                trim_report = _trim_item_to_slice(
+                    project,
+                    track,
+                    window_start_s=float(action["start_s"]),
+                    window_end_s=float(action["start_s"]) + float(action["length_s"]),
+                )
+                if trim_report.get("removed"):
+                    applied["trimmed_notes"] = applied.get("trimmed_notes", 0) + int(trim_report["removed"])
+                if trim_report.get("notes") is not None and not trim_report.get("kept"):
+                    warnings.append(
+                        f"{action['track']} ({Path(action['file']).name}): the segment "
+                        f"'{action.get('segment_name')}' holds NO note after trimming - the region "
+                        "has nothing to show for it"
                     )
                 placed_length = slice_report.get("length_s")
                 if placed_length is None or abs(placed_length - action["length_s"]) > 1e-3:
@@ -916,6 +994,8 @@ def apply_bundle(
                     "segment_name": action.get("segment_name"),
                     "segment_notes": action.get("segment_notes"),
                     "length_s": action.get("length_s"),
+                    "trimmed": (trim_report or {}).get("removed"),
+                    "kept": (trim_report or {}).get("kept"),
                 }
             )
 
