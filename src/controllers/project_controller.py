@@ -471,3 +471,112 @@ class ProjectController(BaseController):
                 "the project left open has never been saved: it exists in memory only"
             )
         return answer
+
+    def open_project_file(self, path: str) -> dict:
+        """Open a `.rpp` in a NEW tab, never in the project the user is working in.
+
+        WHY A NEW TAB FIRST: `Main_openProject` behaves like File -> Open, and its
+        destination is the CURRENT tab. Calling it while the user's project is current
+        would replace that project - the one thing this toolchain must never do. So a
+        fresh tab is opened first (the same command `new_project_tab` uses), and the
+        file is loaded into that tab.
+
+        VERIFIED AGAINST THE HOST, NOT ASSUMED - three separate facts:
+
+        * the new tab became CURRENT (its pointer differs from the one read before);
+        * the file's path appears among the open tabs. This is the only readable name:
+          `GetProjectName` returns the buffer it was given (probed), while the third
+          slot of `EnumProjects` is filled for a project that has a file;
+        * the project that was current BEFORE the call is still among the open tabs.
+
+        MEASURED: `Main_openProject` returned **false** on a call that demonstrably
+        opened the file (the tab carried the path and the project had 2 tracks), so its
+        return value is reported as `host_returned` but is NOT part of the verdict. The
+        tab list, the path, the track count and the surviving original tab are the
+        witnesses.
+
+        A failed check returns an error that says what the host actually did: a silent
+        failure here means either the file did not open or the user's project is gone.
+        """
+        target = os.path.abspath(os.path.expanduser(str(path)))
+        if not os.path.isfile(target):
+            return {"status": "error", "message": "no such file: %s" % target}
+        if os.path.splitext(target)[1].lower() != ".rpp":
+            return {
+                "status": "error",
+                "message": "open_project_file opens .rpp files; got %r"
+                % os.path.splitext(target)[1],
+            }
+
+        before = reapy.Project()
+        before_pointer = str(before.id)
+        before_tabs = _open_projects()
+        before_track_count = len(before.tracks)
+        before_tab = next(
+            (tab for tab in before_tabs if tab["pointer"] == before_pointer), None
+        )
+
+        try:
+            RPR.Main_OnCommand(NEW_PROJECT_TAB_IGNORING_TEMPLATE, 0)
+        except Exception as e:  # noqa: BLE001 - the host refusal is the answer
+            self.logger.error("Failed to open a new project tab: %s", e)
+            return {"status": "error", "message": "failed to open a new project tab: %s" % e}
+
+        blank = reapy.Project()
+        if str(blank.id) == before_pointer:
+            return {
+                "status": "error",
+                "message": "a new tab did not become current; the file was NOT opened",
+                "hints": [
+                    "the action id may differ in this REAPER build",
+                    "check that REAPER is running and not showing a modal dialog",
+                ],
+            }
+
+        try:
+            opened = bool(RPR.Main_openProject(target))
+        except Exception as e:  # noqa: BLE001
+            self.logger.error("Failed to open project file %s: %s", target, e)
+            opened = False
+        after = reapy.Project()
+        after_tabs = _open_projects()
+        original_still_open = any(tab["pointer"] == before_pointer for tab in after_tabs)
+        target_key = os.path.normcase(os.path.abspath(target))
+        opened_tab = next(
+            (
+                tab
+                for tab in after_tabs
+                if tab["file"] and os.path.normcase(os.path.abspath(tab["file"])) == target_key
+            ),
+            None,
+        )
+        ok = original_still_open and opened_tab is not None
+        answer = {
+            "status": "success" if ok else "error",
+            "message": (
+                "opened %s in a new tab" % target
+                if ok
+                else "the file did not open, or a safety check failed"
+            ),
+            "path": target,
+            "host_returned": opened,
+            "project": str(after.id),
+            "track_count": len(after.tracks),
+            "tabs_open": len(after_tabs),
+            "opened_tab": opened_tab,
+            "left_behind": {
+                "project": before_pointer,
+                "track_count": before_track_count,
+                "file": (before_tab or {}).get("file", ""),
+                "still_open": original_still_open,
+            },
+            "tabs": after_tabs,
+        }
+        if not original_still_open:
+            answer["message"] = (
+                "DANGER: the project that was current before the call is no longer among "
+                "the open tabs"
+            )
+        elif opened_tab is None:
+            answer["message"] = "the file does not appear among the open tabs"
+        return answer

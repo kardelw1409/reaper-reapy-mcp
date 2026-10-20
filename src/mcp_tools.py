@@ -1856,6 +1856,30 @@ def setup_mcp_tools(mcp: FastMCP, controller) -> None:
         except Exception as e:
             return {"status": "error", "message": f"Failed to open a new project tab: {str(e)}"}
 
+    @mcp.tool("open_project_file")
+    def open_project_file(ctx: Context, path: str) -> Dict[str, Any]:
+        """Open a `.rpp` file in a NEW project tab and leave the current project untouched.
+
+        WHY THIS TOOL EXISTS: `apply_audiocpp_manifest` fills whatever project is current,
+        and `new_project_tab` can only create an EMPTY tab. Opening a built file therefore
+        had no tool at all - and calling `Main_openProject` from a script while the user's
+        project is current would replace that project. This tool opens the fresh tab
+        FIRST and loads the file into it.
+
+        Args:
+            path: the `.rpp` to open. Parent directories are not created; a missing file
+                is refused before any host call.
+
+        The answer is verified against the host, not assumed: the new tab must have become
+        current, the file's path must appear among the open tabs, and the project that was
+        current before the call must STILL be open. `left_behind` names that project (its
+        `file` is empty when it was never saved, and `still_open` is the safety check).
+        """
+        try:
+            return controller.open_project_file(path)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to open project file: {str(e)}"}
+
     # ----- REAPER's OWN FX presets (the preset dropdown in the FX window) -----
     #
     # A different store from `plugin_presets` (the plugin's built-in browser): REAPER's set is a

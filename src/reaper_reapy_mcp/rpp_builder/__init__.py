@@ -14,6 +14,20 @@ Two rules hold this package together, and both are tested:
 
 from __future__ import annotations
 
+from .model import (
+    AudioSource,
+    Item,
+    Marker,
+    MidiEvent,
+    MidiSource,
+    Project,
+    Region,
+    Send,
+    StretchMarker,
+    Track,
+    make_guid,
+)
+from .reader import from_nodes
 from .rpp import (
     CRLF,
     RppDocument,
@@ -27,17 +41,38 @@ from .rpp import (
     tokenize,
     unquote,
 )
+from .validate import validate
+from .writer import FileSink, ValidationError, WriteReport, WriteVerificationError
+from .writer.to_nodes import to_nodes
 
 __all__ = [
+    "AudioSource",
     "CRLF",
+    "FileSink",
+    "Item",
+    "Marker",
+    "MidiEvent",
+    "MidiSource",
+    "Project",
+    "Region",
     "RppDocument",
     "RppField",
     "RppNode",
     "RppParseError",
+    "Send",
+    "StretchMarker",
+    "Track",
+    "ValidationError",
+    "WriteReport",
+    "WriteVerificationError",
+    "from_nodes",
+    "make_guid",
     "parse",
     "parse_file",
     "render",
     "render_bytes",
+    "to_nodes",
     "tokenize",
     "unquote",
+    "validate",
 ]

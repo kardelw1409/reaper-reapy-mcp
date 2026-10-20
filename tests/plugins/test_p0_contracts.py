@@ -218,7 +218,9 @@ def test_tool_names_disjoint_from_existing_host_tools():
     # 59 -> 63 (P42): REAPER's OWN FX preset store became reachable - get_fx_presets,
     # set_fx_preset, navigate_fx_presets, save_fx_preset. A different store from
     # `plugin_presets` (the plugin's built-in browser), so the names do not collide.
-    assert len(existing) == 63, f"expected 63 existing tools, found {len(existing)}"
+    # 63 -> 64 (F2): open_project_file opens a built .rpp in a NEW tab and verifies
+    # that the previously current project is still open.
+    assert len(existing) == 64, f"expected 64 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
     # 63 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
     # manifest package since E2) + 11 plugin_* (8 until P38 added plugin_presets,
@@ -226,7 +228,7 @@ def test_tool_names_disjoint_from_existing_host_tools():
     # the running server advertises.
     manifest = _manifest_tool_names()
     assert manifest == ["apply_audiocpp_manifest"], manifest
-    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 75
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 76
 
 
 def test_every_mutating_tool_declares_dry_run_true():
