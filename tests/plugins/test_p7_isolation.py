@@ -38,11 +38,17 @@ def test_importing_the_provider_pulls_in_no_legacy_module_and_no_registry_read()
     """The pre-existing package chain is warmed first (it performs host I/O by
     design - 19 Decision 4), so the measurement is about the provider package's
     own import: nothing legacy, no registry read, no working-directory change.
+
+    The warm-up names `.server` explicitly: `reaper_reapy_mcp/__init__.py` is now
+    lazy (PEP 562), so a bare `import reaper_reapy_mcp` no longer pulls the server
+    chain in - and without the chain warmed, the provider's own stdlib imports
+    (hashlib, ast, datetime...) show up as new top-level modules and the
+    measurement stops being about the provider.
     """
     script = (
         "import importlib, json, os, sys\n"
         f"sys.path.insert(0, {str(SRC)!r})\n"
-        "import reaper_reapy_mcp  # warm the pre-existing chain\n"
+        "import reaper_reapy_mcp.server  # warm the pre-existing chain\n"
         "before_cwd = os.getcwd()\n"
         "before = set(sys.modules)\n"
         "events = []\n"
