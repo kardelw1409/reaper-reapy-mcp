@@ -219,7 +219,8 @@ def test_tool_names_disjoint_from_existing_host_tools():
     # set_fx_preset, navigate_fx_presets, save_fx_preset. A different store from
     # `plugin_presets` (the plugin's built-in browser), so the names do not collide.
     # 63 -> 64 (F2): open_project_file opens a built .rpp in a NEW tab and verifies
-    # that the previously current project is still open.
+    # that the previously current project is still open. (F4's build_project_file is
+    # registered by the manifest package, so it is counted below, not here.)
     assert len(existing) == 64, f"expected 64 existing tools, found {len(existing)}"
     assert set(existing) & set(TOOL_NAMES) == set()
     # 63 classic + 1 manifest tool (apply_audiocpp_manifest, registered by the
@@ -227,8 +228,10 @@ def test_tool_names_disjoint_from_existing_host_tools():
     # 9 until P40 added plugin_wavetable, 10 until P41 added plugin_sample) = the tools
     # the running server advertises.
     manifest = _manifest_tool_names()
-    assert manifest == ["apply_audiocpp_manifest"], manifest
-    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 76
+    # F4 added build_project_file to the manifest package, so the pinned list names both -
+    # in the order FastMCP reports them (registration order, not alphabetical).
+    assert manifest == ["build_project_file", "apply_audiocpp_manifest"], manifest
+    assert len(set(existing) | set(TOOL_NAMES) | set(manifest)) == 77
 
 
 def test_every_mutating_tool_declares_dry_run_true():
