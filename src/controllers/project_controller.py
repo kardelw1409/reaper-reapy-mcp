@@ -542,13 +542,19 @@ class ProjectController(BaseController):
         after_tabs = _open_projects()
         original_still_open = any(tab["pointer"] == before_pointer for tab in after_tabs)
         target_key = os.path.normcase(os.path.abspath(target))
+        matching = [
+            tab
+            for tab in after_tabs
+            if tab["file"] and os.path.normcase(os.path.abspath(tab["file"])) == target_key
+        ]
+        # MEASURED: when the same file was ALREADY open in another tab, the path
+        # alone names the wrong tab - a live call reported the new project pointer
+        # while `opened_tab` showed the older tab with that path. The current
+        # project is the tab this call created, so it wins when it matches the path.
+        current_pointer = str(after.id)
         opened_tab = next(
-            (
-                tab
-                for tab in after_tabs
-                if tab["file"] and os.path.normcase(os.path.abspath(tab["file"])) == target_key
-            ),
-            None,
+            (tab for tab in matching if tab["pointer"] == current_pointer),
+            matching[0] if matching else None,
         )
         ok = original_still_open and opened_tab is not None
         answer = {
