@@ -11,6 +11,8 @@ random source or host call is involved. Two builds of one model are byte-identic
 
 from __future__ import annotations
 
+import math
+
 from ..model.item import AudioSource, Item, MidiSource
 from ..model.project import Project
 from ..model.track import Track
@@ -254,18 +256,31 @@ def _midi_source(
                 ),
             )
         )
-    # MEASURED: all 51 reference MIDI sources end with CC123 (all notes off).
-    # It is written ONE TICK AFTER the last event, not on the same tick: measured
-    # live, a note-off on the LAST tick of the source is read back by REAPER with
-    # endppq 0 (the note collapses), while the reference never has that shape.
-    # The reference's gap varies (26..293760 ticks), so the presence is the
-    # measured fact; +1 tick is the smallest safe position.
-    if source.events:
-        last_tick = source.events[-1].tick
+    # MEASURED: all 51 reference MIDI sources end with CC123 (all notes off), and
+    # it sits at the SOURCE's own end rounded UP to whole beats - not at the last
+    # event and not at the slice's edge (vocal 286560 = ceil(286534/480)*480,
+    # bass 248160, ins 295680; 51 of 51 sources agree). A note-off on the last
+    # tick read back with endppq 0 when the CC sat on top of it, which is why the
+    # closing marker must be past the content.
+    if True:  # an EMPTY slice is closed too: measured, a slice with 0 notes still
+        # carries the CC123 line (drums_hihat's last item in the reference holds
+        # exactly that one event).
+        last_tick = source.events[-1].tick if source.events else 0
+        ppq = int(source.ppq)
+        source_end = source.end_tick if source.end_tick is not None else last_tick
+        close_tick = int(math.ceil(float(source_end) / float(ppq))) * ppq
+        if close_tick <= last_tick:
+            close_tick = last_tick + ppq
         body.append(
             _field(
                 _SOURCE_FIELD,
-                ("E", "1", format_hex(0xB0), format_hex(0x7B), format_hex(0)),
+                (
+                    "E",
+                    str(close_tick - last_tick),
+                    format_hex(0xB0),
+                    format_hex(0x7B),
+                    format_hex(0),
+                ),
             )
         )
     # Measured tail, with GUID and SRCCOLOR in their measured positions.
@@ -321,7 +336,7 @@ def _item_node(
         "LOOP": ("1" if item.loop else "0",),
         "SEL": ("1" if item.selected else "0",),
         "IGUID": (guid,),
-        "IID": (str(iid),),
+        "IID": (str(item.iid if item.iid is not None else iid),),
         "NAME": (quote_text(item.name or ""),),
         "SOFFS": soffs,
         "GUID": (take_guid,),

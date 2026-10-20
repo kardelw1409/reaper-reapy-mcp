@@ -64,6 +64,11 @@ class MidiSource:
     pooled_events_guid: str | None = None
     guid: str | None = None  # the source's own GUID (the second one in the block)
     source_color: int = 564
+    #: Last tick the SOURCE FILE mentions. REAPER closes every MIDI source with
+    #: CC123 at this tick rounded UP to whole beats (measured on all 51 sources
+    #: of the reference: vocal 286560, bass 248160, ins 295680), NOT at the last
+    #: event and not at the slice's end. `None` falls back to the last event.
+    end_tick: int | None = None
     extra_raw: tuple[str, ...] = field(default=())
 
 
@@ -86,6 +91,12 @@ class Item:
     fade_out_s: float = 0.0
     guid: str | None = None  # IGUID (item id)
     take_guid: str | None = None  # GUID (take/source id)
+    #: `IID` is the item's number in the PROJECT, in INSERTION order - not the
+    #: item's place on its track (measured: the reference numbers its six audio
+    #: items 1-6 in the order the fill created them, then the MIDI items 7-57).
+    #: `None` means "number it in track order", which is what a freshly built
+    #: model wants; the manifest compiler sets it to reproduce a live fill.
+    iid: int | None = None
     stretch_markers: tuple[StretchMarker, ...] = ()
     #: Unknown fields, in file order: `((token, (arg, ...)), ...)`.
     extra: tuple[tuple[str, tuple[str, ...]], ...] = ()

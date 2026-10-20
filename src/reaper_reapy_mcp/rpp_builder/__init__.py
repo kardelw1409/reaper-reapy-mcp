@@ -14,6 +14,7 @@ Two rules hold this package together, and both are tested:
 
 from __future__ import annotations
 
+from .compile import from_manifest
 from .model import (
     AudioSource,
     Item,
@@ -65,6 +66,7 @@ __all__ = [
     "ValidationError",
     "WriteReport",
     "WriteVerificationError",
+    "from_manifest",
     "from_nodes",
     "make_guid",
     "parse",

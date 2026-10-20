@@ -45,6 +45,10 @@ REFERENCE = Path(
 REFERENCE_SHA256 = "a23d252becc824e97b720ad83533b0013204ffa5d9de08e1aade3de389a6eff3"
 
 _GENERATED_GUIDS = {"guid", "take_guid", "pooled_events_guid"}
+#: Fields the FILE cannot carry back: `iid` is read from the item it belongs to
+#: (so it survives as a value) and `end_tick` describes the source file's length,
+#: which only the compiler knows.
+_NOT_ROUNDTRIPPED = {"end_tick", "iid"}
 
 
 def _demo() -> Project:
@@ -91,7 +95,7 @@ def _strip_generated(value):
         return {
             field.name: _strip_generated(getattr(value, field.name))
             for field in dataclasses.fields(value)
-            if field.name not in _GENERATED_GUIDS
+            if field.name not in _GENERATED_GUIDS and field.name not in _NOT_ROUNDTRIPPED
         }
     if isinstance(value, tuple):
         return tuple(_strip_generated(item) for item in value)
@@ -144,11 +148,11 @@ def test_midi_events_are_written_as_deltas(tmp_path: Path):
     assert events[0] == ("E", "0", "90", "24", "64")
     assert events[1] == ("E", "240", "80", "24", "00")
     deltas = [int(tokens[1]) for tokens in events]
-    # Four model events plus the measured closing CC123 one tick after the last
-    # (all 51 reference sources end with it; see writer/to_nodes.py).
-    assert deltas == [0, 240, 240, 240, 1]
-    assert sum(deltas) == 721
-    assert events[-1] == ("E", "1", "b0", "7b", "00")
+    # Four model events plus the measured closing CC123, placed at the source end
+    # rounded UP to whole beats: 720 ticks -> 960 (2 beats) -> delta 240.
+    assert deltas == [0, 240, 240, 240, 240]
+    assert sum(deltas) == 960
+    assert events[-1] == ("E", "240", "b0", "7b", "00")
 
 
 def test_project_header_constants_are_the_reference_lines(tmp_path: Path):

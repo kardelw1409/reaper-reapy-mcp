@@ -145,13 +145,26 @@ def _read_markers_and_regions(root: RppNode) -> tuple[list[Marker], list[Region]
 
 
 def _read_stretch_markers(item: RppNode) -> tuple[StretchMarker, ...]:
+    """Read `SM` records, including REAPER's line wrapping.
+
+    MEASURED on the reference (RPP_FORMAT.md section 6): REAPER wraps a long
+    `SM` run over several lines and OMITS the mode token on the LAST record of
+    each line - 145 records on 4 lines hold 141 `+` tokens, and the token counts
+    are 125/125/116/65, i.e. `3N - 1` per line. A line whose token count is
+    divisible by 3 (the shape this package's own writer emits, one record per
+    line) carries a mode on every record. Both shapes are accepted; the missing
+    mode means the default, `+`.
+    """
     records: list[StretchMarker] = []
     for field in item.fields():
         if field.key != "SM":
             continue
         args = field.args
-        if len(args) % 3:
-            raise ValueError("SM line is not a sequence of triples: %r" % (args,))
+        trailing = len(args) % 3 == 0
+        if not trailing and (len(args) + 1) % 3 == 0:
+            args = args + ("+",)  # the last record of the line has no mode
+        elif not trailing:
+            raise ValueError("SM line is not a sequence of triples: %r" % (field.args,))
         for index in range(0, len(args), 3):
             records.append(
                 StretchMarker(
@@ -253,6 +266,7 @@ def _read_item(node: RppNode) -> Item:
         name=name if name != "" else None,
         loop=(values["LOOP"].args[0] != "0") if "LOOP" in values else True,
         selected=(values["SEL"].args[0] != "0") if "SEL" in values else False,
+        iid=_int(values["IID"].args[0]) if "IID" in values and values["IID"].args else None,
         playrate=_float(values["PLAYRATE"].args[0]) if "PLAYRATE" in values else 1.0,
         guid=values["IGUID"].args[0] if "IGUID" in values and values["IGUID"].args else None,
         take_guid=values["GUID"].args[0] if "GUID" in values and values["GUID"].args else None,

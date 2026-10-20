@@ -191,10 +191,17 @@ def test_counts_match_the_measured_structure(aligned_root):
     events = [field for node in blocks for field in node.fields() if field.key == "E"]
     assert len(events) == 4405
 
-    # Section 6: 24 `SM` lines holding 846 triples (line wrapping is free).
+    # Section 6: 24 `SM` lines. CORRECTED 2026-10-20 (F3): the file holds 870
+    # RECORDS over those lines - 145 per audio item - and 846 of them carry the
+    # `+` mode, because REAPER drops the mode on each line's LAST record. The
+    # earlier assertion counted `len(args) // 3` per line, which truncates a
+    # wrapped record and happens to equal the mode count.
     stretch = [field for node in blocks for field in node.fields() if field.key == "SM"]
     assert len(stretch) == 24
-    assert sum(len(field.args) // 3 for field in stretch) == 846
+    tokens = sum(len(field.args) for field in stretch)
+    assert tokens == 2586
+    assert (tokens + len(stretch)) // 3 == 870
+    assert sum(field.args.count("+") for field in stretch) == 846
 
     # Section 3: 8 regions (pairs) + 1 plain marker = 17 MARKER lines.
     markers = [field for field in aligned_root.fields() if field.key == "MARKER"]
