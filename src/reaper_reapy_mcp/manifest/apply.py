@@ -49,6 +49,11 @@ from .manifest import (
 )
 
 _MATCH_TOLERANCE_S = 0.1
+#: The subdivision the pipeline quantises every part on (`bar / 16`, see `snap_all_notes` in the
+#: exporter). The project's DRAWN grid is set to the same step, because a grid that does not divide
+#: the part's own quantisation makes correctly placed notes look wrong - measured: with the default
+#: quarter-note grid, 47 % of this take's kick notes sit halfway between the drawn lines.
+GRID_SUBDIVISION = 16
 
 
 def _enumerate_marks(project) -> list[dict]:
@@ -112,6 +117,46 @@ def _set_time_signature(project, num: int, den: int, bpm: float) -> tuple[bool, 
         return ok, "added a tempo/time-signature marker at 0.0 s"
     ok = bool(RPR.SetTempoTimeSigMarker(project.id, -1, 0.0, -1, -1, bpm, num, den, False))
     return ok, "edited the tempo/time-signature marker covering 0.0 s"
+
+
+def grid_division_notes(numerator: int, denominator: int, subdivision: int = GRID_SUBDIVISION) -> float:
+    """The note value REAPER must DRAW so that a line falls on every step the parts sit on.
+
+    MEASURED DEFECT this answers (dnb take, 2026-10-20; the user: "looks like the BPM is entirely
+    wrong, your own kick is not on the grid"). The filled project came up with grid division 0.25 -
+    a QUARTER note - while every part had been snapped to 1/16. Measured in that project, 106 of the
+    226 kick notes (47 %) sit on ODD 16ths, i.e. exactly HALFWAY between the lines REAPER draws, so
+    nearly half the kicks look off the grid while they measure 0.00 ms from the 1/16 line. A grid
+    that does not divide the part's own quantisation cannot be read as "on the grid": the eye reads
+    the drawing, not the PPQ.
+
+    The division is in WHOLE NOTES, and the pipeline quantises to `bar / subdivision`, so the metre
+    belongs in the answer: in 4/4 a 1/16 of a bar IS a 1/16 note (0.0625), while in 2/4 the same
+    "one step of 16" is a 1/32 note (0.03125). Getting that wrong is the same class of bug as the
+    2/4 bar length that once drew every region one bar late.
+    """
+    beats_per_bar = float(numerator) / float(denominator)
+    return beats_per_bar / float(subdivision)
+
+
+def _set_grid_division(project, division: float) -> dict:
+    """Set the drawn grid and READ IT BACK - a setting that did not take is worse than none."""
+    report: dict = {"division": round(float(division), 6), "before": None, "after": None, "ok": False}
+    try:
+        read = RPR.GetSetProjectGrid(project.id, False, 0, 0, 0)
+        if isinstance(read, (list, tuple)) and len(read) > 3:
+            report["before"] = round(float(read[3]), 6)
+        RPR.GetSetProjectGrid(project.id, True, float(division), 0, 0.0)
+        again = RPR.GetSetProjectGrid(project.id, False, 0, 0, 0)
+        if isinstance(again, (list, tuple)) and len(again) > 3:
+            report["after"] = round(float(again[3]), 6)
+    except Exception as exc:  # noqa: BLE001 - a host that cannot set it must be NAMED
+        report["reason"] = "%s: %s" % (type(exc).__name__, exc)
+        return report
+    report["ok"] = report["after"] is not None and abs(float(report["after"]) - float(division)) < 1e-9
+    if not report["ok"]:
+        report["reason"] = "the host did not keep the value it was given"
+    return report
 
 
 def _track_names(project) -> list[str]:
@@ -870,6 +915,19 @@ def apply_bundle(
         warnings.append(f"time signature write returned false ({meter_how})")
     applied["meter"] = info["meter"]
     applied["meter_how"] = meter_how
+    # THE DRAWN GRID MUST DIVIDE WHAT THE PARTS WERE QUANTISED TO. It is a view setting, but it is
+    # the only thing the eye can check a part against, and the project's default did not divide it:
+    # measured, 47 % of the kick notes sat halfway between the drawn lines while being 0.00 ms from
+    # the 1/16 line (see grid_division_notes).
+    applied["grid_division"] = _set_grid_division(
+        project, grid_division_notes(meter_num, meter_den)
+    )
+    if not applied["grid_division"].get("ok"):
+        warnings.append(
+            "the drawn grid could not be set to the parts' own quantisation (1/%d of a bar): %s - "
+            "the notes are still on that grid, but the ruler will not show it"
+            % (GRID_SUBDIVISION, applied["grid_division"].get("reason") or "no reason given")
+        )
     RPR.AddProjectMarker(project.id, False, 0.0, 0.0, info["title"], -1)
 
     # --- tracks (base five, then one per extra artifact the bundle carries)
